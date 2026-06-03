@@ -12,7 +12,22 @@ set -euo pipefail
 PAUSE_IMAGE="registry.k8s.io/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.19"
-ARCH="amd64"
+
+# 自动检测架构
+detect_arch() {
+    local machine
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64)     echo "amd64" ;;
+        aarch64)    echo "arm64" ;;
+        arm64)      echo "arm64" ;;
+        *)
+            echo "ERROR: 不支持的架构: $machine (仅支持 amd64 / arm64)" >&2
+            exit 1
+            ;;
+    esac
+}
+ARCH=$(detect_arch)
 
 CHECK_ONLY=false
 if [[ "${1:-}" == "--check-only" ]]; then
@@ -241,6 +256,7 @@ main() {
     echo "=============================================="
     echo "  沙箱冷启动测试 — 环境准备"
     echo "=============================================="
+    echo "  检测架构: $(uname -m) → $ARCH"
     echo "  安装目标: containerd + crictl + pause 镜像"
     echo "  pause 镜像: $PAUSE_IMAGE"
     echo "=============================================="
