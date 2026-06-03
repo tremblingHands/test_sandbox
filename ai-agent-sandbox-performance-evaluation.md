@@ -18,13 +18,29 @@
 
 ### 2.1 启动延迟（Startup Latency）
 
-衡量沙箱从创建到 ready 状态的时间。
+衡量 Pod 沙箱从 `RunPodSandbox` 调用到 Ready 状态的端到端时间。测试对象为 containerd/CRI-O 管理的 Pod 沙箱，沙箱内仅运行一个轻量 pause 容器，**不包含镜像拉取时延**（pause 镜像已预先缓存至节点）。
 
-| 指标 | 说明 | 典型采集方式 |
+| 指标 | 说明 | 采集方式 |
 |------|------|-------------|
-| 冷启动时间（P50/P95/P99） | 首次创建的完整耗时 | 计时沙箱创建 API 调用 |
-| 热启动时间（P50/P95/P99） | 复用已有环境时的耗时 | 计时沙箱复用/快照恢复 |
+| 冷启动时间（P50/P95/P99） | `crictl runp` 调用到 PodSandboxStatus 就绪的耗时（不含镜像拉取） | `crictl runp` + `crictl inspectp` 计时 |
+| 冷启动分解（各阶段） | 拆分为 RunPodSandbox API 响应时间 + PodSandboxStatus 就绪等待时间 | `time crictl runp` / CRI 事件时间戳 |
+| 热启动时间（P50/P95/P99） | 复用预热池中已有沙箱的耗时 | 计时沙箱复用/快照恢复 |
 | 预热池命中率 | 预创建沙箱的复用比例 | 统计命中次数 / 总请求数 |
+| 并发创建吞吐量 | N 并发 `crictl runp` 的完成速率 | 批量创建计时 |
+
+**测试模型说明**：
+
+```
+用户请求 → RunPodSandbox API → 网络命名空间创建 → pause 容器启动
+                                     ↓
+                              PodSandboxStatus == Ready
+                                     ↓
+                            用户可调度业务容器到该沙箱
+```
+
+- **不含镜像拉取**：pause 镜像（`registry.k8s.io/pause`）已通过 `crictl pull` 预先缓存至所有节点
+- **仅测沙箱本身**：只创建 Pod 沙箱 + pause 容器，不部署业务容器，聚焦沙箱基础设施时延
+- **pause 容器作用**：占用网络命名空间，是 Kubernetes Pod 的标准模式
 
 ### 2.2 执行性能（Execution Performance）
 
@@ -198,90 +214,367 @@
 | lmbench | 系统级微基准 | 源码编译 |
 | hyperfine | 命令行基准测试 | `cargo install hyperfine` |
 
-### 4.2 自定义测试脚本
+### 4.2 crictl Pod 沙箱冷启动测试
+
+以下脚本使用 `crictl` 对 Pod 沙箱进行冷启动时延基准测试。沙箱内仅运行 pause 容器，pause 镜像已预先缓存于节点，**不包含任何镜像拉取时延**。
+
+#### 4.2.1 前置条件
+
+```bash
+# 1. 确认 crictl 可用
+crictl --version
+
+# 2. 确认 containerd/CRI-O 运行中
+crictl info | jq .status.conditions
+
+# 3. 预先缓存 pause 镜像（关键：排除拉取镜像的干扰）
+PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+crictl pull "$PAUSE_IMAGE"
+
+# 4. 确认 pause 镜像已在节点
+crictl images | grep pause
+```
+
+#### 4.2.2 Pod 沙箱配置文件
+
+```bash
+# sandbox-pod.json — 仅定义 Pod 沙箱，不含业务容器
+cat > sandbox-pod.json <<'EOF'
+{
+  "metadata": {
+    "name": "sandbox-bench",
+    "namespace": "default",
+    "uid": "bench-UID",
+    "attempt": 1
+  },
+  "log_directory": "/tmp/sandbox-logs",
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 0
+      }
+    }
+  }
+}
+EOF
+```
+
+#### 4.2.3 冷启动测试脚本
 
 ```python
 #!/usr/bin/env python3
 """
-沙箱性能基准测试框架示例
+Pod 沙箱冷启动时延测试（基于 crictl）
+仅创建 Pod 沙箱 + pause 容器，不包含业务容器，不含镜像拉取。
 """
 
 import time
 import subprocess
 import statistics
 import json
+import uuid
+import argparse
 from dataclasses import dataclass, asdict
-from typing import List
+from pathlib import Path
+
+
+# ============================================================
+# 配置（根据环境修改）
+# ============================================================
+PAUSE_IMAGE = "registry.k8s.io/pause:3.9"
+POD_CONFIG_TEMPLATE = "sandbox-pod.json"
+OUTPUT_FILE = "cold_start_report.json"
+
+
+# ============================================================
+# 数据模型
+# ============================================================
+@dataclass
+class ColdStartTrace:
+    """单次冷启动的完整时延追踪"""
+    run_id: int
+    sandbox_id: str
+    t_runp_ms: float        # RunPodSandbox API 调用耗时至得到 sandbox ID
+    t_ready_ms: float       # 从 sandbox ID 返回到 PodSandboxStatus 变为 SANDBOX_READY
+    total_ms: float         # 总耗时 = t_runp + t_ready
 
 
 @dataclass
-class BenchmarkResult:
-    name: str
-    runs: int
-    mean_ms: float
-    median_ms: float
-    p95_ms: float
-    p99_ms: float
-    stddev_ms: float
-    min_ms: float
-    max_ms: float
+class Stats:
+    """统计摘要"""
+    p50: float; p95: float; p99: float
+    mean: float; stddev: float; min_val: float; max_val: float
 
 
-class SandboxBenchmark:
-    """沙箱性能基准测试器"""
+# ============================================================
+# 工具函数
+# ============================================================
+def compute_stats(values: list[float]) -> Stats:
+    s = sorted(values)
+    n = len(s)
+    return Stats(
+        p50=s[int(n * 0.50) - 1] if n > 0 else 0,
+        p95=s[int(n * 0.95) - 1] if n > 0 else 0,
+        p99=s[int(n * 0.99) - 1] if n > 0 else 0,
+        mean=statistics.mean(s),
+        stddev=statistics.stdev(s) if n > 1 else 0,
+        min_val=s[0],
+        max_val=s[-1],
+    )
 
-    def __init__(self, sandbox_create_fn, sandbox_exec_fn, sandbox_destroy_fn):
-        self.create = sandbox_create_fn
-        self.execute = sandbox_exec_fn
-        self.destroy = sandbox_destroy_fn
 
-    def measure_startup_latency(self, runs: int = 50) -> BenchmarkResult:
-        """测量沙箱启动延迟"""
-        latencies = []
-        for _ in range(runs):
-            start = time.perf_counter()
-            sb = self.create()
-            latencies.append((time.perf_counter() - start) * 1000)
-            self.destroy(sb)
-        return self._compute_stats("startup_latency", latencies)
+def _run(cmd: str) -> str:
+    """执行 shell 命令，返回 stdout。失败抛出异常。"""
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"命令失败 [{cmd}]: {r.stderr.strip()}")
+    return r.stdout.strip()
 
-    def measure_execution_latency(self, code: str, runs: int = 100) -> BenchmarkResult:
-        """测量代码执行延迟"""
-        latencies = []
-        sb = self.create()
-        for _ in range(runs):
-            start = time.perf_counter()
-            self.execute(sb, code)
-            latencies.append((time.perf_counter() - start) * 1000)
-        self.destroy(sb)
-        return self._compute_stats("execution_latency", latencies)
 
-    def measure_concurrent_throughput(
-        self, code: str, concurrency: int, duration_sec: int = 30
-    ) -> dict:
-        """测量并发执行吞吐量"""
-        # 实现并发测试逻辑
-        pass
+# ============================================================
+# Pod 沙箱操作（crictl 封装）
+# ============================================================
+def prepare_pod_config(run_id: int) -> str:
+    """为本次测试生成唯一 pod 配置，避免 UID 冲突"""
+    unique_uid = f"bench-{uuid.uuid4().hex[:12]}"
+    path = f"/tmp/sandbox-pod-{run_id}.json"
+    content = json.dumps({
+        "metadata": {
+            "name": f"sandbox-bench-{run_id}",
+            "namespace": "default",
+            "uid": unique_uid,
+            "attempt": 1
+        },
+        "log_directory": "/tmp/sandbox-logs",
+        "linux": {
+            "security_context": {
+                "namespace_options": {"network": 0}
+            }
+        }
+    })
+    Path(path).write_text(content)
+    return path
 
-    def measure_filesystem_perf(self, test_type: str) -> dict:
-        """测量文件系统性能（封装 fio）"""
-        pass
 
-    def _compute_stats(self, name: str, data: List[float]) -> BenchmarkResult:
-        """计算统计指标"""
-        sorted_data = sorted(data)
-        n = len(sorted_data)
-        return BenchmarkResult(
-            name=name,
-            runs=len(data),
-            mean_ms=statistics.mean(data),
-            median_ms=statistics.median(data),
-            p95_ms=sorted_data[int(n * 0.95)],
-            p99_ms=sorted_data[int(n * 0.99)],
-            stddev_ms=statistics.stdev(data) if n > 1 else 0,
-            min_ms=min(data),
-            max_ms=max(data),
-        )
+def run_pod_sandbox(pod_config_path: str) -> str:
+    """调用 crictl runp 创建 Pod 沙箱，返回 sandbox ID"""
+    return _run(f"crictl runp --runtime runc {pod_config_path}")
+
+
+def wait_until_ready(sandbox_id: str, timeout_sec: float = 30.0) -> None:
+    """轮询 PodSandboxStatus 直到状态变为 SANDBOX_READY"""
+    deadline = time.perf_counter() + timeout_sec
+    while time.perf_counter() < deadline:
+        try:
+            info = _run(f"crictl inspectp {sandbox_id}")
+            status = json.loads(info)
+            state = status.get("status", {}).get("state", "")
+            # 注意: crictl inspectp 返回的字段依赖版本。
+            # 也可以用 crictl pods -q --state Ready 检查。
+            if state == "SANDBOX_READY":
+                return
+        except RuntimeError:
+            pass
+        time.sleep(0.01)  # 10ms 轮询间隔
+    raise TimeoutError(f"沙箱 {sandbox_id} 在 {timeout_sec}s 内未就绪")
+
+
+def stop_pod_sandbox(sandbox_id: str) -> None:
+    """停止沙箱"""
+    _run(f"crictl stopp {sandbox_id}")
+
+
+def remove_pod_sandbox(sandbox_id: str) -> None:
+    """删除沙箱"""
+    _run(f"crictl rmp {sandbox_id}")
+
+
+def clear_caches():
+    """清除内核缓存，保障每轮都是真正的冷启动"""
+    _run("echo 3 > /proc/sys/vm/drop_caches")
+    time.sleep(3)  # 冷却间隔
+
+
+# ============================================================
+# 核心测试：单次冷启动
+# ============================================================
+def single_cold_start(run_id: int) -> ColdStartTrace:
+    """
+    执行一次完整的冷启动流程：
+        crictl runp → 得到 sandbox ID → 等待 SANDBOX_READY
+    全程不含镜像拉取（pause 镜像已预缓存）。
+    """
+    pod_config_path = prepare_pod_config(run_id)
+
+    # ---- 阶段 1: t_runp ---- #
+    t0 = time.perf_counter()
+    sandbox_id = run_pod_sandbox(pod_config_path)
+    t1 = time.perf_counter()
+    t_runp_ms = (t1 - t0) * 1000
+
+    # ---- 阶段 2: t_ready ---- #
+    wait_until_ready(sandbox_id)
+    t2 = time.perf_counter()
+    t_ready_ms = (t2 - t1) * 1000
+
+    # ---- 清理 ---- #
+    stop_pod_sandbox(sandbox_id)
+    remove_pod_sandbox(sandbox_id)
+
+    return ColdStartTrace(
+        run_id=run_id,
+        sandbox_id=sandbox_id,
+        t_runp_ms=round(t_runp_ms, 3),
+        t_ready_ms=round(t_ready_ms, 3),
+        total_ms=round(t_runp_ms + t_ready_ms, 3),
+    )
+
+
+# ============================================================
+# 测试主流程
+# ============================================================
+def run_benchmark(runs: int = 50) -> dict:
+    traces: list[ColdStartTrace] = []
+    failures: list[dict] = []
+
+    for i in range(runs):
+        print(f"[{i+1}/{runs}] 冷启动中...", end=" ", flush=True)
+        clear_caches()
+        try:
+            trace = single_cold_start(i + 1)
+            traces.append(trace)
+            print(f"✓ t_runp={trace.t_runp_ms:.1f}ms  t_ready={trace.t_ready_ms:.1f}ms  total={trace.total_ms:.1f}ms")
+        except Exception as e:
+            failures.append({"run_id": i + 1, "error": str(e)})
+            print(f"✗ {e}")
+
+    totals = [t.total_ms for t in traces]
+    runps = [t.t_runp_ms for t in traces]
+    readys = [t.t_ready_ms for t in traces]
+
+    return {
+        "config": {
+            "pause_image": PAUSE_IMAGE,
+            "runtime": "runc (via crictl)",
+            "description": "Pod sandbox cold start — pause container only, no image pull",
+        },
+        "summary": {
+            "total_runs": len(traces) + len(failures),
+            "success_runs": len(traces),
+            "failure_runs": len(failures),
+        },
+        "phases": {
+            "t_runp":   asdict(compute_stats(runps)),
+            "t_ready":  asdict(compute_stats(readys)),
+            "total_ms": asdict(compute_stats(totals)),
+        },
+        "traces": [asdict(t) for t in traces],
+        "failures": failures,
+    }
+
+
+# ============================================================
+# CLI
+# ============================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Pod 沙箱冷启动时延测试 (crictl)"
+    )
+    parser.add_argument("--runs", type=int, default=50, help="测试轮次（默认 50）")
+    parser.add_argument("--output", default=OUTPUT_FILE, help="JSON 报告输出路径")
+    args = parser.parse_args()
+
+    report = run_benchmark(runs=args.runs)
+
+    with open(args.output, "w") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    # ---- 控制台摘要 ---- #
+    total = report["phases"]["total_ms"]
+    t_runp = report["phases"]["t_runp"]
+    t_ready = report["phases"]["t_ready"]
+
+    print(f"\n{'='*70}")
+    print(f"Pod 沙箱冷启动时延测试 — 摘要")
+    print(f"{'='*70}")
+    print(f"成功率: {report['summary']['success_runs']}/{report['summary']['total_runs']}")
+    print(f"\n{'阶段':<25} {'P50(ms)':>10} {'P95(ms)':>10} {'P99(ms)':>10} {'Mean(ms)':>10}")
+    print(f"{'-'*65}")
+    print(f"{'t_runp (RunPodSandbox API)':<25} {t_runp['p50']:>10.1f} {t_runp['p95']:>10.1f} {t_runp['p99']:>10.1f} {t_runp['mean']:>10.1f}")
+    print(f"{'t_ready (等待就绪)':<25} {t_ready['p50']:>10.1f} {t_ready['p95']:>10.1f} {t_ready['p99']:>10.1f} {t_ready['mean']:>10.1f}")
+    print(f"{'-'*65}")
+    print(f"{'总冷启动时延':<25} {total['p50']:>10.1f} {total['p95']:>10.1f} {total['p99']:>10.1f} {total['mean']:>10.1f}")
+    print(f"\n报告已保存: {args.output}")
+```
+
+#### 4.2.4 并发冷启动测试
+
+```bash
+#!/bin/bash
+# 并发 Pod 沙箱冷启动测试
+# 同时发起 N 个 crictl runp，测量并发下的时延和吞吐量
+
+CONCURRENCY=${1:-10}        # 并发数
+RUNS=${2:-3}                # 重复轮次
+
+PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+crictl pull "$PAUSE_IMAGE" &>/dev/null
+
+echo "并发数: $CONCURRENCY, 轮次: $RUNS"
+echo "=========================================="
+
+for round in $(seq 1 "$RUNS"); do
+    echo "[第 $round 轮]"
+
+    # 清除缓存
+    echo 3 > /proc/sys/vm/drop_caches
+    sleep 2
+
+    # 记录开始时间
+    START_NS=$(date +%s%N)
+
+    # 并发创建 N 个沙箱
+    SANDBOX_IDS=()
+    for i in $(seq 1 "$CONCURRENCY"); do
+        UID="bench-$(date +%s%N)-$i"
+        cat > "/tmp/pod-$i.json" <<JSONEOF
+{
+  "metadata": {"name": "conc-bench-$i", "namespace": "default", "uid": "$UID", "attempt": 1},
+  "log_directory": "/tmp/sandbox-logs",
+  "linux": {"security_context": {"namespace_options": {"network": 0}}}
+}
+JSONEOF
+    done
+
+    # 并发执行 crictl runp
+    for i in $(seq 1 "$CONCURRENCY"); do
+        (time crictl runp --runtime runc "/tmp/pod-$i.json" 2>&1 | \
+         awk '/real/ {print $2}' >> "/tmp/conc-times-$round.log") &
+    done
+    wait
+
+    END_NS=$(date +%s%N)
+    ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
+    echo "  全部完成耗时: ${ELAPSED_MS}ms"
+
+    # 等待所有沙箱就绪
+    for i in $(seq 1 "$CONCURRENCY"); do
+        SAND_ID=$(crictl pods --name "conc-bench-$i" -q 2>/dev/null)
+        timeout 30 sh -c "until crictl inspectp $SAND_ID 2>/dev/null | grep -q 'SANDBOX_READY'; do sleep 0.01; done"
+    done
+
+    # 清理所有沙箱
+    for SAND_ID in $(crictl pods -q --name conc-bench 2>/dev/null); do
+        crictl stopp "$SAND_ID" 2>/dev/null
+        crictl rmp "$SAND_ID" 2>/dev/null
+    done
+
+    echo "  清理完成"
+done
+
+echo ""
+echo "各轮并发总耗时（ms）:"
+cat /tmp/conc-times-*.log | head -20
 ```
 
 ---
@@ -293,36 +586,46 @@ class SandboxBenchmark:
 ```
 1. 环境标准化
    ├── 确认宿主 OS 版本、内核版本
-   ├── 确认沙箱运行时版本（Docker / gVisor / Firecracker / Kata 等）
+   ├── 确认 CRI 运行时版本（containerd / CRI-O）及底层 OCI 运行时（runc / kata / gVisor）
    ├── 确认硬件配置（CPU 型号/核数、内存、磁盘类型）
    └── 关闭不必要的后台服务，减少干扰
 
-2. 基准采集
+2. pause 镜像预缓存（关键：排除拉取镜像干扰）
+   ├── crictl pull registry.k8s.io/pause:3.9
+   ├── 确认 crictl images | grep pause
+   └── 确认 /var/lib/containerd 下镜像数据完整
+
+3. 基准采集
    ├── 先在宿主环境运行所有基准测试，作为裸机对照组
    └── 记录宿主环境的各项指标
 
-3. 预热
+4. 预热
    ├── 运行 3-5 轮预热测试，排除冷启动缓存影响
-   └── 确保文件系统缓存、镜像缓存处于稳定状态
+   └── 确保文件系统缓存处于稳定状态
 ```
 
 ### 5.2 执行测试
 
 ```
-阶段一：微基准测试
-├── 启动延迟测试（50-100 次）
+阶段一：冷启动微基准（使用 crictl，不含镜像拉取）
+├── 单发冷启动测试（50-100 次），采集 P50/P95/P99
+├── t_runp（RunPodSandbox API）与 t_ready（就绪等待）分阶段计时
+├── 对比不同 OCI 运行时（runc / runsc / kata-runtime）的冷启动差异
+└── 并发冷启动测试（5/10/20/50/100 并发），记录吞吐量和时延退化
+
+阶段二：沙箱内性能微基准
 ├── 系统调用开销测试
 ├── CPU/内存/IO 微基准
 └── 网络微基准
 
-阶段二：场景化测试
+阶段三：场景化测试
 ├── 场景一：代码解释与执行
 ├── 场景二：数据处理与文件操作
 ├── 场景三：网络密集型任务
 ├── 场景四：长时间运行任务
 └── 场景五：高并发多租户
 
-阶段三：压力与稳定性测试
+阶段四：压力与稳定性测试
 ├── 极限并发测试
 ├── 长时间稳定性测试（24h+）
 ├── 资源耗尽行为测试
@@ -452,30 +755,59 @@ class SandboxBenchmark:
 ### 9.1 常用测试命令速查
 
 ```bash
-# CPU 基准测试
+# ===== Pod 沙箱操作 (crictl) =====
+# 检查运行时状态
+crictl info | jq .status.conditions
+crictl --version
+
+# 预缓存 pause 镜像（冷启动测试前必做）
+crictl pull registry.k8s.io/pause:3.9
+crictl images | grep pause
+
+# 创建 Pod 沙箱
+crictl runp --runtime runc sandbox-pod.json
+
+# 查看 Pod 沙箱列表及状态
+crictl pods
+crictl pods --state Ready
+
+# 查看 Pod 沙箱详情
+crictl inspectp <sandbox-id>
+
+# 停止 / 删除 Pod 沙箱
+crictl stopp <sandbox-id>
+crictl rmp <sandbox-id>
+
+# 批量清理（停止并删除所有非 Ready 沙箱）
+crictl pods -q | while read id; do
+  crictl stopp "$id" 2>/dev/null
+  crictl rmp "$id" 2>/dev/null
+done
+
+# ===== CPU 基准测试 =====
 sysbench cpu --cpu-max-prime=20000 --threads=4 run
 
-# 内存基准测试
+# ===== 内存基准测试 =====
 sysbench memory --memory-block-size=1M --memory-total-size=10G run
 
-# 文件 I/O 基准测试
+# ===== 文件 I/O 基准测试 =====
 sysbench fileio --file-total-size=5G --file-test-mode=rndrw prepare
 sysbench fileio --file-total-size=5G --file-test-mode=rndrw run
 sysbench fileio cleanup
 
-# 灵活 I/O 测试
+# ===== 灵活 I/O 测试 =====
 fio --name=randwrite --ioengine=libaio --iodepth=16 --rw=randwrite \
     --bs=4k --size=1G --numjobs=4 --runtime=60 --time_based \
     --directory=/mnt/test
 
-# 网络吞吐量测试
+# ===== 网络吞吐量测试 =====
 iperf3 -s                          # 服务端
 iperf3 -c <server_ip> -t 30 -P 4  # 客户端（4 并发，30 秒）
 
-# 压力测试
+# ===== 压力测试 =====
 stress-ng --cpu 4 --io 2 --vm 2 --vm-bytes 512M --timeout 60s
 
-# 系统调用开销
+# ===== 系统调用开销 =====
 strace -c -f <command>
 ```
 
