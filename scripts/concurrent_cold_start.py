@@ -4,16 +4,22 @@
 并发 Pod 沙箱冷启动测试（多线程，基于 crictl）
 兼容 Python 3.6+。
 
-两种模式:
-  continuous - 每轮内 N 个线程持续发送 runp，不等就绪即取下一任务；
-               全部 runp 完成后统一轮询 SANDBOX_READY。
-  serial     - 每轮内 N 个线程各自 runp → 等就绪 → 清理 → 取下一任务。
+模式:
+  continuous - runp 不等就绪即取下一任务，poll worker 异步就绪等待
+  serial     - 每个线程 runp → 等就绪 → 清理 → 取下一任务
 
-每个沙箱独立记录 t_runp 和 t_ready。
+两种测试方式:
+  --per-round M  - 每轮创建固定 M 个沙箱（通过 task_queue 分发）
+  --duration S   - 每轮持续 S 秒，线程自驱循环，统计时间内完成数
 
 用法:
+    # 固定数量
     python3 concurrent_cold_start.py \
         --concurrency 5 --per-round 20 --rounds 3 --mode continuous
+
+    # 固定时间
+    python3 concurrent_cold_start.py \
+        --concurrency 5 --duration 30 --rounds 3 --mode continuous
 
 前置条件:
     ./scripts/setup.sh
@@ -28,12 +34,12 @@ import argparse
 import sys
 import os
 import threading
-import itertools
 
 try:
     import queue
 except ImportError:
-    import Queue as queue  # Python 2 fallback (实际上 Python 3 就是 queue)
+    import Queue as queue
+
 
 # ============================================================
 # 配置
@@ -47,8 +53,6 @@ POD_CONFIG_DIR = "/tmp/conc-pod-configs"
 # 数据模型
 # ============================================================
 class SandboxResult(object):
-    """单个沙箱的冷启动时延"""
-
     def __init__(self, round_num, worker_id, task_index, sandbox_id,
                  t_runp_ms, t_ready_ms, total_ms):
         self.round_num = round_num
@@ -89,7 +93,6 @@ class Stats(object):
 # 工具函数
 # ============================================================
 def _run(cmd):
-    # type: (str) -> str
     r = subprocess.run(
         cmd, shell=True, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, timeout=60
@@ -137,13 +140,11 @@ def check_prerequisites():
         print("[check] crictl 可用: {}".format(version))
     except Exception:
         errors.append("crictl 未找到，请执行 ./scripts/setup.sh")
-
     try:
         _run("crictl info")
         print("[check] CRI 运行时连接正常")
     except Exception as e:
         errors.append("CRI 运行时异常: {}".format(e))
-
     try:
         existing = _run("crictl images -q {}".format(PAUSE_IMAGE))
         if PAUSE_IMAGE in existing:
@@ -157,28 +158,26 @@ def check_prerequisites():
             print("[check] pause 镜像拉取完成")
         except Exception as e:
             errors.append("pause 镜像拉取失败: {}".format(e))
-
     if not os.path.isfile("/proc/sys/vm/drop_caches"):
         errors.append("/proc/sys/vm/drop_caches 不可用")
-
     if errors:
         print("\n前置条件检查失败:")
         for err in errors:
             print("  ✗ {}".format(err))
         sys.exit(1)
-
     print("[check] 所有前置条件满足\n")
 
 
 # ============================================================
 # Pod 配置生成
 # ============================================================
-def generate_pod_config(task_index, round_num):
-    unique_uid = "conc-{}-r{}-t{}".format(uuid.uuid4().hex[:12], round_num, task_index)
-    path = "{}/pod-{}.json".format(POD_CONFIG_DIR, task_index)
+def generate_pod_config(round_num, worker_id, local_seq):
+    task_label = "w{}-{}".format(worker_id, local_seq)
+    unique_uid = "conc-{}-r{}".format(uuid.uuid4().hex[:12], round_num)
+    path = "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, local_seq)
     content = json.dumps({
         "metadata": {
-            "name": "conc-bench-r{}-t{}".format(round_num, task_index),
+            "name": "conc-bench-r{}-w{}-{}".format(round_num, worker_id, local_seq),
             "namespace": "default",
             "uid": unique_uid,
             "attempt": 1
@@ -216,21 +215,13 @@ def poll_until_ready(sandbox_id, timeout_sec=30.0):
     raise RuntimeError("sandbox {} not ready in {}s".format(sandbox_id, timeout_sec))
 
 
-def stop_sandbox(sandbox_id):
-    _run("crictl stopp {}".format(sandbox_id))
-
-
-def remove_sandbox(sandbox_id):
-    _run("crictl rmp {}".format(sandbox_id))
-
-
 def cleanup_sandbox(sandbox_id):
     try:
-        stop_sandbox(sandbox_id)
+        _run("crictl stopp {}".format(sandbox_id))
     except Exception:
         pass
     try:
-        remove_sandbox(sandbox_id)
+        _run("crictl rmp {}".format(sandbox_id))
     except Exception:
         pass
 
@@ -244,12 +235,10 @@ def batch_cleanup(round_num):
 
 
 # ============================================================
-# Worker 线程
-# ============================================================
-
 # 全局结果存储（线程安全）
+# ============================================================
 _results_lock = threading.Lock()
-_results = []  # type: list[SandboxResult]
+_results = []
 
 
 def add_result(result):
@@ -257,57 +246,43 @@ def add_result(result):
         _results.append(result)
 
 
-def worker_serial(worker_id, task_queue, round_num):
-    """
-    Mode 2: serial
-    runp → poll ready → 记录 t_runp + t_ready → cleanup → 取下一个
-    """
+# ============================================================
+# = 固定数量模式 workers（通过 task_queue 分发任务）         =
+# ============================================================
+
+def worker_counted_serial(worker_id, task_queue, round_num):
+    """serial + 固定数量"""
     while True:
         item = task_queue.get()
         if item is None:
             break
         task_index, pod_config_path = item
 
-        # ---- runp ---- #
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path)
-        except Exception as e:
-            add_result(SandboxResult(
-                round_num=round_num, worker_id=worker_id,
-                task_index=task_index, sandbox_id="FAIL",
-                t_runp_ms=0, t_ready_ms=0, total_ms=0))
+        except Exception:
+            add_result(SandboxResult(round_num, worker_id, task_index,
+                                     "FAIL", 0, 0, 0))
             continue
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
-        # ---- poll ready ---- #
         try:
             poll_until_ready(sandbox_id)
+            t_ready_ms = round((time.perf_counter() - t1) * 1000, 3)
         except Exception:
             t_ready_ms = -1
-        else:
-            t2 = time.perf_counter()
-            t_ready_ms = round((t2 - t1) * 1000, 3)
 
-        # ---- record ---- #
-        add_result(SandboxResult(
-            round_num=round_num, worker_id=worker_id,
-            task_index=task_index, sandbox_id=sandbox_id[:12],
-            t_runp_ms=t_runp_ms, t_ready_ms=t_ready_ms,
-            total_ms=round(t_runp_ms + max(t_ready_ms, 0), 3)))
-
-        # ---- cleanup ---- #
+        add_result(SandboxResult(round_num, worker_id, task_index,
+                                 sandbox_id[:12], t_runp_ms,
+                                 t_ready_ms if t_ready_ms >= 0 else 0,
+                                 round(t_runp_ms + max(t_ready_ms, 0), 3)))
         cleanup_sandbox(sandbox_id)
 
 
-# ============================================================
-# worker for continuous mode — 只做 runp，产出 push 到共享队列
-# ============================================================
-def worker_continuous_runp(worker_id, task_queue, ready_queue):
-    """
-    continuous mode: 不停取 task → runp → push sandbox 到 ready_queue。
-    """
+def worker_counted_continuous_runp(worker_id, task_queue, ready_queue):
+    """continuous 固定数量: runp → push ready_queue"""
     while True:
         item = task_queue.get()
         if item is None:
@@ -327,28 +302,19 @@ def worker_continuous_runp(worker_id, task_queue, ready_queue):
             "task_index": task_index,
             "sandbox_id": sandbox_id,
             "t_runp_ms": t_runp_ms,
-            "t_after_runp": t1,   # perf_counter，用于计算 t_ready
+            "t_after_runp": t1,
         })
-
-    # 通知 poll worker 该 worker 已完成
     ready_queue.put(None)
 
 
-# ============================================================
-# worker for continuous mode — 从 ready_queue 取，poll 就绪
-# ============================================================
-def worker_continuous_poll(worker_id, round_num, ready_queue, runp_finished_counter, n_runp_workers):
-    """
-    continuous mode: 不停从 ready_queue 取已完成的 sandbox → poll 就绪 → 记录 → 清理。
-    runp worker 产出后立刻被 pick up，t_ready 精确。
-    """
+def worker_counted_continuous_poll(worker_id, round_num, ready_queue,
+                                    runp_done_counter, n_runp_workers):
+    """continuous 固定数量: 从 ready_queue 取 → poll → 记录 → 清理"""
     while True:
         item = ready_queue.get()
         if item is None:
-            # 一个 runp worker 完成
-            runp_finished_counter[0] += 1
-            if runp_finished_counter[0] >= n_runp_workers:
-                # 所有 runp worker 都完成了，通知其他 poll worker 退出
+            runp_done_counter[0] += 1
+            if runp_done_counter[0] >= n_runp_workers:
                 ready_queue.put(None)
                 break
             continue
@@ -364,132 +330,277 @@ def worker_continuous_poll(worker_id, round_num, ready_queue, runp_finished_coun
         else:
             t_ready_ms = -1
 
-        total_ms = round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)
-
         add_result(SandboxResult(
-            round_num=round_num,
-            worker_id=item["worker"],
-            task_index=item["task_index"],
-            sandbox_id=(sid[:12] if sid else "FAIL"),
-            t_runp_ms=item["t_runp_ms"],
-            t_ready_ms=t_ready_ms if t_ready_ms >= 0 else 0,
-            total_ms=total_ms,
-        ))
-
-        # 清理
+            round_num, item["worker"], item["task_index"],
+            (sid[:12] if sid else "FAIL"),
+            item["t_runp_ms"],
+            t_ready_ms if t_ready_ms >= 0 else 0,
+            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
         if sid:
             cleanup_sandbox(sid)
 
 
 # ============================================================
-# 轮次执行 — continuous 模式
+# = 固定时间模式 workers（线程自驱循环 + stop_event + 本地计数器）=
 # ============================================================
-def run_round_continuous(round_num, concurrency, per_round):
+
+def worker_timed_serial(worker_id, round_num, stop_event):
     """
-    Mode 1: continuous
-    N runp workers + N poll workers 同时启动。
-    runp worker: task → runp → push 到 ready_queue（不等就绪）
-    poll worker: 从 ready_queue pull → poll ready → 记录 → 清理
+    serial + 固定时间:
+    线程本地序号 seq，循环: runp → poll → record → cleanup → seq++
     """
+    seq = 0
+    while not stop_event.is_set():
+        pod_config_path = generate_pod_config(round_num, worker_id, seq)
+
+        t0 = time.perf_counter()
+        try:
+            sandbox_id = run_pod_sandbox(pod_config_path)
+        except Exception:
+            add_result(SandboxResult(round_num, worker_id, seq,
+                                     "FAIL", 0, 0, 0))
+            seq += 1
+            continue
+        t1 = time.perf_counter()
+        t_runp_ms = round((t1 - t0) * 1000, 3)
+
+        # 检查 stop_event：如果 runp 期间时间到了，就绪等待后不再循环
+        try:
+            poll_until_ready(sandbox_id)
+            t_ready_ms = round((time.perf_counter() - t1) * 1000, 3)
+        except Exception:
+            t_ready_ms = -1
+
+        add_result(SandboxResult(
+            round_num, worker_id, seq,
+            sandbox_id[:12], t_runp_ms,
+            t_ready_ms if t_ready_ms >= 0 else 0,
+            round(t_runp_ms + max(t_ready_ms, 0), 3)))
+        cleanup_sandbox(sandbox_id)
+        seq += 1
+
+
+def worker_timed_continuous_runp(worker_id, round_num, stop_event, ready_queue):
+    """
+    continuous + 固定时间: 线程自驱循环，runp → push ready_queue → seq++
+    """
+    seq = 0
+    while not stop_event.is_set():
+        pod_config_path = generate_pod_config(round_num, worker_id, seq)
+
+        t0 = time.perf_counter()
+        try:
+            sandbox_id = run_pod_sandbox(pod_config_path)
+        except Exception:
+            sandbox_id = None
+        t1 = time.perf_counter()
+        t_runp_ms = round((t1 - t0) * 1000, 3)
+
+        ready_queue.put({
+            "worker": worker_id,
+            "task_index": seq,
+            "sandbox_id": sandbox_id,
+            "t_runp_ms": t_runp_ms,
+            "t_after_runp": t1,
+        })
+        seq += 1
+
+    # 通知 poll worker
+    ready_queue.put(None)
+
+
+def worker_timed_continuous_poll(worker_id, round_num, stop_event, ready_queue,
+                                  runp_done_counter, n_runp_workers):
+    """
+    continuous + 固定时间: 从 ready_queue 取 → poll → 记录 → 清理。
+    当所有 runp worker 发来 None 时退出。
+    """
+    while True:
+        # 使用 timeout 以便能检查 stop_event（但实际由 runp 线程的 None 控制）
+        try:
+            item = ready_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        if item is None:
+            runp_done_counter[0] += 1
+            if runp_done_counter[0] >= n_runp_workers:
+                # 通知其他 poll worker
+                ready_queue.put(None)
+                break
+            continue
+
+        sid = item["sandbox_id"]
+        if sid is not None:
+            try:
+                poll_until_ready(sid)
+                t_ready_ms = round(
+                    (time.perf_counter() - item["t_after_runp"]) * 1000, 3)
+            except Exception:
+                t_ready_ms = -1
+        else:
+            t_ready_ms = -1
+
+        add_result(SandboxResult(
+            round_num, item["worker"], item["task_index"],
+            (sid[:12] if sid else "FAIL"),
+            item["t_runp_ms"],
+            t_ready_ms if t_ready_ms >= 0 else 0,
+            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
+        if sid:
+            cleanup_sandbox(sid)
+
+
+# ============================================================
+# = 轮次执行函数                                             =
+# ============================================================
+
+def run_round_counted_continuous(round_num, concurrency, per_round):
+    """固定数量 + continuous"""
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
 
-    # ---- 准备 task 队列 ---- #
     task_queue = queue.Queue()
     for i in range(per_round):
-        pod_config_path = generate_pod_config(i, round_num)
+        pod_config_path = generate_pod_config(round_num, -1, i)
         task_queue.put((i, pod_config_path))
     for _ in range(concurrency):
         task_queue.put(None)
 
-    # ---- 共享 ready 队列 ---- #
     ready_queue = queue.Queue()
 
-    # ---- 启动 runp + poll workers 同时运行 ---- #
-    print("[第 {}/{} 轮] continuous: {} runp + {} poll workers, 共 {} 沙箱...".format(
+    print("[第 {}/{} 轮] continuous(固定数量): {} runp + {} poll workers, {} sandboxes".format(
         round_num, args.rounds, concurrency, concurrency, per_round))
 
     t_start = time.perf_counter()
+    runp_done = [0]
 
-    runp_finished_counter = [0]  # 用 list 包装实现跨线程修改
-
-    # 启动 runp workers
     runp_threads = []
     for w in range(concurrency):
-        t = threading.Thread(
-            target=worker_continuous_runp,
-            args=(w, task_queue, ready_queue)
-        )
-        t.start()
-        runp_threads.append(t)
+        t = threading.Thread(target=worker_counted_continuous_runp,
+                             args=(w, task_queue, ready_queue))
+        t.start(); runp_threads.append(t)
 
-    # 启动 poll workers（与 runp 同时运行）
     poll_threads = []
     for w in range(concurrency):
-        t = threading.Thread(
-            target=worker_continuous_poll,
-            args=(w, round_num, ready_queue, runp_finished_counter, concurrency)
-        )
-        t.start()
-        poll_threads.append(t)
+        t = threading.Thread(target=worker_counted_continuous_poll,
+                             args=(w, round_num, ready_queue, runp_done, concurrency))
+        t.start(); poll_threads.append(t)
 
-    # 等待全部完成
-    for t in runp_threads:
-        t.join()
-    for t in poll_threads:
-        t.join()
+    for t in runp_threads: t.join()
+    for t in poll_threads: t.join()
 
-    t_end = time.perf_counter()
-    wall_ms = round((t_end - t_start) * 1000, 1)
-
+    wall_ms = round((time.perf_counter() - t_start) * 1000, 1)
     print("  完成: 挂钟 {}ms".format(wall_ms))
-
-    # 清理残留
     batch_cleanup(round_num)
-
     return wall_ms
 
 
-def run_round_serial(round_num, concurrency, per_round):
-    """
-    Mode 2: serial
-    每个 worker 线程: runp → poll ready → cleanup → 取下一个
-    """
+def run_round_counted_serial(round_num, concurrency, per_round):
+    """固定数量 + serial"""
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
 
     task_queue = queue.Queue()
     for i in range(per_round):
-        pod_config_path = generate_pod_config(i, round_num)
+        pod_config_path = generate_pod_config(round_num, -1, i)
         task_queue.put((i, pod_config_path))
     for _ in range(concurrency):
         task_queue.put(None)
 
-    print("[第 {}/{} 轮] {} 线程串行模式 (runp→ready→cleanup), 共 {} 沙箱...".format(
+    print("[第 {}/{} 轮] serial(固定数量): {} workers, {} sandboxes".format(
         round_num, args.rounds, concurrency, per_round))
+
+    t_start = time.perf_counter()
+    threads = []
+    for w in range(concurrency):
+        t = threading.Thread(target=worker_counted_serial,
+                             args=(w, task_queue, round_num))
+        t.start(); threads.append(t)
+    for t in threads: t.join()
+
+    wall_ms = round((time.perf_counter() - t_start) * 1000, 1)
+    print("  完成: 挂钟 {}ms".format(wall_ms))
+    batch_cleanup(round_num)
+    return wall_ms
+
+
+def run_round_timed_continuous(round_num, concurrency, duration):
+    """固定时间 + continuous"""
+    print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
+    clear_caches()
+
+    stop_event = threading.Event()
+    ready_queue = queue.Queue()
+
+    print("[第 {}/{} 轮] continuous(固定时间): {} runp + {} poll workers, {}s".format(
+        round_num, args.rounds, concurrency, concurrency, duration))
+
+    t_start = time.perf_counter()
+    runp_done = [0]
+
+    runp_threads = []
+    for w in range(concurrency):
+        t = threading.Thread(target=worker_timed_continuous_runp,
+                             args=(w, round_num, stop_event, ready_queue))
+        t.start(); runp_threads.append(t)
+
+    poll_threads = []
+    for w in range(concurrency):
+        t = threading.Thread(target=worker_timed_continuous_poll,
+                             args=(w, round_num, stop_event, ready_queue,
+                                   runp_done, concurrency))
+        t.start(); poll_threads.append(t)
+
+    time.sleep(duration)
+    stop_event.set()
+
+    for t in runp_threads: t.join()
+    for t in poll_threads: t.join()
+
+    elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+    round_results = [r for r in _results if r.round_num == round_num]
+    count = len(round_results)
+    tps = count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+
+    print("  完成: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
+        elapsed_ms, count, tps))
+    batch_cleanup(round_num)
+    return elapsed_ms
+
+
+def run_round_timed_serial(round_num, concurrency, duration):
+    """固定时间 + serial"""
+    print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
+    clear_caches()
+
+    stop_event = threading.Event()
+
+    print("[第 {}/{} 轮] serial(固定时间): {} workers, {}s".format(
+        round_num, args.rounds, concurrency, duration))
 
     t_start = time.perf_counter()
 
     threads = []
     for w in range(concurrency):
-        t = threading.Thread(
-            target=worker_serial,
-            args=(w, task_queue, round_num)
-        )
-        t.start()
-        threads.append(t)
+        t = threading.Thread(target=worker_timed_serial,
+                             args=(w, round_num, stop_event))
+        t.start(); threads.append(t)
 
-    for t in threads:
-        t.join()
+    time.sleep(duration)
+    stop_event.set()
 
-    t_end = time.perf_counter()
-    wall_ms = round((t_end - t_start) * 1000, 1)
-    print("  完成: 挂钟 {}ms".format(wall_ms))
+    for t in threads: t.join()
 
-    # 清理残留
+    elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+    round_results = [r for r in _results if r.round_num == round_num]
+    count = len(round_results)
+    tps = count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+
+    print("  完成: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
+        elapsed_ms, count, tps))
     batch_cleanup(round_num)
-
-    return wall_ms
+    return elapsed_ms
 
 
 # ============================================================
@@ -506,51 +617,75 @@ def print_summary(all_wall_times):
     d_stats = compute_stats(readys)
     t_stats = compute_stats(totals)
 
+    is_timed = G.use_timed
+
     print("")
     print("=" * 70)
     print("并发 Pod 沙箱冷启动测试 — 结果汇总")
     print("=" * 70)
     print("模式:     {}".format(args.mode))
     print("并发数:   {} threads".format(args.concurrency))
-    print("每轮数:   {} sandboxes".format(args.per_round))
+    if is_timed:
+        print("每轮时长: {}s".format(args.duration))
+        print("总计沙箱: {}".format(sum(1 for _ in _results)))
+    else:
+        print("每轮数:   {} sandboxes".format(args.per_round))
+        print("总计沙箱: {}".format(args.rounds * args.per_round))
     print("总轮次:   {}".format(args.rounds))
-    print("总沙箱:   {}".format(args.rounds * args.per_round))
-    print("成功:     {}/{}".format(len(totals), args.rounds * args.per_round))
+    print("成功:     {}/{}".format(
+        sum(1 for r in _results if r.sandbox_id != "FAIL"),
+        len(_results)))
     print("=" * 70)
 
     print("")
-    print("各轮挂钟总耗时:")
-    for r, wall in enumerate(all_wall_times, 1):
-        print("  第 {} 轮: {}ms".format(r, wall))
+    if is_timed:
+        print("各轮统计:")
+        for rnd in range(1, args.rounds + 1):
+            wall = all_wall_times[rnd - 1]
+            count = sum(1 for r in _results if r.round_num == rnd)
+            tps = count / (wall / 1000.0) if wall > 0 else 0
+            print("  第 {} 轮: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
+                rnd, wall, count, tps))
+    else:
+        print("各轮挂钟总耗时:")
+        for rnd, wall in enumerate(all_wall_times, 1):
+            print("  第 {} 轮: {}ms".format(rnd, wall))
 
     print("")
     print("{:<18} {:>8} {:>8} {:>8} {:>8} {:>8}".format(
         "", "P50(ms)", "P95(ms)", "P99(ms)", "Mean(ms)", "Min/Max"))
     print("-" * 65)
-    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{}".format(
+    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{:.1f}".format(
         "t_runp", r_stats.p50, r_stats.p95, r_stats.p99,
         r_stats.mean, r_stats.min_val, r_stats.max_val))
-    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{}".format(
+    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{:.1f}".format(
         "t_ready", d_stats.p50, d_stats.p95, d_stats.p99,
         d_stats.mean, d_stats.min_val, d_stats.max_val))
     print("-" * 65)
-    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{}".format(
+    print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{:.1f}".format(
         "total", t_stats.p50, t_stats.p95, t_stats.p99,
         t_stats.mean, t_stats.min_val, t_stats.max_val))
 
-    # 按轮次统计
     print("")
     print("各轮次耗时分布:")
     for rnd in range(1, args.rounds + 1):
-        round_results = [res for res in _results if res.round_num == rnd]
-        if round_results:
-            round_totals = [res.total_ms for res in round_results]
+        round_res = [r for r in _results if r.round_num == rnd]
+        if round_res:
+            round_totals = [r.total_ms for r in round_res]
             s = compute_stats(round_totals)
             print("  r{}: 样本={}  P50={:.0f}ms  P95={:.0f}ms  Min/Max={:.0f}/{:.0f}ms".format(
                 rnd, len(round_totals), s.p50, s.p95, s.min_val, s.max_val))
 
     print("")
     print("详细报告: {}".format(args.output))
+
+
+# ============================================================
+# 全局状态（避免到处传参数）
+# ============================================================
+class _Globals(object):
+    pass
+G = _Globals()
 
 
 # ============================================================
@@ -562,66 +697,82 @@ if __name__ == "__main__":
     )
     parser.add_argument("--concurrency", type=int, default=5,
                         help="并发线程数 N (默认 5)")
-    parser.add_argument("--per-round", type=int, default=20,
-                        help="每轮沙箱总数 M (默认 20)")
     parser.add_argument("--rounds", type=int, default=3,
                         help="总轮次 K (默认 3)")
     parser.add_argument("--mode", choices=["continuous", "serial"],
                         default="continuous",
-                        help="模式: continuous(不等就绪) / serial(等就绪) (默认 continuous)")
+                        help="continuous(不等就绪) / serial(等就绪)")
+
+    # --per-round / --duration 二选一
+    count_group = parser.add_mutually_exclusive_group(required=True)
+    count_group.add_argument("--per-round", type=int,
+                              help="每轮固定沙箱数 M")
+    count_group.add_argument("--duration", type=int,
+                              help="每轮持续时间（秒），统计时间内完成数")
+
     parser.add_argument("--output", default=OUTPUT_FILE,
                         help="JSON 报告输出路径")
     parser.add_argument("--skip-check", action="store_true",
                         help="跳过前置条件检查")
     args = parser.parse_args()
 
+    # 确定模式
+    G.use_timed = args.duration is not None
+    per_round_val = args.duration if G.use_timed else args.per_round
+
     # 前置检查
     if not args.skip_check:
         check_prerequisites()
 
-    # 准备目录
     if not os.path.isdir(POD_CONFIG_DIR):
         os.makedirs(POD_CONFIG_DIR)
 
-    total_sandboxes = args.rounds * args.per_round
     print("")
     print("=" * 50)
     print("并发 Pod 沙箱冷启动测试")
     print("=" * 50)
     print("模式:     {}".format(args.mode))
     print("并发数:   {} threads".format(args.concurrency))
-    print("每轮数:   {} sandboxes".format(args.per_round))
+    if G.use_timed:
+        print("每轮时长: {}s (固定时间)".format(args.duration))
+    else:
+        print("每轮数:   {} sandboxes (固定数量)".format(args.per_round))
     print("总轮次:   {}".format(args.rounds))
-    print("总沙箱:   {}".format(total_sandboxes))
     print("=" * 50)
     print("")
 
-    # 重置全局结果
+    # 重置
     _results = []
 
+    # 选择执行函数
+    if G.use_timed:
+        round_fn = (run_round_timed_continuous if args.mode == "continuous"
+                    else run_round_timed_serial)
+    else:
+        round_fn = (run_round_counted_continuous if args.mode == "continuous"
+                    else run_round_counted_serial)
+
     all_wall_times = []
-
-    fn = run_round_continuous if args.mode == "continuous" else run_round_serial
-
-    for round_num in range(1, args.rounds + 1):
-        wall = fn(round_num, args.concurrency, args.per_round)
+    for rnd in range(1, args.rounds + 1):
+        wall = round_fn(rnd, args.concurrency, per_round_val)
         all_wall_times.append(wall)
 
-    # 输出报告
     print_summary(all_wall_times)
 
-    # 写入 JSON
+    # JSON 报告
     report = {
         "config": {
             "concurrency": args.concurrency,
-            "per_round": args.per_round,
             "rounds": args.rounds,
             "mode": args.mode,
+            "timed": G.use_timed,
+            "per_round": args.per_round,
+            "duration": args.duration,
             "pause_image": PAUSE_IMAGE,
             "runtime": "runc (via crictl)",
         },
         "summary": {
-            "total_sandboxes": args.rounds * args.per_round,
+            "total_sandboxes": len(_results),
             "success": sum(1 for r in _results if r.sandbox_id != "FAIL"),
             "failed": sum(1 for r in _results if r.sandbox_id == "FAIL"),
         },
