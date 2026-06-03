@@ -191,6 +191,8 @@ CONFEOF
         sudo sed -i "s|\"subnet\": \"[^\"]*\"|\"subnet\": \"$CNI_SUBNET\"|" "$CNI_CONF_FILE"
         # 清理旧的 IP 分配记录（子网变了旧记录无效）
         sudo rm -rf /var/lib/cni/networks/mynet/
+        # 删除旧网桥（否则新子网 IP 无法绑定）
+        sudo ip link delete cni0 2>/dev/null || true
         pass "CNI subnet 已更新为: $CNI_SUBNET"
 
         # 重启 containerd 使配置生效
