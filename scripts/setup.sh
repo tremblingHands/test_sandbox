@@ -190,6 +190,67 @@ EOF
 }
 
 # ============================================================
+# 配置 registry 镜像源（阿里云）
+# ============================================================
+ALIYUN_K8S_MIRROR="https://registry.aliyuncs.com/google_containers"
+
+check_registry_mirror() {
+    echo ""
+    echo "--- registry 镜像源 ---"
+
+    # containerd v2 使用 hosts.toml 目录方式配置 mirror
+    local certs_dir="/etc/containerd/certs.d"
+    local hosts_dir="$certs_dir/registry.k8s.io"
+    local hosts_file="$hosts_dir/hosts.toml"
+
+    if [ -f "$hosts_file" ]; then
+        pass "registry.k8s.io 镜像源已配置: $ALIYUN_K8S_MIRROR"
+        return 0
+    fi
+
+    if $CHECK_ONLY; then
+        warn "registry.k8s.io 未配置国内镜像源，拉取可能超时"
+        return 1
+    fi
+
+    # 1. 确保 containerd 主配置设定了 config_path
+    local config_file="/etc/containerd/config.toml"
+    local config_path_line="config_path = '$certs_dir'"
+
+    if ! grep -q "config_path.*certs.d" "$config_file" 2>/dev/null; then
+        echo "  设置 containerd registry config_path..."
+        # 在 [plugins.'io.containerd.cri.v1.images'.registry] 段下设置 config_path
+        if grep -q "config_path" "$config_file"; then
+            sudo sed -i "s|config_path = .*|config_path = '$certs_dir'|" "$config_file"
+        else
+            sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'.registry\]/a\      config_path = '$certs_dir'" "$config_file"
+        fi
+    fi
+
+    # 2. 创建 registry.k8s.io 的 hosts.toml
+    echo "  配置 registry.k8s.io → $ALIYUN_K8S_MIRROR ..."
+    sudo mkdir -p "$hosts_dir"
+    cat | sudo tee "$hosts_file" > /dev/null <<TOML
+server = "https://registry.k8s.io"
+
+[host."$ALIYUN_K8S_MIRROR"]
+  capabilities = ["pull", "resolve"]
+TOML
+
+    # 3. 重启 containerd 使配置生效
+    echo "  重启 containerd 使镜像源配置生效..."
+    if sudo systemctl restart containerd; then
+        sleep 2
+        pass "registry 镜像源配置完成"
+    else
+        fail "containerd 重启失败，请检查 /etc/containerd/config.toml"
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================
 # 检查 pause 镜像
 # ============================================================
 check_pause_image() {
@@ -198,21 +259,32 @@ check_pause_image() {
 
     if crictl images -q 2>/dev/null | grep -qF "$PAUSE_IMAGE"; then
         pass "pause 镜像已缓存: $PAUSE_IMAGE"
-    else
-        if $CHECK_ONLY; then
-            fail "pause 镜像缺失: $PAUSE_IMAGE"
-            return 1
-        fi
-        warn "pause 镜像缺失，正在拉取: $PAUSE_IMAGE ..."
-        if crictl pull "$PAUSE_IMAGE"; then
-            pass "pause 镜像拉取完成"
-        else
-            fail "pause 镜像拉取失败，请检查网络和 containerd 状态"
-            return 1
-        fi
+        return 0
     fi
 
-    return 0
+    if $CHECK_ONLY; then
+        fail "pause 镜像缺失: $PAUSE_IMAGE"
+        return 1
+    fi
+
+    warn "pause 镜像缺失，正在拉取: $PAUSE_IMAGE ..."
+    if crictl pull "$PAUSE_IMAGE" 2>&1; then
+        pass "pause 镜像拉取完成"
+        return 0
+    fi
+
+    # 直接拉取失败时，尝试从阿里云镜像源拉取然后 re-tag
+    warn "直接拉取失败，尝试从阿里云镜像源拉取..."
+    local aliyun_image="registry.aliyuncs.com/google_containers/pause:3.9"
+    # 关键: crictl 使用 k8s.io namespace，必须在这个 namespace 下操作
+    if ctr -n k8s.io image pull "$aliyun_image" 2>&1; then
+        ctr -n k8s.io image tag "$aliyun_image" "$PAUSE_IMAGE" 2>/dev/null || true
+        pass "pause 镜像已从阿里云镜像源拉取并标记"
+        return 0
+    fi
+
+    fail "pause 镜像拉取失败（已尝试直接拉取和阿里云镜像源），请检查网络"
+    return 1
 }
 
 # ============================================================
@@ -267,6 +339,7 @@ main() {
     check_containerd      || errors=$((errors + 1))
     check_crictl          || errors=$((errors + 1))
     check_crictl_config   || { [[ $? -eq 1 ]] && errors=$((errors + 1)); }
+    check_registry_mirror || errors=$((errors + 1))
     check_pause_image     || errors=$((errors + 1))
     check_kernel_params
 
