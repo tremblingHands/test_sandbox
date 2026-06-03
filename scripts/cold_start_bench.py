@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Pod 沙箱冷启动时延测试（基于 crictl）
-仅创建 Pod 沙箱 + pause 容器，不包含业务容器，不含镜像拉取。
+兼容 Python 3.6+，仅创建 Pod 沙箱 + pause 容器，不含镜像拉取。
 
 用法:
     # 首次使用先准备环境
@@ -22,8 +23,7 @@ import json
 import uuid
 import argparse
 import sys
-from dataclasses import dataclass, asdict
-from pathlib import Path
+import os
 
 
 # ============================================================
@@ -34,48 +34,93 @@ OUTPUT_FILE = "cold_start_report.json"
 
 
 # ============================================================
-# 数据模型
+# 数据模型（不使用 dataclass，兼容 Python 3.6）
 # ============================================================
-@dataclass
-class ColdStartTrace:
+class ColdStartTrace(object):
     """单次冷启动的完整时延追踪"""
-    run_id: int
-    sandbox_id: str
-    t_runp_ms: float        # RunPodSandbox API 调用耗时至得到 sandbox ID
-    t_ready_ms: float       # 从 sandbox ID 返回到 PodSandboxStatus 变为 SANDBOX_READY
-    total_ms: float         # 总耗时 = t_runp + t_ready
+
+    def __init__(self, run_id, sandbox_id, t_runp_ms, t_ready_ms, total_ms):
+        self.run_id = run_id
+        self.sandbox_id = sandbox_id
+        self.t_runp_ms = t_runp_ms
+        self.t_ready_ms = t_ready_ms
+        self.total_ms = total_ms
+
+    def to_dict(self):
+        return {
+            "run_id": self.run_id,
+            "sandbox_id": self.sandbox_id,
+            "t_runp_ms": self.t_runp_ms,
+            "t_ready_ms": self.t_ready_ms,
+            "total_ms": self.total_ms,
+        }
 
 
-@dataclass
-class Stats:
+class Stats(object):
     """统计摘要"""
-    p50: float; p95: float; p99: float
-    mean: float; stddev: float; min_val: float; max_val: float
+
+    def __init__(self, p50, p95, p99, mean, stddev, min_val, max_val):
+        self.p50 = p50
+        self.p95 = p95
+        self.p99 = p99
+        self.mean = mean
+        self.stddev = stddev
+        self.min_val = min_val
+        self.max_val = max_val
+
+    def to_dict(self):
+        return {
+            "p50": self.p50,
+            "p95": self.p95,
+            "p99": self.p99,
+            "mean": self.mean,
+            "stddev": self.stddev,
+            "min_val": self.min_val,
+            "max_val": self.max_val,
+        }
 
 
 # ============================================================
 # 工具函数
 # ============================================================
-def compute_stats(values: list[float]) -> Stats:
+def compute_stats(values):
+    # type: (list) -> Stats
     s = sorted(values)
     n = len(s)
     return Stats(
         p50=s[int(n * 0.50) - 1] if n > 0 else 0,
         p95=s[int(n * 0.95) - 1] if n > 0 else 0,
         p99=s[int(n * 0.99) - 1] if n > 0 else 0,
-        mean=statistics.mean(s),
+        mean=statistics.mean(s) if n > 0 else 0,
         stddev=statistics.stdev(s) if n > 1 else 0,
-        min_val=s[0],
-        max_val=s[-1],
+        min_val=s[0] if n > 0 else 0,
+        max_val=s[-1] if n > 0 else 0,
     )
 
 
-def _run(cmd: str) -> str:
+def _run(cmd):
+    # type: (str) -> str
     """执行 shell 命令，返回 stdout。失败抛出异常。"""
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=60
+    )
+    stdout = r.stdout.decode("utf-8", errors="replace").strip()
+    stderr = r.stderr.decode("utf-8", errors="replace").strip()
     if r.returncode != 0:
-        raise RuntimeError(f"命令失败 [{cmd}]: {r.stderr.strip()}")
-    return r.stdout.strip()
+        raise RuntimeError("命令失败 [{}]: {}".format(cmd, stderr))
+    return stdout
+
+
+def _write_file(path, content):
+    # type: (str, str) -> None
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def _file_exists(path):
+    # type: (str) -> bool
+    return os.path.isfile(path)
 
 
 # ============================================================
@@ -88,40 +133,40 @@ def check_prerequisites():
     # 1. 检查 crictl 是否可用
     try:
         version = _run("crictl --version")
-        print(f"[check] crictl 可用: {version}")
+        print("[check] crictl 可用: {}".format(version))
     except Exception:
-        errors.append("crictl 未找到或不可用，请确认已安装并加入 PATH")
+        errors.append("crictl 未找到或不可用，请执行 ./scripts/setup.sh")
 
     # 2. 检查 CRI 运行时是否正常
     try:
         _run("crictl info")
         print("[check] CRI 运行时连接正常")
     except Exception as e:
-        errors.append(f"CRI 运行时异常: {e}")
+        errors.append("CRI 运行时异常: {}".format(e))
 
     # 3. 检查 pause 镜像，缺失则自动拉取
     try:
-        existing = _run(f"crictl images -q {PAUSE_IMAGE}")
+        existing = _run("crictl images -q {}".format(PAUSE_IMAGE))
         if PAUSE_IMAGE in existing:
-            print(f"[check] pause 镜像已缓存: {PAUSE_IMAGE}")
+            print("[check] pause 镜像已缓存: {}".format(PAUSE_IMAGE))
         else:
             raise RuntimeError("镜像未找到")
     except Exception:
-        print(f"[check] pause 镜像缺失，正在拉取: {PAUSE_IMAGE} ...")
+        print("[check] pause 镜像缺失，正在拉取: {} ...".format(PAUSE_IMAGE))
         try:
-            _run(f"crictl pull {PAUSE_IMAGE}")
-            print(f"[check] pause 镜像拉取完成: {PAUSE_IMAGE}")
+            _run("crictl pull {}".format(PAUSE_IMAGE))
+            print("[check] pause 镜像拉取完成: {}".format(PAUSE_IMAGE))
         except Exception as e:
-            errors.append(f"pause 镜像拉取失败: {e}")
+            errors.append("pause 镜像拉取失败: {}".format(e))
 
-    # 4. 确认 /proc/sys/vm/drop_caches 可写（需要 root 权限）
-    if not Path("/proc/sys/vm/drop_caches").is_file():
+    # 4. 确认 drop_caches 可用
+    if not _file_exists("/proc/sys/vm/drop_caches"):
         errors.append("/proc/sys/vm/drop_caches 不可用，清除缓存功能将无法工作")
 
     if errors:
         print("\n前置条件检查失败:")
         for err in errors:
-            print(f"  ✗ {err}")
+            print("  ✗ {}".format(err))
         sys.exit(1)
 
     print("[check] 所有前置条件满足\n")
@@ -130,13 +175,14 @@ def check_prerequisites():
 # ============================================================
 # Pod 沙箱操作（crictl 封装）
 # ============================================================
-def prepare_pod_config(run_id: int) -> str:
+def prepare_pod_config(run_id):
+    # type: (int) -> str
     """为本次测试生成唯一 pod 配置，避免 UID 冲突"""
-    unique_uid = f"bench-{uuid.uuid4().hex[:12]}"
-    path = f"/tmp/sandbox-pod-{run_id}.json"
+    unique_uid = "bench-{}".format(uuid.uuid4().hex[:12])
+    path = "/tmp/sandbox-pod-{}.json".format(run_id)
     content = json.dumps({
         "metadata": {
-            "name": f"sandbox-bench-{run_id}",
+            "name": "sandbox-bench-{}".format(run_id),
             "namespace": "default",
             "uid": unique_uid,
             "attempt": 1
@@ -148,41 +194,43 @@ def prepare_pod_config(run_id: int) -> str:
             }
         }
     })
-    Path(path).write_text(content)
+    _write_file(path, content)
     return path
 
 
-def run_pod_sandbox(pod_config_path: str) -> str:
+def run_pod_sandbox(pod_config_path):
+    # type: (str) -> str
     """调用 crictl runp 创建 Pod 沙箱，返回 sandbox ID"""
-    return _run(f"crictl runp --runtime runc {pod_config_path}")
+    return _run("crictl runp --runtime runc {}".format(pod_config_path))
 
 
-def wait_until_ready(sandbox_id: str, timeout_sec: float = 30.0) -> None:
+def wait_until_ready(sandbox_id, timeout_sec=30.0):
+    # type: (str, float) -> None
     """轮询 PodSandboxStatus 直到状态变为 SANDBOX_READY"""
     deadline = time.perf_counter() + timeout_sec
     while time.perf_counter() < deadline:
         try:
-            info = _run(f"crictl inspectp {sandbox_id}")
+            info = _run("crictl inspectp {}".format(sandbox_id))
             status = json.loads(info)
             state = status.get("status", {}).get("state", "")
-            # 注意: crictl inspectp 返回的字段依赖版本。
-            # 也可以用 crictl pods -q --state Ready 检查。
             if state == "SANDBOX_READY":
                 return
         except RuntimeError:
             pass
         time.sleep(0.01)  # 10ms 轮询间隔
-    raise TimeoutError(f"沙箱 {sandbox_id} 在 {timeout_sec}s 内未就绪")
+    raise RuntimeError("沙箱 {} 在 {}s 内未就绪".format(sandbox_id, timeout_sec))
 
 
-def stop_pod_sandbox(sandbox_id: str) -> None:
+def stop_pod_sandbox(sandbox_id):
+    # type: (str) -> None
     """停止沙箱"""
-    _run(f"crictl stopp {sandbox_id}")
+    _run("crictl stopp {}".format(sandbox_id))
 
 
-def remove_pod_sandbox(sandbox_id: str) -> None:
+def remove_pod_sandbox(sandbox_id):
+    # type: (str) -> None
     """删除沙箱"""
-    _run(f"crictl rmp {sandbox_id}")
+    _run("crictl rmp {}".format(sandbox_id))
 
 
 def clear_caches():
@@ -194,7 +242,8 @@ def clear_caches():
 # ============================================================
 # 核心测试：单次冷启动
 # ============================================================
-def single_cold_start(run_id: int) -> ColdStartTrace:
+def single_cold_start(run_id):
+    # type: (int) -> ColdStartTrace
     """
     执行一次完整的冷启动流程：
         crictl runp → 得到 sandbox ID → 等待 SANDBOX_READY
@@ -229,20 +278,22 @@ def single_cold_start(run_id: int) -> ColdStartTrace:
 # ============================================================
 # 测试主流程
 # ============================================================
-def run_benchmark(runs: int = 50) -> dict:
-    traces: list[ColdStartTrace] = []
-    failures: list[dict] = []
+def run_benchmark(runs=50):
+    # type: (int) -> dict
+    traces = []   # type: list
+    failures = [] # type: list
 
     for i in range(runs):
-        print(f"[{i+1}/{runs}] 冷启动中...", end=" ", flush=True)
+        print("[{}/{}] 冷启动中...".format(i + 1, runs), end=" ", flush=True)
         clear_caches()
         try:
             trace = single_cold_start(i + 1)
             traces.append(trace)
-            print(f"✓ t_runp={trace.t_runp_ms:.1f}ms  t_ready={trace.t_ready_ms:.1f}ms  total={trace.total_ms:.1f}ms")
+            print("✓ t_runp={:.1f}ms  t_ready={:.1f}ms  total={:.1f}ms".format(
+                trace.t_runp_ms, trace.t_ready_ms, trace.total_ms))
         except Exception as e:
             failures.append({"run_id": i + 1, "error": str(e)})
-            print(f"✗ {e}")
+            print("✗ {}".format(e))
 
     totals = [t.total_ms for t in traces]
     runps = [t.t_runp_ms for t in traces]
@@ -260,11 +311,11 @@ def run_benchmark(runs: int = 50) -> dict:
             "failure_runs": len(failures),
         },
         "phases": {
-            "t_runp":   asdict(compute_stats(runps)),
-            "t_ready":  asdict(compute_stats(readys)),
-            "total_ms": asdict(compute_stats(totals)),
+            "t_runp":   compute_stats(runps).to_dict(),
+            "t_ready":  compute_stats(readys).to_dict(),
+            "total_ms": compute_stats(totals).to_dict(),
         },
-        "traces": [asdict(t) for t in traces],
+        "traces": [t.to_dict() for t in traces],
         "failures": failures,
     }
 
@@ -294,14 +345,26 @@ if __name__ == "__main__":
     t_runp = report["phases"]["t_runp"]
     t_ready = report["phases"]["t_ready"]
 
-    print(f"\n{'='*70}")
-    print(f"Pod 沙箱冷启动时延测试 — 摘要")
-    print(f"{'='*70}")
-    print(f"成功率: {report['summary']['success_runs']}/{report['summary']['total_runs']}")
-    print(f"\n{'阶段':<25} {'P50(ms)':>10} {'P95(ms)':>10} {'P99(ms)':>10} {'Mean(ms)':>10}")
-    print(f"{'-'*65}")
-    print(f"{'t_runp (RunPodSandbox API)':<25} {t_runp['p50']:>10.1f} {t_runp['p95']:>10.1f} {t_runp['p99']:>10.1f} {t_runp['mean']:>10.1f}")
-    print(f"{'t_ready (等待就绪)':<25} {t_ready['p50']:>10.1f} {t_ready['p95']:>10.1f} {t_ready['p99']:>10.1f} {t_ready['mean']:>10.1f}")
-    print(f"{'-'*65}")
-    print(f"{'总冷启动时延':<25} {total['p50']:>10.1f} {total['p95']:>10.1f} {total['p99']:>10.1f} {total['mean']:>10.1f}")
-    print(f"\n报告已保存: {args.output}")
+    print("")
+    print("=" * 70)
+    print("Pod 沙箱冷启动时延测试 — 摘要")
+    print("=" * 70)
+    print("成功率: {}/{}".format(
+        report["summary"]["success_runs"],
+        report["summary"]["total_runs"]))
+    print("")
+    print("{:<25} {:>10} {:>10} {:>10} {:>10}".format(
+        "阶段", "P50(ms)", "P95(ms)", "P99(ms)", "Mean(ms)"))
+    print("-" * 65)
+    print("{:<25} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}".format(
+        "t_runp (RunPodSandbox API)",
+        t_runp["p50"], t_runp["p95"], t_runp["p99"], t_runp["mean"]))
+    print("{:<25} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}".format(
+        "t_ready (等待就绪)",
+        t_ready["p50"], t_ready["p95"], t_ready["p99"], t_ready["mean"]))
+    print("-" * 65)
+    print("{:<25} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}".format(
+        "总冷启动时延",
+        total["p50"], total["p95"], total["p99"], total["mean"]))
+    print("")
+    print("报告已保存: {}".format(args.output))

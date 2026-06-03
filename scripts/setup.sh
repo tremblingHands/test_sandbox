@@ -199,42 +199,76 @@ check_registry_mirror() {
     local certs_dir="/etc/containerd/certs.d"
     local hosts_file="$certs_dir/registry.k8s.io/hosts.toml"
 
+    # ---- 1. hosts.toml: registry.k8s.io 映射到阿里云 ---- #
     if [ -f "$hosts_file" ]; then
         pass "registry.k8s.io → 阿里云镜像源 已配置"
-        return 0
-    fi
-
-    if $CHECK_ONLY; then
-        warn "registry.k8s.io 未配置镜像源（不影响阿里云直接拉取）"
-        return 1
-    fi
-
-    # 1. 确保 containerd 主配置设定了 config_path
-    local config_file="/etc/containerd/config.toml"
-    if ! grep -q "config_path.*certs.d" "$config_file" 2>/dev/null; then
-        if grep -q "config_path" "$config_file"; then
-            sudo sed -i "s|config_path = .*|config_path = '$certs_dir'|" "$config_file"
-        else
-            sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'.registry\]/a\      config_path = '$certs_dir'" "$config_file"
+    else
+        if $CHECK_ONLY; then
+            warn "registry.k8s.io 未配置镜像源"
+            return 1
         fi
-    fi
 
-    # 2. 创建 hosts.toml，将 registry.k8s.io 映射到阿里云
-    sudo mkdir -p "$(dirname "$hosts_file")"
-    cat | sudo tee "$hosts_file" > /dev/null <<TOML
+        # 设置 containerd config_path
+        local config_file="/etc/containerd/config.toml"
+        if ! grep -q "config_path.*certs.d" "$config_file" 2>/dev/null; then
+            if grep -q "config_path" "$config_file"; then
+                sudo sed -i "s|config_path = .*|config_path = '$certs_dir'|" "$config_file"
+            else
+                sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'.registry\]/a\      config_path = '$certs_dir'" "$config_file"
+            fi
+        fi
+
+        sudo mkdir -p "$(dirname "$hosts_file")"
+        cat | sudo tee "$hosts_file" > /dev/null <<TOML
 server = "https://registry.k8s.io"
 
 [host."https://registry.aliyuncs.com/google_containers"]
   capabilities = ["pull", "resolve"]
 TOML
-
-    # 3. 重启 containerd
-    if sudo systemctl restart containerd; then
-        sleep 2
+        need_restart=true
         pass "registry.k8s.io → 阿里云镜像源 配置完成"
+    fi
+
+    # ---- 2. pinned_images: 替换为阿里云镜像 ---- #
+    local config_file="/etc/containerd/config.toml"
+    if grep -q "pinned_images" "$config_file" 2>/dev/null; then
+        if grep -q "registry.k8s.io/pause" "$config_file" 2>/dev/null; then
+            if $CHECK_ONLY; then
+                warn "containerd pinned_images 仍指向 registry.k8s.io，需替换为阿里云镜像"
+                return 1
+            fi
+            echo "  替换 pinned_images sandbox 镜像为阿里云源..."
+            sudo sed -i "s|sandbox = 'registry.k8s.io/pause:[^']*'|sandbox = '$PAUSE_IMAGE'|" "$config_file"
+            need_restart=true
+            pass "pinned_images 已更新为: $PAUSE_IMAGE"
+        else
+            pass "pinned_images 已指向可用镜像源"
+        fi
     else
-        fail "containerd 重启失败"
-        return 1
+        pass "未使用 pinned_images（无需修改）"
+    fi
+
+    # ---- 3. 修复 runc systemd cgroup 兼容性 ---- #
+    if grep -q "SystemdCgroup = true" "$config_file" 2>/dev/null; then
+        if $CHECK_ONLY; then
+            warn "runc SystemdCgroup=true 可能导致 cgroup 路径格式错误"
+            return 1
+        fi
+        echo "  禁用 runc SystemdCgroup（使用标准 cgroups 路径）..."
+        sudo sed -i 's/SystemdCgroup = true/SystemdCgroup = false/' "$config_file"
+        need_restart=true
+        pass "runc SystemdCgroup 已禁用"
+    fi
+
+    # ---- 4. 配置有变更时重启 containerd ---- #
+    if ${need_restart:-false}; then
+        echo "  重启 containerd 使配置生效..."
+        if sudo systemctl restart containerd; then
+            sleep 2
+        else
+            fail "containerd 重启失败"
+            return 1
+        fi
     fi
 
     return 0

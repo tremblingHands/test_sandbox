@@ -1,2 +1,4 @@
 .claude/settings.local.json
 *.swp
+cold_start_report.json
+/tmp/
