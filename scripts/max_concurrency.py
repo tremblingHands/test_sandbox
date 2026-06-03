@@ -142,6 +142,8 @@ if __name__ == "__main__":
                         help="上限（0 = 无上限，直到创建失败）")
     parser.add_argument("--output", default="max_concurrency_report.json",
                         help="报告输出路径")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="测试结束后清理所有 pod（默认保留，便于调试）")
     parser.add_argument("--skip-check", action="store_true",
                         help="跳过前置条件检查")
     args = parser.parse_args()
@@ -179,8 +181,9 @@ if __name__ == "__main__":
         try:
             sandbox_id = create_sandbox(pod_config_path)
         except Exception as e:
-            err_msg = str(e)[:200]
-            print("\n[FAIL] 第 {} 个沙箱创建失败: {}".format(i, err_msg))
+            err_msg = str(e)
+            print("\n[FAIL] 第 {} 个沙箱创建失败:".format(i))
+            print(err_msg)
             failures.append({"index": i, "error": err_msg})
             break
         t_runp_ms = round((time.perf_counter() - t0) * 1000, 1)
@@ -229,14 +232,16 @@ if __name__ == "__main__":
     print("containerd 内存: {}MB".format(mem_final))
     print("")
 
-    # 保留 pod 10 秒供观察
-    print("10 秒后将清理所有 pod...")
-    try:
-        time.sleep(10)
-    except KeyboardInterrupt:
-        pass
-
-    batch_cleanup()
+    if args.cleanup:
+        print("10 秒后将清理所有 pod...")
+        try:
+            time.sleep(10)
+        except KeyboardInterrupt:
+            pass
+        batch_cleanup()
+    else:
+        print("pod 已保留（未启用 --cleanup），可手动调试。")
+        print("清理命令: crictl pods -q --name {} | xargs -r -n1 sh -c 'crictl stopp $1; crictl rmp $1' --".format(POD_NAME_PREFIX))
 
     # JSON 报告
     report = {
