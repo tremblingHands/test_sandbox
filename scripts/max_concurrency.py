@@ -142,8 +142,8 @@ if __name__ == "__main__":
                         help="上限（0 = 无上限，直到创建失败）")
     parser.add_argument("--output", default="max_concurrency_report.json",
                         help="报告输出路径")
-    parser.add_argument("--cleanup", action="store_true",
-                        help="测试结束后清理所有 pod（默认保留，便于调试）")
+    parser.add_argument("--no-cleanup", action="store_true",
+                        help="保留所有 pod 不清理（便于调试）")
     parser.add_argument("--skip-check", action="store_true",
                         help="跳过前置条件检查")
     args = parser.parse_args()
@@ -232,16 +232,16 @@ if __name__ == "__main__":
     print("containerd 内存: {}MB".format(mem_final))
     print("")
 
-    if args.cleanup:
+    if args.no_cleanup:
+        print("pod 已保留（--no-cleanup），可手动调试。")
+        print("清理命令: crictl pods -q --name {} | xargs -r -n1 sh -c 'crictl stopp $1; crictl rmp $1' --".format(POD_NAME_PREFIX))
+    else:
         print("10 秒后将清理所有 pod...")
         try:
             time.sleep(10)
         except KeyboardInterrupt:
             pass
         batch_cleanup()
-    else:
-        print("pod 已保留（未启用 --cleanup），可手动调试。")
-        print("清理命令: crictl pods -q --name {} | xargs -r -n1 sh -c 'crictl stopp $1; crictl rmp $1' --".format(POD_NAME_PREFIX))
 
     # JSON 报告
     report = {
