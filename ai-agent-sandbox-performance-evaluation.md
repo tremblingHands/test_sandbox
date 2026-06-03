@@ -38,7 +38,7 @@
                             用户可调度业务容器到该沙箱
 ```
 
-- **不含镜像拉取**：pause 镜像（`registry.k8s.io/pause`）已通过 `crictl pull` 预先缓存至所有节点
+- **不含镜像拉取**：pause 镜像（`registry.aliyuncs.com/google_containers/pause`）已通过 `crictl pull` 预先缓存至所有节点
 - **仅测沙箱本身**：只创建 Pod 沙箱 + pause 容器，不部署业务容器，聚焦沙箱基础设施时延
 - **pause 容器作用**：占用网络命名空间，是 Kubernetes Pod 的标准模式
 
@@ -288,7 +288,7 @@ python3 scripts/cold_start_bench.py --runs 50 --output cold_start_report.json
    └── 关闭不必要的后台服务，减少干扰
 
 2. pause 镜像预缓存（关键：排除拉取镜像干扰）
-   ├── crictl pull registry.k8s.io/pause:3.9
+   ├── crictl pull registry.aliyuncs.com/google_containers/pause:3.9
    ├── 确认 crictl images | grep pause
    └── 确认 /var/lib/containerd 下镜像数据完整
 
@@ -458,7 +458,7 @@ crictl info | jq .status.conditions
 crictl --version
 
 # 预缓存 pause 镜像（冷启动测试前必做）
-crictl pull registry.k8s.io/pause:3.9
+crictl pull registry.aliyuncs.com/google_containers/pause:3.9
 crictl images | grep pause
 
 # 创建 Pod 沙箱

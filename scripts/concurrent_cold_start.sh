@@ -22,7 +22,7 @@ set -euo pipefail
 CONCURRENCY=${1:-10}        # 并发数
 RUNS=${2:-3}                # 重复轮次
 
-PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 RESULT_DIR="/tmp/conc-start-results"
 POD_CONFIG_DIR="/tmp/conc-pod-configs"
 LOG_PREFIX="$RESULT_DIR/conc-times"

@@ -29,7 +29,7 @@ from pathlib import Path
 # ============================================================
 # 配置（根据环境修改）
 # ============================================================
-PAUSE_IMAGE = "registry.k8s.io/pause:3.9"
+PAUSE_IMAGE = "registry.aliyuncs.com/google_containers/pause:3.9"
 OUTPUT_FILE = "cold_start_report.json"
 
 
