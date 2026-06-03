@@ -6,8 +6,9 @@ Pod 沙箱冷启动时延测试（基于 crictl）
 用法:
     python3 cold_start_bench.py --runs 50 --output cold_start_report.json
 
-前置条件:
-    crictl pull registry.k8s.io/pause:3.9   # pause 镜像必须预先缓存
+前置条件（脚本运行时自动检查）:
+    - crictl 可用
+    - pause 镜像已缓存（缺失则自动执行 crictl pull）
 """
 
 import time
@@ -16,6 +17,7 @@ import statistics
 import json
 import uuid
 import argparse
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -66,10 +68,59 @@ def compute_stats(values: list[float]) -> Stats:
 
 def _run(cmd: str) -> str:
     """执行 shell 命令，返回 stdout。失败抛出异常。"""
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"命令失败 [{cmd}]: {r.stderr.strip()}")
     return r.stdout.strip()
+
+
+# ============================================================
+# 前置条件检查
+# ============================================================
+def check_prerequisites():
+    """检查运行环境，缺失条件时自动修复（如拉取 pause 镜像）。"""
+    errors = []
+
+    # 1. 检查 crictl 是否可用
+    try:
+        version = _run("crictl --version")
+        print(f"[check] crictl 可用: {version}")
+    except Exception:
+        errors.append("crictl 未找到或不可用，请确认已安装并加入 PATH")
+
+    # 2. 检查 CRI 运行时是否正常
+    try:
+        _run("crictl info")
+        print("[check] CRI 运行时连接正常")
+    except Exception as e:
+        errors.append(f"CRI 运行时异常: {e}")
+
+    # 3. 检查 pause 镜像，缺失则自动拉取
+    try:
+        existing = _run(f"crictl images -q {PAUSE_IMAGE}")
+        if PAUSE_IMAGE in existing:
+            print(f"[check] pause 镜像已缓存: {PAUSE_IMAGE}")
+        else:
+            raise RuntimeError("镜像未找到")
+    except Exception:
+        print(f"[check] pause 镜像缺失，正在拉取: {PAUSE_IMAGE} ...")
+        try:
+            _run(f"crictl pull {PAUSE_IMAGE}")
+            print(f"[check] pause 镜像拉取完成: {PAUSE_IMAGE}")
+        except Exception as e:
+            errors.append(f"pause 镜像拉取失败: {e}")
+
+    # 4. 确认 /proc/sys/vm/drop_caches 可写（需要 root 权限）
+    if not Path("/proc/sys/vm/drop_caches").is_file():
+        errors.append("/proc/sys/vm/drop_caches 不可用，清除缓存功能将无法工作")
+
+    if errors:
+        print("\n前置条件检查失败:")
+        for err in errors:
+            print(f"  ✗ {err}")
+        sys.exit(1)
+
+    print("[check] 所有前置条件满足\n")
 
 
 # ============================================================
@@ -223,7 +274,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--runs", type=int, default=50, help="测试轮次（默认 50）")
     parser.add_argument("--output", default=OUTPUT_FILE, help="JSON 报告输出路径")
+    parser.add_argument("--skip-check", action="store_true", help="跳过前置条件检查")
     args = parser.parse_args()
+
+    if not args.skip_check:
+        check_prerequisites()
 
     report = run_benchmark(runs=args.runs)
 
