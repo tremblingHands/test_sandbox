@@ -116,6 +116,94 @@ check_containerd() {
 }
 
 # ============================================================
+# 检查 CNI 网络配置（确保子网够大，支持大量 pod）
+# ============================================================
+CNI_CONF_FILE="/etc/cni/net.d/10-mynet.conf"
+CNI_SUBNET="10.0.0.0/12"          # ~100 万 IP，足够大规模并发测试
+
+check_cni_network() {
+    echo ""
+    echo "--- CNI 网络配置 ---"
+
+    # 确保 CNI 配置目录存在
+    local cni_dir
+    cni_dir=$(dirname "$CNI_CONF_FILE")
+    if [ ! -d "$cni_dir" ]; then
+        if $CHECK_ONLY; then
+            warn "CNI 配置目录不存在: $cni_dir"
+            return 1
+        fi
+        sudo mkdir -p "$cni_dir"
+    fi
+
+    # 如果配置文件不存在，创建默认配置
+    if [ ! -f "$CNI_CONF_FILE" ]; then
+        if $CHECK_ONLY; then
+            warn "CNI 配置文件不存在: $CNI_CONF_FILE"
+            return 1
+        fi
+        echo "  创建 CNI bridge 配置 (subnet=$CNI_SUBNET)..."
+        cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<'CONFEOF'
+{
+  "cniVersion": "0.3.1",
+  "name": "mynet",
+  "type": "bridge",
+  "bridge": "cni0",
+  "isGateway": true,
+  "ipMasq": true,
+  "ipam": {
+    "type": "host-local",
+    "subnet": "10.0.0.0/12",
+    "routes": [
+      { "dst": "0.0.0.0/0" }
+    ]
+  }
+}
+CONFEOF
+        pass "CNI bridge 配置已创建 (subnet=$CNI_SUBNET)"
+        # 重启使配置生效
+        sudo systemctl restart containerd
+        sleep 2
+        return 0
+    fi
+
+    # 检查子网配置是否足够大
+    local current_subnet
+    current_subnet=$(grep -o '"subnet": "[^"]*"' "$CNI_CONF_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
+
+    if [ -z "$current_subnet" ]; then
+        warn "无法解析当前 CNI subnet"
+        return 1
+    fi
+
+    # 计算子网位数
+    local mask
+    mask=$(echo "$current_subnet" | cut -d'/' -f2)
+
+    if [ "$mask" -le 12 ] 2>/dev/null; then
+        pass "CNI subnet 已足够大: $current_subnet"
+    else
+        if $CHECK_ONLY; then
+            warn "CNI subnet 太小: $current_subnet (推荐 /12 或更小)"
+            return 1
+        fi
+        echo "  扩大 CNI subnet: $current_subnet → $CNI_SUBNET ..."
+        sudo sed -i "s|\"subnet\": \"[^\"]*\"|\"subnet\": \"$CNI_SUBNET\"|" "$CNI_CONF_FILE"
+        # 清理旧的 IP 分配记录（子网变了旧记录无效）
+        sudo rm -rf /var/lib/cni/networks/mynet/
+        pass "CNI subnet 已更新为: $CNI_SUBNET"
+
+        # 重启 containerd 使配置生效
+        echo "  重启 containerd 使 CNI 配置生效..."
+        sudo systemctl restart containerd
+        sleep 2
+        pass "containerd 已重启"
+    fi
+
+    return 0
+}
+
+# ============================================================
 # 检查 crictl
 # ============================================================
 check_crictl() {
@@ -351,6 +439,7 @@ main() {
     local errors=0
 
     check_containerd      || errors=$((errors + 1))
+    check_cni_network     || errors=$((errors + 1))
     check_crictl          || errors=$((errors + 1))
     check_crictl_config   || { [[ $? -eq 1 ]] && errors=$((errors + 1)); }
     check_registry_mirror || errors=$((errors + 1))
