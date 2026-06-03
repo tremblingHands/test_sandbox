@@ -4,10 +4,14 @@ Pod 沙箱冷启动时延测试（基于 crictl）
 仅创建 Pod 沙箱 + pause 容器，不包含业务容器，不含镜像拉取。
 
 用法:
+    # 首次使用先准备环境
+    ./scripts/setup.sh
+
+    # 运行测试
     python3 cold_start_bench.py --runs 50 --output cold_start_report.json
 
-前置条件（脚本运行时自动检查）:
-    - crictl 可用
+前置条件（脚本运行时自动检查，也可用 setup.sh 一次性准备）:
+    - containerd 运行中 + crictl 可用
     - pause 镜像已缓存（缺失则自动执行 crictl pull）
 """
 

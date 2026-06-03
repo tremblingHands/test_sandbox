@@ -3,14 +3,19 @@
 # 同时发起 N 个 crictl runp，测量并发下的时延和吞吐量。
 #
 # 用法:
+#   # 首次使用先准备环境
+#   ./scripts/setup.sh
+#
+#   # 运行并发测试
 #   ./concurrent_cold_start.sh <并发数> <轮次>
 #
 # 示例:
 #   ./concurrent_cold_start.sh 10 3     # 10 并发，3 轮
 #   ./concurrent_cold_start.sh 50       # 50 并发，默认 3 轮
 #
-# 前置条件:
-#   crictl pull registry.k8s.io/pause:3.9
+# 前置条件（脚本运行时自动检查，也可用 setup.sh 一次性准备）:
+#   - containerd 运行中 + crictl 可用
+#   - pause 镜像已缓存（缺失则自动拉取）
 
 set -euo pipefail
 

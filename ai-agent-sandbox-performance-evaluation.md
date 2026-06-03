@@ -220,20 +220,25 @@
 
 #### 4.2.1 前置条件
 
+一键准备环境（安装 containerd + crictl + 拉取 pause 镜像）：
+
 ```bash
-# 1. 确认 crictl 可用
-crictl --version
+# 完整安装
+./scripts/setup.sh
 
-# 2. 确认 containerd/CRI-O 运行中
-crictl info | jq .status.conditions
-
-# 3. 预先缓存 pause 镜像（关键：排除拉取镜像的干扰）
-PAUSE_IMAGE="registry.k8s.io/pause:3.9"
-crictl pull "$PAUSE_IMAGE"
-
-# 4. 确认 pause 镜像已在节点
-crictl images | grep pause
+# 或仅检查不安装
+./scripts/setup.sh --check-only
 ```
+
+脚本自动检查以下 5 项：
+
+| 检查项 | 自动修复 |
+|--------|---------|
+| containerd 安装及运行状态 | 下载安装 + 启动服务 |
+| runc 可用性 | 仅检查，提示手动安装 |
+| crictl 安装 | 从 GitHub Release 下载 |
+| crictl 连接 containerd | 写入 `/etc/crictl.yaml` |
+| pause 镜像缓存 | `crictl pull` |
 
 #### 4.2.2 单发冷启动测试 → [`scripts/cold_start_bench.py`](scripts/cold_start_bench.py)
 
