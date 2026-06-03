@@ -180,6 +180,25 @@ CONFEOF
     local mask
     mask=$(echo "$current_subnet" | cut -d'/' -f2)
 
+    # ---- 调整 bridge hash_max（默认 4096，大规模 pod 需加大） ---- #
+    local target_hash_max=1048576
+    if [ -d "/sys/class/net/cni0/bridge" ]; then
+        local current_hash
+        current_hash=$(cat /sys/class/net/cni0/bridge/hash_max 2>/dev/null || echo 0)
+        if [ "$current_hash" -lt "$target_hash_max" ] 2>/dev/null; then
+            if $CHECK_ONLY; then
+                warn "bridge hash_max 太小: $current_hash (推荐 $target_hash_max)"
+                return 1
+            fi
+            echo "  扩大 bridge hash_max: $current_hash → $target_hash_max ..."
+            sudo sh -c "echo $target_hash_max > /sys/class/net/cni0/bridge/hash_max"
+            current_hash=$(cat /sys/class/net/cni0/bridge/hash_max)
+            pass "bridge hash_max 已更新为: $current_hash"
+        else
+            pass "bridge hash_max 已足够大: $current_hash"
+        fi
+    fi
+
     if [ "$mask" -le 12 ] 2>/dev/null; then
         pass "CNI subnet 已足够大: $current_subnet"
     else
