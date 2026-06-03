@@ -278,7 +278,8 @@ def worker_counted_serial(worker_id, task_queue, round_num):
                                  sandbox_id[:12], t_runp_ms,
                                  t_ready_ms if t_ready_ms >= 0 else 0,
                                  round(t_runp_ms + max(t_ready_ms, 0), 3)))
-        cleanup_sandbox(sandbox_id)
+        if G.cleanup:
+            cleanup_sandbox(sandbox_id)
 
 
 def worker_counted_continuous_runp(worker_id, task_queue, ready_queue):
@@ -336,7 +337,7 @@ def worker_counted_continuous_poll(worker_id, round_num, ready_queue,
             item["t_runp_ms"],
             t_ready_ms if t_ready_ms >= 0 else 0,
             round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
-        if sid:
+        if sid and G.cleanup:
             cleanup_sandbox(sid)
 
 
@@ -376,7 +377,8 @@ def worker_timed_serial(worker_id, round_num, stop_event):
             sandbox_id[:12], t_runp_ms,
             t_ready_ms if t_ready_ms >= 0 else 0,
             round(t_runp_ms + max(t_ready_ms, 0), 3)))
-        cleanup_sandbox(sandbox_id)
+        if G.cleanup:
+            cleanup_sandbox(sandbox_id)
         seq += 1
 
 
@@ -447,7 +449,7 @@ def worker_timed_continuous_poll(worker_id, round_num, stop_event, ready_queue,
             item["t_runp_ms"],
             t_ready_ms if t_ready_ms >= 0 else 0,
             round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
-        if sid:
+        if sid and G.cleanup:
             cleanup_sandbox(sid)
 
 
@@ -712,11 +714,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--output", default=OUTPUT_FILE,
                         help="JSON 报告输出路径")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="每个 sandbox 就绪后立即清理（默认不清理）")
     parser.add_argument("--skip-check", action="store_true",
                         help="跳过前置条件检查")
     args = parser.parse_args()
 
-    # 确定模式
+    G.cleanup = args.cleanup
     G.use_timed = args.duration is not None
     per_round_val = args.duration if G.use_timed else args.per_round
 
@@ -733,6 +737,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("模式:     {}".format(args.mode))
     print("并发数:   {} threads".format(args.concurrency))
+    print("清理:     {}".format("是 (每就绪一个清理一个)" if G.cleanup else "否 (仅轮末/结束统一清理)"))
     if G.use_timed:
         print("每轮时长: {}s (固定时间)".format(args.duration))
     else:
@@ -787,6 +792,13 @@ if __name__ == "__main__":
         },
         "results": [r.to_dict() for r in _results],
     }
+    # 测试结束后统一清理所有残留 pod
+    print("")
+    print("[final cleanup] 清理所有测试 pod...")
+    for rnd in range(1, args.rounds + 1):
+        batch_cleanup(rnd)
+    print("[final cleanup] 完成")
+
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
