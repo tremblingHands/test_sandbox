@@ -207,8 +207,7 @@ check_kata_runtime() {
         echo "  下载: $kata_url"
         local tmpdir
         tmpdir=$(mktemp -d)
-        #curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
-	cp -ar /home/nathan/kata-static-3.22.0-arm64.tar.zst "$tmpdir/kata.tar.zst"
+        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
 
         # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
         if sudo tar --zstd -xf "$tmpdir/kata.tar.zst" -C / 2>/dev/null; then
@@ -250,6 +249,15 @@ check_kata_runtime() {
     kata_config=$(find "$KATA_INSTALL_DIR" -name "configuration-qemu-runtime-rs.toml" -type f 2>/dev/null | head -1)
     if [ -z "$kata_config" ]; then
         kata_config="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml"
+    fi
+
+    # 将默认 config 指向 QEMU 配置（默认是 dragonball，ARM64 不可用）
+    local default_config="${kata_config%/*}/configuration.toml"
+    if [ -f "$kata_config" ] && [ "$(readlink -f "$default_config" 2>/dev/null)" != "$kata_config" ]; then
+        if ! $CHECK_ONLY; then
+            sudo rm -f "$default_config"
+            sudo ln -s "$(basename "$kata_config")" "$default_config"
+        fi
     fi
 
     if [ -f "$kata_config" ]; then
