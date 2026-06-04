@@ -207,7 +207,8 @@ check_kata_runtime() {
         echo "  下载: $kata_url"
         local tmpdir
         tmpdir=$(mktemp -d)
-        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
+        #curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
+	cp -ar /home/nathan/kata-static-3.22.0-arm64.tar.zst "$tmpdir/kata.tar.zst"
 
         # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
         if sudo tar --zstd -xf "$tmpdir/kata.tar.zst" -C / 2>/dev/null; then
@@ -289,7 +290,7 @@ check_kata_runtime() {
     echo "  注册 kata runtime 到 containerd..."
 
     # 找到 kata 配置文件（runtime-rs 使用 runtime-rs 子目录下的配置）
-    local kata_config_path
+    local kata_config_path=""
     if echo "$kata_shim" | grep -q "runtime-rs"; then
         kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/runtime-rs/*" 2>/dev/null | head -1)
     fi
