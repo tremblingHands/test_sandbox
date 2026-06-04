@@ -177,13 +177,17 @@ check_kata_runtime() {
     echo ""
     echo "--- Kata Containers ---"
 
-    # ---- 1. 检查 kata-runtime ---- #
+    # ---- 1. 检查 kata shim（优先 runtime-rs 静态二进制，兼容旧 glibc） ---- #
     local kata_bin="$KATA_BIN_DIR/kata-runtime"
     local kata_shim="$KATA_BIN_DIR/containerd-shim-kata-v2"
+    local kata_rs_shim="$KATA_INSTALL_DIR/runtime-rs/bin/containerd-shim-kata-v2"
 
-    if [ -x "$kata_bin" ] && [ -x "$kata_shim" ]; then
-        local ver
-        ver=$("$kata_bin" --version 2>/dev/null | head -1)
+    # runtime-rs 是静态链接的 Rust 二进制，无需高版本 glibc
+    if [ -x "$kata_rs_shim" ]; then
+        pass "kata runtime-rs shim 可用: $kata_rs_shim"
+        kata_shim="$kata_rs_shim"
+    elif [ -x "$kata_shim" ] && ldd "$kata_shim" &>/dev/null; then
+        ver=$("$kata_bin" --version 2>/dev/null | head -1 || echo "kata (glibc)")
         pass "kata-runtime 已安装: $ver"
     else
         if $CHECK_ONLY; then
@@ -219,15 +223,16 @@ check_kata_runtime() {
         fi
         rm -rf "$tmpdir"
 
-        # kata-static 解包后的路径可能不同，尝试常见位置
+        # kata-static 解包后查找 shim（优先 runtime-rs 静态二进制）
         if [ ! -x "$kata_shim" ]; then
-            # 在解包目录中查找
             local found_shim
-            found_shim=$(find "$KATA_INSTALL_DIR" -name "containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
+            # 优先 runtime-rs（静态链接，兼容旧 glibc）
+            found_shim=$(find "$KATA_INSTALL_DIR" -path "*/runtime-rs/bin/containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
+            if [ -z "$found_shim" ]; then
+                found_shim=$(find "$KATA_INSTALL_DIR" -name "containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
+            fi
             if [ -n "$found_shim" ]; then
-                KATA_BIN_DIR=$(dirname "$found_shim")
-                kata_bin="$KATA_BIN_DIR/kata-runtime"
-                kata_shim="$KATA_BIN_DIR/containerd-shim-kata-v2"
+                kata_shim="$found_shim"
             fi
         fi
 
@@ -253,9 +258,14 @@ check_kata_runtime() {
 
     echo "  注册 kata runtime 到 containerd..."
 
-    # 找到 kata 配置文件（通常在 /opt/kata/share/defaults/...）
+    # 找到 kata 配置文件（runtime-rs 使用 runtime-rs 子目录下的配置）
     local kata_config_path
-    kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/kata-containers/*" 2>/dev/null | head -1)
+    if echo "$kata_shim" | grep -q "runtime-rs"; then
+        kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/runtime-rs/*" 2>/dev/null | head -1)
+    fi
+    if [ -z "$kata_config_path" ]; then
+        kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/kata-containers/*" 2>/dev/null | head -1)
+    fi
     if [ -z "$kata_config_path" ]; then
         kata_config_path="/opt/kata/share/defaults/kata-containers/configuration.toml"
     fi
