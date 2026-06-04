@@ -4,20 +4,21 @@
 # 安装 containerd + crictl，拉取 pause 镜像，配置运行环境。
 #
 # 用法:
-#   ./setup.sh                          # 完整安装，默认 ipvlan-l3
-#   ./setup.sh --cni-type bridge        # 使用 bridge CNI
-#   ./setup.sh --cni-type ipvlan-l2     # 使用 ipvlan L2 CNI
-#   ./setup.sh --cni-type ipvlan-l3     # 使用 ipvlan L3 CNI（默认）
-#   ./setup.sh --check-only              # 仅检查，不安装
+#   ./setup.sh                               # 完整安装，runc + ipvlan-l3
+#   ./setup.sh --runtime kata                # kata + dragonball（默认）
+#   ./setup.sh --runtime kata --hypervisor qemu  # kata + QEMU
+#   ./setup.sh --cni-type bridge             # 使用 bridge CNI
+#   ./setup.sh --check-only                   # 仅检查，不安装
 # ============================================================
 set -euo pipefail
 
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.19"
-CNI_TYPE="ipvlan-l3"          # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
-CONTAINERD_RUNTIME="runc"     # 默认: runc
-KATA_VERSION="3.22.0"         # kata containers 版本
+CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
+CONTAINERD_RUNTIME="runc"       # 默认: runc
+KATA_VERSION="3.22.0"           # kata containers 版本
+KATA_HYPERVISOR="dragonball"    # kata hypervisor: dragonball | qemu
 
 # 自动检测架构
 detect_arch() {
@@ -55,9 +56,16 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: --runtime 必须是 runc | kata"; exit 1 ;;
             esac
             shift 2 ;;
+        --hypervisor)
+            KATA_HYPERVISOR="$2"
+            case "$KATA_HYPERVISOR" in
+                dragonball|qemu) ;;
+                *) echo "ERROR: --hypervisor 必须是 dragonball | qemu"; exit 1 ;;
+            esac
+            shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--hypervisor dragonball|qemu] [--check-only]"
             exit 1 ;;
     esac
 done
@@ -167,6 +175,8 @@ detect_master_iface() {
 KATA_INSTALL_DIR="/opt/kata"
 KATA_BIN_DIR="$KATA_INSTALL_DIR/bin"
 # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 才能对齐
+INSTALL_FILES_DIR="./install"    # 本地 kata 包存放目录（优先使用，不纳入 git）
+TARBALL_NAME="kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
 
 check_kata_runtime() {
     # 非 kata 模式直接跳过
@@ -203,25 +213,36 @@ check_kata_runtime() {
                 sudo yum install -y -q zstd 2>/dev/null || true
         fi
 
-        local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
-        echo "  下载: $kata_url"
-        local tmpdir
-        tmpdir=$(mktemp -d)
-        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
+        local tarball_path=""
+        # 优先使用本地 install 目录中的包
+        if [ -f "${INSTALL_FILES_DIR}/${TARBALL_NAME}" ]; then
+            tarball_path="${INSTALL_FILES_DIR}/${TARBALL_NAME}"
+            echo "  使用本地包: $tarball_path"
+        else
+            local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
+            echo "  下载: $kata_url"
+            tarball_path="/tmp/kata-$$.tar.zst"
+            curl -fsSL "$kata_url" -o "$tarball_path"
+        fi
 
         # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
-        if sudo tar --zstd -xf "$tmpdir/kata.tar.zst" -C / 2>/dev/null; then
+        if sudo tar --zstd -xf "$tarball_path" -C / 2>/dev/null; then
             true
         elif command -v zstd &>/dev/null; then
-            zstd -d "$tmpdir/kata.tar.zst" -o "$tmpdir/kata.tar" 2>/dev/null || \
-                zstdcat "$tmpdir/kata.tar.zst" > "$tmpdir/kata.tar"
+            local tmpdir; tmpdir=$(mktemp -d)
+            zstd -d "$tarball_path" -o "$tmpdir/kata.tar" 2>/dev/null || \
+                zstdcat "$tarball_path" > "$tmpdir/kata.tar"
             sudo tar -C / -xf "$tmpdir/kata.tar"
+            rm -rf "$tmpdir"
         else
             fail "无法解压 .tar.zst 文件（需要 zstd 或 tar --zstd）"
-            rm -rf "$tmpdir"
             return 1
         fi
-        rm -rf "$tmpdir"
+
+        # 清理临时下载（保留本地 install 目录中的文件）
+        if [ "$tarball_path" != "${INSTALL_FILES_DIR}/${TARBALL_NAME}" ]; then
+            rm -f "$tarball_path"
+        fi
 
         # kata-static 解包后查找 shim（优先 runtime-rs 静态二进制）
         if [ ! -x "$kata_shim" ]; then
@@ -244,44 +265,75 @@ check_kata_runtime() {
         fi
     fi
 
-    # ---- 1.5 修补 runtime-rs QEMU 配置（ARM64 兼容性） ---- #
-    local kata_config
-    kata_config=$(find "$KATA_INSTALL_DIR" -name "configuration-qemu-runtime-rs.toml" -type f 2>/dev/null | head -1)
-    if [ -z "$kata_config" ]; then
-        kata_config="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml"
-    fi
+    # ---- 1.5 配置 runtime-rs hypervisor（dragonball 或 qemu） ---- #
+    local kata_config_dir="/opt/kata/share/defaults/kata-containers/runtime-rs"
 
-    # 将默认 config 指向 QEMU 配置（默认是 dragonball，ARM64 不可用）
-    local default_config="${kata_config%/*}/configuration.toml"
-    if [ -f "$kata_config" ] && [ "$(readlink -f "$default_config" 2>/dev/null)" != "$kata_config" ]; then
-        if ! $CHECK_ONLY; then
-            sudo rm -f "$default_config"
-            sudo ln -s "$(basename "$kata_config")" "$default_config"
-        fi
-    fi
+    # 选择并修补对应的 hypervisor 配置
+    case "$KATA_HYPERVISOR" in
+        dragonball)
+            # 使用 kata 包默认的 dragonball 配置（configuration.toml 默认指向它）
+            local db_config="$kata_config_dir/configuration-dragonball.toml"
+            if [ -f "$db_config" ]; then
+                echo "  配置 runtime-rs dragonball（从默认配置开始）..."
 
-    if [ -f "$kata_config" ]; then
-        echo "  修补 runtime-rs QEMU 配置（ARM64 适配）..."
-        # 1. machine_type: q35 是 x86 专用，ARM64 必须用 virt
-        sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$kata_config"
-        # 2. kernel: vmlinux.container 不存在，用实际文件名
-        local actual_kernel
-        actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
-        if [ -n "$actual_kernel" ]; then
-            sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$kata_config"
-        fi
-        # 3. firmware: ARM64 必须指定 UEFI firmware 路径
-        if grep -q 'firmware = ""' "$kata_config" 2>/dev/null; then
-            sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$kata_config"
-            sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$kata_config"
-        fi
-        # 4. rootfs driver: virtio-pmem 在 ARM64 virt 上会导致 QEMU 崩溃 (ECONNRESET)
-        sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$kata_config"
-        # 5. 保持 image + virtio-fs 模式（性能优于 initrd，已验证可用）
-        pass "runtime-rs QEMU 配置已修补"
-    else
-        warn "未找到 runtime-rs QEMU 配置文件，跳过修补"
-    fi
+                # 1. kernel: 用实际存在的内核文件
+                local actual_kernel
+                actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | grep -v dragonball | head -1)
+                [ -z "$actual_kernel" ] && actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
+                if [ -n "$actual_kernel" ]; then
+                    sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$db_config"
+                fi
+
+                # 2. 确保 configuration.toml 指向 dragonball
+                local default_config="$kata_config_dir/configuration.toml"
+                if [ "$(readlink -f "$default_config" 2>/dev/null)" != "$db_config" ]; then
+                    if ! $CHECK_ONLY; then
+                        sudo rm -f "$default_config"
+                        sudo ln -s configuration-dragonball.toml "$default_config"
+                    fi
+                fi
+                pass "runtime-rs dragonball 配置完成"
+            else
+                fail "dragonball 配置文件不存在: $db_config"
+                return 1
+            fi
+            ;;
+
+        qemu)
+            # 使用 QEMU runtime-rs 配置，并修补 ARM64 兼容性
+            local qemu_config="$kata_config_dir/configuration-qemu-runtime-rs.toml"
+            if [ -f "$qemu_config" ]; then
+                echo "  配置 runtime-rs QEMU（ARM64 适配）..."
+
+                # 1. machine_type: q35 是 x86 专用，ARM64 必须用 virt
+                sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$qemu_config"
+                # 2. kernel
+                local actual_kernel
+                actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
+                [ -n "$actual_kernel" ] && sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$qemu_config"
+                # 3. firmware: ARM64 UEFI
+                if grep -q 'firmware = ""' "$qemu_config" 2>/dev/null; then
+                    sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$qemu_config"
+                    sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$qemu_config"
+                fi
+                # 4. virtio-pmem → virtio-blk-pci (ARM64 virt 上 pmem 会崩)
+                sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$qemu_config"
+
+                # 5. 指向 QEMU 配置
+                local default_config="$kata_config_dir/configuration.toml"
+                if [ "$(readlink -f "$default_config" 2>/dev/null)" != "$qemu_config" ]; then
+                    if ! $CHECK_ONLY; then
+                        sudo rm -f "$default_config"
+                        sudo ln -s configuration-qemu-runtime-rs.toml "$default_config"
+                    fi
+                fi
+                pass "runtime-rs QEMU 配置完成"
+            else
+                fail "QEMU runtime-rs 配置文件不存在: $qemu_config"
+                return 1
+            fi
+            ;;
+    esac
 
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
     local config_file="/etc/containerd/config.toml"
@@ -750,6 +802,9 @@ main() {
     echo "=============================================="
     echo "  检测架构: $(uname -m) → $ARCH"
     echo "  Runtime:  $CONTAINERD_RUNTIME"
+    if [ "$CONTAINERD_RUNTIME" = "kata" ]; then
+        echo "  Kata Hypervisor: $KATA_HYPERVISOR"
+    fi
     echo "  CNI 类型: $CNI_TYPE"
     echo "  pause 镜像: $PAUSE_IMAGE"
     echo "=============================================="
