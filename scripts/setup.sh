@@ -342,12 +342,12 @@ check_kata_runtime() {
         local need_fix=false
         if ! grep -q "runtime-rs" <<< "$(grep 'runtime_path.*kata' "$config_file")"; then
             warn "kata runtime_path 未指向 runtime-rs，正在修正..."
-            sudo sed -i "s|runtime_path = '/opt/kata/bin/containerd-shim-kata-v2'|runtime_path = '$kata_shim'|" "$config_file"
+            sudo sed -i "/runtimes\.kata\]/,/^\[/s|runtime_path = .*|runtime_path = '$kata_shim'|" "$config_file"
             need_fix=true
         fi
         if ! grep -q "runtime-rs" <<< "$(grep 'ConfigPath.*kata' "$config_file")"; then
             warn "kata ConfigPath 未指向 runtime-rs，正在修正..."
-            sudo sed -i "s|ConfigPath = .*|ConfigPath = '/opt/kata/share/defaults/kata-containers/runtime-rs/configuration.toml'|" "$config_file"
+            sudo sed -i "/runtimes\.kata\]/,/^\[/s|ConfigPath = .*|ConfigPath = '/opt/kata/share/defaults/kata-containers/runtime-rs/configuration.toml'|" "$config_file"
             need_fix=true
         fi
         if $need_fix; then
