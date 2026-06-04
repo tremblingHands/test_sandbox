@@ -166,6 +166,7 @@ detect_master_iface() {
 # ============================================================
 KATA_INSTALL_DIR="/opt/kata"
 KATA_BIN_DIR="$KATA_INSTALL_DIR/bin"
+# kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 才能对齐
 
 check_kata_runtime() {
     # 非 kata 模式直接跳过
@@ -202,17 +203,15 @@ check_kata_runtime() {
         echo "  下载: $kata_url"
         local tmpdir
         tmpdir=$(mktemp -d)
-        #curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
-	cp -ar /home/nathan/kata-static-3.22.0-arm64.tar.zst "$tmpdir/kata.tar.zst"
-        sudo mkdir -p "$KATA_INSTALL_DIR"
+        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
 
-        # 解压 .tar.zst（优先用 tar --zstd，fallback: zstd -d + tar）
-        if tar --zstd -xf "$tmpdir/kata.tar.zst" -C "$KATA_INSTALL_DIR" 2>/dev/null; then
+        # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
+        if sudo tar --zstd -xf "$tmpdir/kata.tar.zst" -C / 2>/dev/null; then
             true
         elif command -v zstd &>/dev/null; then
             zstd -d "$tmpdir/kata.tar.zst" -o "$tmpdir/kata.tar" 2>/dev/null || \
                 zstdcat "$tmpdir/kata.tar.zst" > "$tmpdir/kata.tar"
-            sudo tar -C "$KATA_INSTALL_DIR" -xf "$tmpdir/kata.tar"
+            sudo tar -C / -xf "$tmpdir/kata.tar"
         else
             fail "无法解压 .tar.zst 文件（需要 zstd 或 tar --zstd）"
             rm -rf "$tmpdir"
