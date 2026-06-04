@@ -244,6 +244,47 @@ check_kata_runtime() {
         fi
     fi
 
+    # ---- 1.5 修补 runtime-rs QEMU 配置（ARM64 兼容性） ---- #
+    local kata_config
+    kata_config=$(find "$KATA_INSTALL_DIR" -name "configuration-qemu-runtime-rs.toml" -type f 2>/dev/null | head -1)
+    if [ -z "$kata_config" ]; then
+        kata_config="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml"
+    fi
+
+    if [ -f "$kata_config" ]; then
+        echo "  修补 runtime-rs QEMU 配置（ARM64 适配）..."
+        # 1. machine_type: q35 是 x86 专用，ARM64 必须用 virt
+        sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$kata_config"
+        # 2. nvdimm: ARM64 virt 机型不支持
+        sudo sed -i 's|machine_accelerators=""|machine_accelerators="nvdimm=off"|' "$kata_config"
+        # 3. kernel: vmlinux.container 不存在，用实际文件
+        local actual_kernel
+        actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
+        if [ -n "$actual_kernel" ]; then
+            sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$kata_config"
+        fi
+        # 4. firmware: ARM64 需要 UEFI firmware
+        if grep -q 'firmware = ""' "$kata_config" 2>/dev/null; then
+            sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$kata_config"
+            sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$kata_config"
+        fi
+        # 5. rootfs: 改用 initrd（跳过 virtio-fs 兼容问题）
+        if grep -q '^image = ' "$kata_config" 2>/dev/null; then
+            local actual_initrd
+            actual_initrd=$(ls /opt/kata/share/kata-containers/kata-*.initrd 2>/dev/null | head -1)
+            if [ -n "$actual_initrd" ]; then
+                sudo sed -i 's|^image = .*|# image = "/opt/kata/share/kata-containers/kata-containers.img"|' "$kata_config"
+                sudo sed -i "s|^# initrd = .*|initrd = \"$actual_initrd\"|" "$kata_config"
+                sudo sed -i 's|disable_block_device_use = false|disable_block_device_use = true|' "$kata_config"
+            fi
+        fi
+        # 6. rootfs driver: virtio-pmem → virtio-blk-pci（更兼容）
+        sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$kata_config"
+        pass "runtime-rs QEMU 配置已修补"
+    else
+        warn "未找到 runtime-rs QEMU 配置文件，跳过修补"
+    fi
+
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
     local config_file="/etc/containerd/config.toml"
     if grep -q "io.containerd.kata.v2" "$config_file" 2>/dev/null; then
