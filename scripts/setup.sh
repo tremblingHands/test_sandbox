@@ -17,7 +17,7 @@ CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.19"
 CNI_TYPE="ipvlan-l3"          # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 CONTAINERD_RUNTIME="runc"     # 默认: runc
-KATA_VERSION="3.21.1"         # kata containers 版本
+KATA_VERSION="3.22.0"         # kata containers 版本
 
 # 自动检测架构
 detect_arch() {
@@ -191,14 +191,32 @@ check_kata_runtime() {
         fi
         warn "kata-runtime 未安装，正在安装 v${KATA_VERSION}..."
 
-        local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.xz"
+        # 确保 zstd 解压工具可用
+        if ! command -v zstd &>/dev/null; then
+            echo "  安装 zstd..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq zstd 2>/dev/null || \
+                sudo yum install -y -q zstd 2>/dev/null || true
+        fi
+
+        local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
         echo "  下载: $kata_url"
         local tmpdir
         tmpdir=$(mktemp -d)
-        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.xz"
+        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
         sudo mkdir -p "$KATA_INSTALL_DIR"
-        sudo tar -C "$KATA_INSTALL_DIR" -xJf "$tmpdir/kata.tar.xz" 2>/dev/null || \
-            sudo tar -C "$KATA_INSTALL_DIR" -xf "$tmpdir/kata.tar.xz"
+
+        # 解压 .tar.zst（优先用 tar --zstd，fallback: zstd -d + tar）
+        if tar --zstd -xf "$tmpdir/kata.tar.zst" -C "$KATA_INSTALL_DIR" 2>/dev/null; then
+            true
+        elif command -v zstd &>/dev/null; then
+            zstd -d "$tmpdir/kata.tar.zst" -o "$tmpdir/kata.tar" 2>/dev/null || \
+                zstdcat "$tmpdir/kata.tar.zst" > "$tmpdir/kata.tar"
+            sudo tar -C "$KATA_INSTALL_DIR" -xf "$tmpdir/kata.tar"
+        else
+            fail "无法解压 .tar.zst 文件（需要 zstd 或 tar --zstd）"
+            rm -rf "$tmpdir"
+            return 1
+        fi
         rm -rf "$tmpdir"
 
         # kata-static 解包后的路径可能不同，尝试常见位置
