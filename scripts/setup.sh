@@ -263,6 +263,11 @@ check_kata_runtime() {
             fail "kata-runtime 安装失败，未找到 containerd-shim-kata-v2"
             return 1
         fi
+
+        # 重新检测 runtime-rs shim（安装后新文件已就位，更新 kata_shim）
+        if [ -x "$kata_rs_shim" ]; then
+            kata_shim="$kata_rs_shim"
+        fi
     fi
 
     # ---- 1.5 配置 runtime-rs hypervisor（dragonball 或 qemu） ---- #
