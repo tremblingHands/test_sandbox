@@ -438,65 +438,19 @@ check_cni_network() {
 
         case "$CNI_TYPE" in
             bridge)
-                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
-{
-  "cniVersion": "0.3.1",
-  "name": "mynet",
-  "type": "bridge",
-  "bridge": "cni0",
-  "isGateway": true,
-  "ipMasq": true,
-  "ipam": {
-    "type": "host-local",
-    "subnet": "$CNI_SUBNET",
-    "routes": [
-      { "dst": "0.0.0.0/0" }
-    ]
-  }
-}
-CONFEOF
+                printf '{\n  "cniVersion": "0.3.1",\n  "name": "mynet",\n  "type": "bridge",\n  "bridge": "cni0",\n  "isGateway": true,\n  "ipMasq": true,\n  "ipam": {\n    "type": "host-local",\n    "subnet": "%s",\n    "routes": [\n      { "dst": "0.0.0.0/0" }\n    ]\n  }\n}\n' "$CNI_SUBNET" | sudo tee "$CNI_CONF_FILE" > /dev/null
                 ;;
             ipvlan-l2)
                 local master
                 master=$(detect_master_iface)
                 echo "  ipvlan master 网卡: $master"
-                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
-{
-  "cniVersion": "0.3.1",
-  "name": "mynet",
-  "type": "ipvlan",
-  "master": "$master",
-  "mode": "l2",
-  "ipam": {
-    "type": "host-local",
-    "subnet": "$CNI_SUBNET",
-    "routes": [
-      { "dst": "0.0.0.0/0" }
-    ]
-  }
-}
-CONFEOF
+                printf '{\n  "cniVersion": "0.3.1",\n  "name": "mynet",\n  "type": "ipvlan",\n  "master": "%s",\n  "mode": "l2",\n  "ipam": {\n    "type": "host-local",\n    "subnet": "%s",\n    "routes": [\n      { "dst": "0.0.0.0/0" }\n    ]\n  }\n}\n' "$master" "$CNI_SUBNET" | sudo tee "$CNI_CONF_FILE" > /dev/null
                 ;;
             ipvlan-l3)
                 local master
                 master=$(detect_master_iface)
                 echo "  ipvlan master 网卡: $master"
-                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
-{
-  "cniVersion": "0.3.1",
-  "name": "mynet",
-  "type": "ipvlan",
-  "master": "$master",
-  "mode": "l3",
-  "ipam": {
-    "type": "host-local",
-    "subnet": "$CNI_SUBNET",
-    "routes": [
-      { "dst": "0.0.0.0/0" }
-    ]
-  }
-}
-CONFEOF
+                printf '{\n  "cniVersion": "0.3.1",\n  "name": "mynet",\n  "type": "ipvlan",\n  "master": "%s",\n  "mode": "l3",\n  "ipam": {\n    "type": "host-local",\n    "subnet": "%s",\n    "routes": [\n      { "dst": "0.0.0.0/0" }\n    ]\n  }\n}\n' "$master" "$CNI_SUBNET" | sudo tee "$CNI_CONF_FILE" > /dev/null
                 ;;
         esac
 
