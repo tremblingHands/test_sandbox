@@ -255,31 +255,20 @@ check_kata_runtime() {
         echo "  修补 runtime-rs QEMU 配置（ARM64 适配）..."
         # 1. machine_type: q35 是 x86 专用，ARM64 必须用 virt
         sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$kata_config"
-        # 2. nvdimm: ARM64 virt 机型不支持
-        sudo sed -i 's|machine_accelerators=""|machine_accelerators="nvdimm=off"|' "$kata_config"
-        # 3. kernel: vmlinux.container 不存在，用实际文件
+        # 2. kernel: vmlinux.container 不存在，用实际文件名
         local actual_kernel
         actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
         if [ -n "$actual_kernel" ]; then
             sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$kata_config"
         fi
-        # 4. firmware: ARM64 需要 UEFI firmware
+        # 3. firmware: ARM64 必须指定 UEFI firmware 路径
         if grep -q 'firmware = ""' "$kata_config" 2>/dev/null; then
             sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$kata_config"
             sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$kata_config"
         fi
-        # 5. rootfs: 改用 initrd（跳过 virtio-fs 兼容问题）
-        if grep -q '^image = ' "$kata_config" 2>/dev/null; then
-            local actual_initrd
-            actual_initrd=$(ls /opt/kata/share/kata-containers/kata-*.initrd 2>/dev/null | head -1)
-            if [ -n "$actual_initrd" ]; then
-                sudo sed -i 's|^image = .*|# image = "/opt/kata/share/kata-containers/kata-containers.img"|' "$kata_config"
-                sudo sed -i "s|^# initrd = .*|initrd = \"$actual_initrd\"|" "$kata_config"
-                sudo sed -i 's|disable_block_device_use = false|disable_block_device_use = true|' "$kata_config"
-            fi
-        fi
-        # 6. rootfs driver: virtio-pmem → virtio-blk-pci（更兼容）
+        # 4. rootfs driver: virtio-pmem 在 ARM64 virt 上会导致 QEMU 崩溃 (ECONNRESET)
         sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$kata_config"
+        # 5. 保持 image + virtio-fs 模式（性能优于 initrd，已验证可用）
         pass "runtime-rs QEMU 配置已修补"
     else
         warn "未找到 runtime-rs QEMU 配置文件，跳过修补"
