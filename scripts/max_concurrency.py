@@ -82,8 +82,8 @@ def generate_pod_config(index):
     return path, name
 
 
-def create_sandbox(pod_config_path):
-    return _run_checked("crictl runp --runtime runc {}".format(pod_config_path))
+def create_sandbox(pod_config_path, runtime="runc"):
+    return _run_checked("crictl runp --runtime {} {}".format(runtime, pod_config_path))
 
 
 def wait_until_ready(sandbox_id, timeout_sec=60.0):
@@ -142,6 +142,8 @@ if __name__ == "__main__":
                         help="上限（0 = 无上限，直到创建失败）")
     parser.add_argument("--output", default="max_concurrency_report.json",
                         help="报告输出路径")
+    parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
+                        help="OCI 运行时 (默认 runc)")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="保留所有 pod 不清理（便于调试）")
     parser.add_argument("--skip-check", action="store_true",
@@ -179,7 +181,7 @@ if __name__ == "__main__":
         # ---- 创建 ---- #
         t0 = time.perf_counter()
         try:
-            sandbox_id = create_sandbox(pod_config_path)
+            sandbox_id = create_sandbox(pod_config_path, args.runtime)
         except Exception as e:
             err_msg = str(e)
             print("\n[FAIL] 第 {} 个沙箱创建失败:".format(i))

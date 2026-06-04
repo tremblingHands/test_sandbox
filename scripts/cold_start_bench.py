@@ -198,10 +198,10 @@ def prepare_pod_config(run_id):
     return path
 
 
-def run_pod_sandbox(pod_config_path):
-    # type: (str) -> str
+def run_pod_sandbox(pod_config_path, runtime="runc"):
+    # type: (str, str) -> str
     """调用 crictl runp 创建 Pod 沙箱，返回 sandbox ID"""
-    return _run("crictl runp --runtime runc {}".format(pod_config_path))
+    return _run("crictl runp --runtime {} {}".format(runtime, pod_config_path))
 
 
 def wait_until_ready(sandbox_id, timeout_sec=30.0):
@@ -253,7 +253,7 @@ def single_cold_start(run_id):
 
     # ---- 阶段 1: t_runp ---- #
     t0 = time.perf_counter()
-    sandbox_id = run_pod_sandbox(pod_config_path)
+    sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
     t1 = time.perf_counter()
     t_runp_ms = (t1 - t0) * 1000
 
@@ -328,6 +328,8 @@ if __name__ == "__main__":
         description="Pod 沙箱冷启动时延测试 (crictl)"
     )
     parser.add_argument("--runs", type=int, default=50, help="测试轮次（默认 50）")
+    parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
+                        help="OCI 运行时 (默认 runc)")
     parser.add_argument("--output", default=OUTPUT_FILE, help="JSON 报告输出路径")
     parser.add_argument("--skip-check", action="store_true", help="跳过前置条件检查")
     args = parser.parse_args()

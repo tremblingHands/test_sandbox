@@ -16,6 +16,8 @@ PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.19"
 CNI_TYPE="ipvlan-l3"          # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
+CONTAINERD_RUNTIME="runc"     # 默认: runc
+KATA_VERSION="3.21.1"         # kata containers 版本
 
 # 自动检测架构
 detect_arch() {
@@ -46,9 +48,16 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: --cni-type 必须是 bridge | ipvlan-l2 | ipvlan-l3"; exit 1 ;;
             esac
             shift 2 ;;
+        --runtime)
+            CONTAINERD_RUNTIME="$2"
+            case "$CONTAINERD_RUNTIME" in
+                runc|kata) ;;
+                *) echo "ERROR: --runtime 必须是 runc | kata"; exit 1 ;;
+            esac
+            shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--check-only]"
             exit 1 ;;
     esac
 done
@@ -152,6 +161,121 @@ detect_master_iface() {
     echo "${iface:-eth0}"
 }
 
+# ============================================================
+# 检查 kata runtime（仅在 --runtime kata 时执行）
+# ============================================================
+KATA_INSTALL_DIR="/opt/kata"
+KATA_BIN_DIR="$KATA_INSTALL_DIR/bin"
+
+check_kata_runtime() {
+    # 非 kata 模式直接跳过
+    if [ "$CONTAINERD_RUNTIME" != "kata" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo "--- Kata Containers ---"
+
+    # ---- 1. 检查 kata-runtime ---- #
+    local kata_bin="$KATA_BIN_DIR/kata-runtime"
+    local kata_shim="$KATA_BIN_DIR/containerd-shim-kata-v2"
+
+    if [ -x "$kata_bin" ] && [ -x "$kata_shim" ]; then
+        local ver
+        ver=$("$kata_bin" --version 2>/dev/null | head -1)
+        pass "kata-runtime 已安装: $ver"
+    else
+        if $CHECK_ONLY; then
+            fail "kata-runtime 未安装（需要 --runtime kata）"
+            return 1
+        fi
+        warn "kata-runtime 未安装，正在安装 v${KATA_VERSION}..."
+
+        local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.xz"
+        echo "  下载: $kata_url"
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.xz"
+        sudo mkdir -p "$KATA_INSTALL_DIR"
+        sudo tar -C "$KATA_INSTALL_DIR" -xJf "$tmpdir/kata.tar.xz" 2>/dev/null || \
+            sudo tar -C "$KATA_INSTALL_DIR" -xf "$tmpdir/kata.tar.xz"
+        rm -rf "$tmpdir"
+
+        # kata-static 解包后的路径可能不同，尝试常见位置
+        if [ ! -x "$kata_shim" ]; then
+            # 在解包目录中查找
+            local found_shim
+            found_shim=$(find "$KATA_INSTALL_DIR" -name "containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
+            if [ -n "$found_shim" ]; then
+                KATA_BIN_DIR=$(dirname "$found_shim")
+                kata_bin="$KATA_BIN_DIR/kata-runtime"
+                kata_shim="$KATA_BIN_DIR/containerd-shim-kata-v2"
+            fi
+        fi
+
+        if [ -x "$kata_shim" ]; then
+            pass "kata-runtime 安装完成: $("$kata_bin" --version 2>/dev/null | head -1 || echo ok)"
+        else
+            fail "kata-runtime 安装失败，未找到 containerd-shim-kata-v2"
+            return 1
+        fi
+    fi
+
+    # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
+    local config_file="/etc/containerd/config.toml"
+    if grep -q "io.containerd.kata.v2" "$config_file" 2>/dev/null; then
+        pass "containerd 已注册 kata runtime"
+        return 0
+    fi
+
+    if $CHECK_ONLY; then
+        warn "containerd 未注册 kata runtime"
+        return 1
+    fi
+
+    echo "  注册 kata runtime 到 containerd..."
+    # 在 runc runtime 段之后追加 kata 配置
+    local kata_section
+    kata_section=$(cat <<KATAEOF
+
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]
+    runtime_type = 'io.containerd.kata.v2'
+    runtime_path = '$kata_shim'
+    privileged_without_host_devices = true
+    pod_annotations = ['io.katacontainers.*']
+    container_annotations = []
+    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata.options]
+KATAEOF
+)
+    # 在 runc runtime 段的最后一个 options 后插入
+    # 找到 "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]" 之前的位置
+    if grep -q "\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc\]" "$config_file"; then
+        # 找到 runc 段结束后的下一行插入
+        local insert_line
+        insert_line=$(grep -n "sandboxer = 'podsandbox'" "$config_file" | tail -1 | cut -d: -f1)
+        insert_line=$((insert_line + 1))
+        sudo sed -i "${insert_line}i\\${kata_section}" "$config_file"
+    else
+        # fallback: 追加到文件末尾
+        echo "$kata_section" | sudo tee -a "$config_file" > /dev/null
+    fi
+
+    # 重启 containerd 使配置生效
+    echo "  重启 containerd 使 kata runtime 生效..."
+    sudo systemctl restart containerd
+    sleep 2
+
+    if grep -q "io.containerd.kata.v2" "$config_file"; then
+        pass "kata runtime 已注册到 containerd"
+    else
+        fail "kata runtime 注册失败"
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================
 check_cni_network() {
     echo ""
     echo "--- CNI 网络配置 (类型: $CNI_TYPE) ---"
@@ -554,6 +678,7 @@ main() {
     echo "  沙箱冷启动测试 — 环境准备"
     echo "=============================================="
     echo "  检测架构: $(uname -m) → $ARCH"
+    echo "  Runtime:  $CONTAINERD_RUNTIME"
     echo "  CNI 类型: $CNI_TYPE"
     echo "  pause 镜像: $PAUSE_IMAGE"
     echo "=============================================="
@@ -562,6 +687,7 @@ main() {
     local errors=0
 
     check_containerd      || errors=$((errors + 1))
+    check_kata_runtime    || errors=$((errors + 1))
     check_cni_network     || errors=$((errors + 1))
     check_crictl          || errors=$((errors + 1))
     check_crictl_config   || { [[ $? -eq 1 ]] && errors=$((errors + 1)); }

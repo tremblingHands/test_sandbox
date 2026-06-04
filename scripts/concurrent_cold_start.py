@@ -196,8 +196,8 @@ def generate_pod_config(round_num, worker_id, local_seq):
 # ============================================================
 # Pod 沙箱操作
 # ============================================================
-def run_pod_sandbox(pod_config_path):
-    return _run("crictl runp --runtime runc {}".format(pod_config_path))
+def run_pod_sandbox(pod_config_path, runtime="runc"):
+    return _run("crictl runp --runtime {} {}".format(runtime, pod_config_path))
 
 
 def poll_until_ready(sandbox_id, timeout_sec=30.0):
@@ -260,7 +260,7 @@ def worker_counted_serial(worker_id, task_queue, round_num):
 
         t0 = time.perf_counter()
         try:
-            sandbox_id = run_pod_sandbox(pod_config_path)
+            sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             add_result(SandboxResult(round_num, worker_id, task_index,
                                      "FAIL", 0, 0, 0))
@@ -292,7 +292,7 @@ def worker_counted_continuous_runp(worker_id, task_queue, ready_queue):
 
         t0 = time.perf_counter()
         try:
-            sandbox_id = run_pod_sandbox(pod_config_path)
+            sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             sandbox_id = None
         t1 = time.perf_counter()
@@ -356,7 +356,7 @@ def worker_timed_serial(worker_id, round_num, stop_event):
 
         t0 = time.perf_counter()
         try:
-            sandbox_id = run_pod_sandbox(pod_config_path)
+            sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             add_result(SandboxResult(round_num, worker_id, seq,
                                      "FAIL", 0, 0, 0))
@@ -392,7 +392,7 @@ def worker_timed_continuous_runp(worker_id, round_num, stop_event, ready_queue):
 
         t0 = time.perf_counter()
         try:
-            sandbox_id = run_pod_sandbox(pod_config_path)
+            sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             sandbox_id = None
         t1 = time.perf_counter()
@@ -701,6 +701,8 @@ if __name__ == "__main__":
                         help="并发线程数 N (默认 5)")
     parser.add_argument("--rounds", type=int, default=3,
                         help="总轮次 K (默认 3)")
+    parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
+                        help="OCI 运行时 (默认 runc)")
     parser.add_argument("--mode", choices=["continuous", "serial"],
                         default="continuous",
                         help="continuous(不等就绪) / serial(等就绪)")
