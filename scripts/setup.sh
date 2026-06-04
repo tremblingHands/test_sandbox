@@ -4,14 +4,18 @@
 # 安装 containerd + crictl，拉取 pause 镜像，配置运行环境。
 #
 # 用法:
-#   ./setup.sh                # 完整安装并检查
-#   ./setup.sh --check-only   # 仅检查，不安装
+#   ./setup.sh                          # 完整安装，默认 ipvlan-l3
+#   ./setup.sh --cni-type bridge        # 使用 bridge CNI
+#   ./setup.sh --cni-type ipvlan-l2     # 使用 ipvlan L2 CNI
+#   ./setup.sh --cni-type ipvlan-l3     # 使用 ipvlan L3 CNI（默认）
+#   ./setup.sh --check-only              # 仅检查，不安装
 # ============================================================
 set -euo pipefail
 
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.19"
+CNI_TYPE="ipvlan-l3"          # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 
 # 自动检测架构
 detect_arch() {
@@ -30,9 +34,24 @@ detect_arch() {
 ARCH=$(detect_arch)
 
 CHECK_ONLY=false
-if [[ "${1:-}" == "--check-only" ]]; then
-    CHECK_ONLY=true
-fi
+# 解析参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check-only)
+            CHECK_ONLY=true; shift ;;
+        --cni-type)
+            CNI_TYPE="$2"
+            case "$CNI_TYPE" in
+                bridge|ipvlan-l2|ipvlan-l3) ;;
+                *) echo "ERROR: --cni-type 必须是 bridge | ipvlan-l2 | ipvlan-l3"; exit 1 ;;
+            esac
+            shift 2 ;;
+        *)
+            echo "ERROR: 未知参数: $1"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--check-only]"
+            exit 1 ;;
+    esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -116,16 +135,27 @@ check_containerd() {
 }
 
 # ============================================================
-# 检查 CNI 网络配置（确保子网够大，支持大量 pod）
+# 检查 CNI 网络配置
+# 支持 bridge / ipvlan-l2 / ipvlan-l3，默认 ipvlan-l3（百万 pod 规模无瓶颈）
 # ============================================================
 CNI_CONF_FILE="/etc/cni/net.d/10-mynet.conf"
-CNI_SUBNET="10.0.0.0/12"          # ~100 万 IP，足够大规模并发测试
+CNI_SUBNET="10.0.0.0/12"          # ~100 万 IP
+
+# 自动检测默认路由对应的物理网卡（ipvlan master）
+detect_master_iface() {
+    local iface
+    iface=$(ip -o route show default 2>/dev/null | head -1 | awk '{print $5}')
+    if [ -z "$iface" ]; then
+        # fallback: 找第一个非 lo 的 UP 状态的物理网卡
+        iface=$(ip -o link show up 2>/dev/null | grep -v 'lo' | head -1 | awk -F': ' '{print $2}' | awk '{print $1}')
+    fi
+    echo "${iface:-eth0}"
+}
 
 check_cni_network() {
     echo ""
-    echo "--- CNI 网络配置 ---"
+    echo "--- CNI 网络配置 (类型: $CNI_TYPE) ---"
 
-    # 确保 CNI 配置目录存在
     local cni_dir
     cni_dir=$(dirname "$CNI_CONF_FILE")
     if [ ! -d "$cni_dir" ]; then
@@ -136,14 +166,32 @@ check_cni_network() {
         sudo mkdir -p "$cni_dir"
     fi
 
-    # 如果配置文件不存在，创建默认配置
-    if [ ! -f "$CNI_CONF_FILE" ]; then
+    # ---- 检测当前配置类型 ---- #
+    local current_type="none"
+    if [ -f "$CNI_CONF_FILE" ]; then
+        current_type=$(grep -o '"type": "[^"]*"' "$CNI_CONF_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
+    fi
+
+    # ---- 配置不存在或类型不匹配 → 重新创建 ---- #
+    if [ "$current_type" != "$CNI_TYPE" ]; then
         if $CHECK_ONLY; then
-            warn "CNI 配置文件不存在: $CNI_CONF_FILE"
+            warn "CNI 配置类型不匹配: 当前=$current_type, 需要=$CNI_TYPE"
             return 1
         fi
-        echo "  创建 CNI bridge 配置 (subnet=$CNI_SUBNET)..."
-        cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<'CONFEOF'
+
+        # 清理旧的 CNI 状态
+        case "$current_type" in
+            bridge)
+                sudo rm -rf /var/lib/cni/networks/mynet/
+                sudo ip link delete cni0 2>/dev/null || true
+                ;;
+        esac
+
+        echo "  创建 CNI $CNI_TYPE 配置 (subnet=$CNI_SUBNET)..."
+
+        case "$CNI_TYPE" in
+            bridge)
+                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
 {
   "cniVersion": "0.3.1",
   "name": "mynet",
@@ -153,21 +201,65 @@ check_cni_network() {
   "ipMasq": true,
   "ipam": {
     "type": "host-local",
-    "subnet": "10.0.0.0/12",
+    "subnet": "$CNI_SUBNET",
     "routes": [
       { "dst": "0.0.0.0/0" }
     ]
   }
 }
 CONFEOF
-        pass "CNI bridge 配置已创建 (subnet=$CNI_SUBNET)"
-        # 重启使配置生效
+                ;;
+            ipvlan-l2)
+                local master
+                master=$(detect_master_iface)
+                echo "  ipvlan master 网卡: $master"
+                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
+{
+  "cniVersion": "0.3.1",
+  "name": "mynet",
+  "type": "ipvlan",
+  "master": "$master",
+  "mode": "l2",
+  "ipam": {
+    "type": "host-local",
+    "subnet": "$CNI_SUBNET",
+    "routes": [
+      { "dst": "0.0.0.0/0" }
+    ]
+  }
+}
+CONFEOF
+                ;;
+            ipvlan-l3)
+                local master
+                master=$(detect_master_iface)
+                echo "  ipvlan master 网卡: $master"
+                cat | sudo tee "$CNI_CONF_FILE" > /dev/null <<CONFEOF
+{
+  "cniVersion": "0.3.1",
+  "name": "mynet",
+  "type": "ipvlan",
+  "master": "$master",
+  "mode": "l3",
+  "ipam": {
+    "type": "host-local",
+    "subnet": "$CNI_SUBNET",
+    "routes": [
+      { "dst": "0.0.0.0/0" }
+    ]
+  }
+}
+CONFEOF
+                ;;
+        esac
+
+        pass "CNI $CNI_TYPE 配置已创建"
         sudo systemctl restart containerd
         sleep 2
         return 0
     fi
 
-    # 检查子网配置是否足够大
+    # ---- 配置已存在且类型匹配，检查子网 ---- #
     local current_subnet
     current_subnet=$(grep -o '"subnet": "[^"]*"' "$CNI_CONF_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
 
@@ -176,28 +268,8 @@ CONFEOF
         return 1
     fi
 
-    # 计算子网位数
     local mask
     mask=$(echo "$current_subnet" | cut -d'/' -f2)
-
-    # ---- 调整 bridge hash_max（默认 4096，大规模 pod 需加大） ---- #
-    local target_hash_max=1048576
-    if [ -d "/sys/class/net/cni0/bridge" ]; then
-        local current_hash
-        current_hash=$(cat /sys/class/net/cni0/bridge/hash_max 2>/dev/null || echo 0)
-        if [ "$current_hash" -lt "$target_hash_max" ] 2>/dev/null; then
-            if $CHECK_ONLY; then
-                warn "bridge hash_max 太小: $current_hash (推荐 $target_hash_max)"
-                return 1
-            fi
-            echo "  扩大 bridge hash_max: $current_hash → $target_hash_max ..."
-            sudo sh -c "echo $target_hash_max > /sys/class/net/cni0/bridge/hash_max"
-            current_hash=$(cat /sys/class/net/cni0/bridge/hash_max)
-            pass "bridge hash_max 已更新为: $current_hash"
-        else
-            pass "bridge hash_max 已足够大: $current_hash"
-        fi
-    fi
 
     if [ "$mask" -le 12 ] 2>/dev/null; then
         pass "CNI subnet 已足够大: $current_subnet"
@@ -208,17 +280,47 @@ CONFEOF
         fi
         echo "  扩大 CNI subnet: $current_subnet → $CNI_SUBNET ..."
         sudo sed -i "s|\"subnet\": \"[^\"]*\"|\"subnet\": \"$CNI_SUBNET\"|" "$CNI_CONF_FILE"
-        # 清理旧的 IP 分配记录（子网变了旧记录无效）
         sudo rm -rf /var/lib/cni/networks/mynet/
-        # 删除旧网桥（否则新子网 IP 无法绑定）
-        sudo ip link delete cni0 2>/dev/null || true
+        if [ "$CNI_TYPE" = "bridge" ]; then
+            sudo ip link delete cni0 2>/dev/null || true
+        fi
         pass "CNI subnet 已更新为: $CNI_SUBNET"
-
-        # 重启 containerd 使配置生效
-        echo "  重启 containerd 使 CNI 配置生效..."
         sudo systemctl restart containerd
         sleep 2
-        pass "containerd 已重启"
+    fi
+
+    # ---- bridge 专属：hash_max ---- #
+    if [ "$CNI_TYPE" = "bridge" ] && [ -d "/sys/class/net/cni0/bridge" ]; then
+        local target_hash_max=1048576
+        local current_hash
+        current_hash=$(cat /sys/class/net/cni0/bridge/hash_max 2>/dev/null || echo 0)
+        if [ "$current_hash" -lt "$target_hash_max" ] 2>/dev/null; then
+            if $CHECK_ONLY; then
+                warn "bridge hash_max 太小: $current_hash (推荐 $target_hash_max)"
+                return 1
+            fi
+            echo "  扩大 bridge hash_max: $current_hash → $target_hash_max ..."
+            sudo sh -c "echo $target_hash_max > /sys/class/net/cni0/bridge/hash_max"
+            pass "bridge hash_max 已更新为: $(cat /sys/class/net/cni0/bridge/hash_max)"
+        else
+            pass "bridge hash_max 已足够大: $current_hash"
+        fi
+    fi
+
+    # ---- ipvlan 专属：验证 master 网卡存在 ---- #
+    if [[ "$CNI_TYPE" == ipvlan-* ]]; then
+        local master
+        master=$(grep -o '"master": "[^"]*"' "$CNI_CONF_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
+        if ip link show "$master" &>/dev/null; then
+            pass "ipvlan master 网卡可用: $master"
+        else
+            if $CHECK_ONLY; then
+                fail "ipvlan master 网卡不可用: $master"
+                return 1
+            fi
+            fail "ipvlan master 网卡不可用: $master，请修改 $CNI_CONF_FILE"
+            return 1
+        fi
     fi
 
     return 0
@@ -452,7 +554,7 @@ main() {
     echo "  沙箱冷启动测试 — 环境准备"
     echo "=============================================="
     echo "  检测架构: $(uname -m) → $ARCH"
-    echo "  安装目标: containerd + crictl + pause 镜像"
+    echo "  CNI 类型: $CNI_TYPE"
     echo "  pause 镜像: $PAUSE_IMAGE"
     echo "=============================================="
     echo
