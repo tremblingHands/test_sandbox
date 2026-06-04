@@ -202,7 +202,8 @@ check_kata_runtime() {
         echo "  下载: $kata_url"
         local tmpdir
         tmpdir=$(mktemp -d)
-        curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
+        #curl -fsSL "$kata_url" -o "$tmpdir/kata.tar.zst"
+	cp -ar /home/nathan/kata-static-3.22.0-arm64.tar.zst "$tmpdir/kata.tar.zst"
         sudo mkdir -p "$KATA_INSTALL_DIR"
 
         # 解压 .tar.zst（优先用 tar --zstd，fallback: zstd -d + tar）
@@ -252,39 +253,43 @@ check_kata_runtime() {
     fi
 
     echo "  注册 kata runtime 到 containerd..."
-    # 在 runc runtime 段之后追加 kata 配置
-    local kata_section
-    kata_section=$(cat <<KATAEOF
 
-  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]
-    runtime_type = 'io.containerd.kata.v2'
-    runtime_path = '$kata_shim'
-    privileged_without_host_devices = true
-    pod_annotations = ['io.katacontainers.*']
-    container_annotations = []
-    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata.options]
-KATAEOF
-)
-    # 在 runc runtime 段的最后一个 options 后插入
-    # 找到 "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]" 之前的位置
-    if grep -q "\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc\]" "$config_file"; then
-        # 找到 runc 段结束后的下一行插入
-        local insert_line
-        insert_line=$(grep -n "sandboxer = 'podsandbox'" "$config_file" | tail -1 | cut -d: -f1)
-        insert_line=$((insert_line + 1))
-        sudo sed -i "${insert_line}i\\${kata_section}" "$config_file"
-    else
-        # fallback: 追加到文件末尾
-        echo "$kata_section" | sudo tee -a "$config_file" > /dev/null
+    # 找到 kata 配置文件（通常在 /opt/kata/share/defaults/...）
+    local kata_config_path
+    kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/kata-containers/*" 2>/dev/null | head -1)
+    if [ -z "$kata_config_path" ]; then
+        kata_config_path="/opt/kata/share/defaults/kata-containers/configuration.toml"
     fi
+
+    # 附加 kata runtime 到 containerd config.toml 末尾
+    # TOML 完整路径格式，append 到文件末尾即可
+    sudo tee -a "$config_file" > /dev/null <<KATAEOF
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]
+  runtime_type = 'io.containerd.kata.v2'
+  runtime_path = '$kata_shim'
+  privileged_without_host_devices = true
+  pod_annotations = ['io.katacontainers.*']
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata.options]
+    ConfigPath = '$kata_config_path'
+KATAEOF
 
     # 重启 containerd 使配置生效
     echo "  重启 containerd 使 kata runtime 生效..."
-    sudo systemctl restart containerd
-    sleep 2
+    if ! sudo systemctl restart containerd; then
+        fail "containerd 重启失败，检查 /etc/containerd/config.toml"
+        return 1
+    fi
+    sleep 3
 
+    # 验证注册成功
     if grep -q "io.containerd.kata.v2" "$config_file"; then
-        pass "kata runtime 已注册到 containerd"
+        # 进一步验证 containerd 能识别
+        if ctr plugins ls 2>/dev/null | grep -q "io.containerd.kata"; then
+            pass "kata runtime 已注册到 containerd"
+        else
+            warn "kata 配置已写入，但 containerd 未加载 kata 插件（可能需手动检查）"
+        fi
     else
         fail "kata runtime 注册失败"
         return 1
