@@ -149,7 +149,7 @@ def check_prerequisites():
     except Exception as e:
         errors.append("CRI 运行时异常: {}".format(e))
     try:
-        existing = _run("crictl images -q {}".format(PAUSE_IMAGE))
+        existing = _run("crictl images {}".format(PAUSE_IMAGE))
         if PAUSE_IMAGE in existing:
             print("[check] pause 镜像已缓存: {}".format(PAUSE_IMAGE))
         else:
