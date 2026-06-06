@@ -14,7 +14,7 @@ set -euo pipefail
 
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
-CONTAINERD_VERSION="1.7.19"
+CONTAINERD_VERSION="1.6.32"
 CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 CONTAINERD_RUNTIME="runc"       # 默认: runc
 KATA_VERSION="3.22.0"           # kata containers 版本
