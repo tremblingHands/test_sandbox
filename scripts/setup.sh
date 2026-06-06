@@ -672,7 +672,7 @@ check_pause_image() {
     echo ""
     echo "--- pause 镜像 ---"
 
-    if crictl images 2>/dev/null | grep -qF "$PAUSE_IMAGE"; then
+    if crictl images 2>/dev/null | awk '{print $1":"$2}' | grep -qF "$PAUSE_IMAGE"; then
         pass "pause 镜像已缓存: $PAUSE_IMAGE"
         return 0
     fi

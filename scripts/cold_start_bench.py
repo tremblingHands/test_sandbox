@@ -146,8 +146,8 @@ def check_prerequisites():
 
     # 3. 检查 pause 镜像，缺失则自动拉取
     try:
-        existing = _run("crictl images {}".format(PAUSE_IMAGE))
-        if PAUSE_IMAGE in existing:
+        existing = _run("crictl images")
+        if PAUSE_IMAGE in existing or PAUSE_IMAGE.replace(":", " ") in existing:
             print("[check] pause 镜像已缓存: {}".format(PAUSE_IMAGE))
         else:
             raise RuntimeError("镜像未找到")
