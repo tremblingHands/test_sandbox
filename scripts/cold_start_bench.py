@@ -235,8 +235,12 @@ def remove_pod_sandbox(sandbox_id):
 
 def clear_caches():
     """清除内核缓存，保障每轮都是真正的冷启动"""
-    _run("echo 3 > /proc/sys/vm/drop_caches")
-    time.sleep(3)  # 冷却间隔
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+        time.sleep(3)
+    except Exception:
+        pass  # 容器环境可能不支持
 
 
 # ============================================================

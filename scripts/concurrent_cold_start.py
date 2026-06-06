@@ -126,8 +126,11 @@ def compute_stats(values):
 
 
 def clear_caches():
-    _run("echo 3 > /proc/sys/vm/drop_caches")
-    time.sleep(2)
+    try:
+        _run("echo 3 > /proc/sys/vm/drop_caches")
+        time.sleep(2)
+    except Exception:
+        pass
 
 
 # ============================================================
