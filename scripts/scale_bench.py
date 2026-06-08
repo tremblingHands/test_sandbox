@@ -69,42 +69,43 @@ def run_level(concurrency, duration, runtime, mode):
         "total_sandboxes": total_sandboxes,
         "wall_seconds": round(elapsed, 1),
         "throughput": round(throughput, 1),
-        "t_runp_p50": round(t_runp.get("p50", 0), 1),
-        "t_runp_p95": round(t_runp.get("p95", 0), 1),
-        "t_ready_p50": round(t_ready.get("p50", 0), 1),
-        "t_ready_p95": round(t_ready.get("p95", 0), 1),
         "total_p50": round(total_stats.get("p50", 0), 1),
         "total_p95": round(total_stats.get("p95", 0), 1),
+        "total_p99": round(total_stats.get("p99", 0), 1),
+        "total_mean": round(total_stats.get("mean", 0), 1),
+        "t_runp_p50": round(t_runp.get("p50", 0), 1),
+        "t_runp_p95": round(t_runp.get("p95", 0), 1),
+        "t_runp_p99": round(t_runp.get("p99", 0), 1),
+        "t_runp_mean": round(t_runp.get("mean", 0), 1),
     }
-    print("{} sandboxes, {:.1f} sandbox/s, P50={:.0f}ms".format(
-        total_sandboxes, throughput, result["total_p50"]))
+    print("{} sandboxes, {:.1f}/s, P50={:.0f}ms P99={:.0f}ms".format(
+        total_sandboxes, throughput, result["total_p50"], result["total_p99"]))
     return result
 
 
 def print_table(results):
     """打印汇总表"""
     print("")
-    print("=" * 90)
+    print("=" * 120)
     print("并发扩展性测试结果 (runtime={}, mode={})".format(args.runtime, args.mode))
-    print("=" * 90)
-    print("{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
-        "并发", "沙箱总数", "吞吐量/s", "P50(ms)", "P95(ms)", "runpP50", "runpP95"))
-    print("-" * 90)
+    print("=" * 120)
+    print("{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
+        "并发", "沙箱总数", "吞吐量/s", "P50(ms)", "P95(ms)", "P99(ms)", "Mean(ms)", "runpP50", "runpP95"))
+    print("-" * 120)
 
     prev_tp = 0
     for r in results:
         tp_str = "{:.1f}".format(r["throughput"])
-        # 标记吞吐量增长趋势
         if prev_tp > 0 and r["throughput"] < prev_tp * 1.05:
-            tp_str += " ~"   # 趋于饱和
+            tp_str += " ~"
         prev_tp = r["throughput"]
 
-        print("{:>6} {:>10} {:>10} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f}".format(
+        print("{:>6} {:>10} {:>10} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f}".format(
             r["concurrency"], r["total_sandboxes"], tp_str,
-            r["total_p50"], r["total_p95"],
+            r["total_p50"], r["total_p95"], r["total_p99"], r["total_mean"],
             r["t_runp_p50"], r["t_runp_p95"]))
 
-    print("-" * 90)
+    print("-" * 120)
     print("~ 表示吞吐量趋于饱和")
 
 
