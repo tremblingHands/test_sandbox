@@ -134,44 +134,6 @@ def clear_caches():
 
 
 # ============================================================
-# 前置条件检查
-# ============================================================
-def check_prerequisites():
-    errors = []
-    try:
-        version = _run("crictl --version")
-        print("[check] crictl 可用: {}".format(version))
-    except Exception:
-        errors.append("crictl 未找到，请执行 ./scripts/setup.sh")
-    try:
-        _run("crictl info")
-        print("[check] CRI 运行时连接正常")
-    except Exception as e:
-        errors.append("CRI 运行时异常: {}".format(e))
-    try:
-        existing = _run("crictl images")
-        if PAUSE_IMAGE in existing or PAUSE_IMAGE.replace(":", " ") in existing:
-            print("[check] pause 镜像已缓存: {}".format(PAUSE_IMAGE))
-        else:
-            raise RuntimeError("未找到")
-    except Exception:
-        print("[check] pause 镜像缺失，正在拉取: {} ...".format(PAUSE_IMAGE))
-        try:
-            _run("crictl pull {}".format(PAUSE_IMAGE))
-            print("[check] pause 镜像拉取完成")
-        except Exception as e:
-            errors.append("pause 镜像拉取失败: {}".format(e))
-    if not os.path.isfile("/proc/sys/vm/drop_caches"):
-        errors.append("/proc/sys/vm/drop_caches 不可用")
-    if errors:
-        print("\n前置条件检查失败:")
-        for err in errors:
-            print("  ✗ {}".format(err))
-        sys.exit(1)
-    print("[check] 所有前置条件满足\n")
-
-
-# ============================================================
 # Pod 配置生成
 # ============================================================
 def generate_pod_config(round_num, worker_id, local_seq):
@@ -741,17 +703,11 @@ if __name__ == "__main__":
                         help="JSON 报告输出路径")
     parser.add_argument("--cleanup", action="store_true",
                         help="每个 sandbox 就绪后立即清理（默认不清理）")
-    parser.add_argument("--skip-check", action="store_true",
-                        help="跳过前置条件检查")
     args = parser.parse_args()
 
     G.cleanup = args.cleanup
     G.use_timed = args.duration is not None
     per_round_val = args.duration if G.use_timed else args.per_round
-
-    # 前置检查
-    if not args.skip_check:
-        check_prerequisites()
 
     if not os.path.isdir(POD_CONFIG_DIR):
         os.makedirs(POD_CONFIG_DIR)

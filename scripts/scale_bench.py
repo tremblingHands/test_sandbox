@@ -20,7 +20,7 @@ CONCURRENT_SCRIPT = os.path.join(SCRIPT_DIR, "concurrent_cold_start.py")
 RESULTS_DIR = "results"
 
 
-def run_level(concurrency, duration, runtime, mode, skip_check):
+def run_level(concurrency, duration, runtime, mode):
     """运行一个并发级别, 返回结果摘要"""
     output_file = "{}/scale-c{}.json".format(RESULTS_DIR, concurrency)
     log_file = "{}/scale-c{}.log".format(RESULTS_DIR, concurrency)
@@ -34,8 +34,6 @@ def run_level(concurrency, duration, runtime, mode, skip_check):
         "--runtime", runtime,
         "--output", output_file,
     ]
-    if skip_check:
-        cmd.append("--skip-check")
 
     print("  [concurrency={}] 运行中...".format(concurrency), end=" ", flush=True)
     t0 = time.perf_counter()
@@ -125,8 +123,6 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["continuous", "serial"],
                         default="continuous",
                         help="模式 (默认 continuous)")
-    parser.add_argument("--skip-check", action="store_true",
-                        help="跳过前置条件检查")
     parser.add_argument("--output", default="results/scale_report.json",
                         help="汇总报告输出路径")
     args = parser.parse_args()
@@ -157,7 +153,7 @@ if __name__ == "__main__":
 
     results = []
     for level in levels:
-        r = run_level(level, args.duration, args.runtime, args.mode, args.skip_check)
+        r = run_level(level, args.duration, args.runtime, args.mode)
         if r:
             results.append(r)
         else:

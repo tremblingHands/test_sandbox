@@ -48,17 +48,6 @@ def _run_checked(cmd):
     return stdout
 
 
-def check_prerequisites():
-    print("[check] 检查环境...")
-    _run_checked("crictl --version")
-    _run_checked("crictl info")
-    existing = _run_checked("crictl images -q {}".format(PAUSE_IMAGE))
-    if PAUSE_IMAGE not in existing:
-        print("[check] 拉取 pause 镜像...")
-        _run_checked("crictl pull {}".format(PAUSE_IMAGE))
-    print("[check] 环境就绪\n")
-
-
 def generate_pod_config(index):
     name = "{}-{}".format(POD_NAME_PREFIX, index)
     uid = "maxc-{}-{}".format(uuid.uuid4().hex[:8], index)
@@ -146,12 +135,7 @@ if __name__ == "__main__":
                         help="OCI 运行时 (默认 runc)")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="保留所有 pod 不清理（便于调试）")
-    parser.add_argument("--skip-check", action="store_true",
-                        help="跳过前置条件检查")
     args = parser.parse_args()
-
-    if not args.skip_check:
-        check_prerequisites()
 
     if not os.path.isdir(POD_CONFIG_DIR):
         os.makedirs(POD_CONFIG_DIR)

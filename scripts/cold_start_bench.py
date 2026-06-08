@@ -126,53 +126,6 @@ def _file_exists(path):
 # ============================================================
 # 前置条件检查
 # ============================================================
-def check_prerequisites():
-    """检查运行环境，缺失条件时自动修复（如拉取 pause 镜像）。"""
-    errors = []
-
-    # 1. 检查 crictl 是否可用
-    try:
-        version = _run("crictl --version")
-        print("[check] crictl 可用: {}".format(version))
-    except Exception:
-        errors.append("crictl 未找到或不可用，请执行 ./scripts/setup.sh")
-
-    # 2. 检查 CRI 运行时是否正常
-    try:
-        _run("crictl info")
-        print("[check] CRI 运行时连接正常")
-    except Exception as e:
-        errors.append("CRI 运行时异常: {}".format(e))
-
-    # 3. 检查 pause 镜像，缺失则自动拉取
-    try:
-        existing = _run("crictl images")
-        if PAUSE_IMAGE in existing or PAUSE_IMAGE.replace(":", " ") in existing:
-            print("[check] pause 镜像已缓存: {}".format(PAUSE_IMAGE))
-        else:
-            raise RuntimeError("镜像未找到")
-    except Exception:
-        print("[check] pause 镜像缺失，正在拉取: {} ...".format(PAUSE_IMAGE))
-        try:
-            _run("crictl pull {}".format(PAUSE_IMAGE))
-            print("[check] pause 镜像拉取完成: {}".format(PAUSE_IMAGE))
-        except Exception as e:
-            errors.append("pause 镜像拉取失败: {}".format(e))
-
-    # 4. 确认 drop_caches 可用
-    if not _file_exists("/proc/sys/vm/drop_caches"):
-        errors.append("/proc/sys/vm/drop_caches 不可用，清除缓存功能将无法工作")
-
-    if errors:
-        print("\n前置条件检查失败:")
-        for err in errors:
-            print("  ✗ {}".format(err))
-        sys.exit(1)
-
-    print("[check] 所有前置条件满足\n")
-
-
-# ============================================================
 # Pod 沙箱操作（crictl 封装）
 # ============================================================
 def prepare_pod_config(run_id):
@@ -335,11 +288,7 @@ if __name__ == "__main__":
     parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
                         help="OCI 运行时 (默认 runc)")
     parser.add_argument("--output", default=OUTPUT_FILE, help="JSON 报告输出路径")
-    parser.add_argument("--skip-check", action="store_true", help="跳过前置条件检查")
     args = parser.parse_args()
-
-    if not args.skip_check:
-        check_prerequisites()
 
     report = run_benchmark(runs=args.runs)
 
