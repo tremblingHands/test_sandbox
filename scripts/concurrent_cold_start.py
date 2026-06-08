@@ -609,7 +609,7 @@ def print_summary(all_wall_times):
     print("并发数:   {} threads".format(args.concurrency))
     if is_timed:
         print("每轮时长: {}s".format(args.duration))
-        print("总计沙箱: {}".format(sum(1 for _ in _results)))
+        print("总计沙箱: {}".format(sum(_window_counts.values())))
     else:
         print("每轮数:   {} sandboxes".format(args.per_round))
         print("总计沙箱: {}".format(args.rounds * args.per_round))
@@ -623,12 +623,10 @@ def print_summary(all_wall_times):
     if is_timed:
         print("各轮统计:")
         for rnd in range(1, args.rounds + 1):
-            wall = all_wall_times[rnd - 1]
-            count = sum(1 for r in _results if r.round_num == rnd)
-            total_tps = count / (wall / 1000.0) if wall > 0 else 0
-            tail_ms = int(wall - args.duration * 1000)
-            print("  第 {} 轮: {} sandboxes, wall={}ms tail={}ms, 总吞吐 {:.1f}/s".format(
-                rnd, count, int(wall), tail_ms, total_tps))
+            wc = _window_counts.get(rnd, 0)
+            window_tps = wc / args.duration if args.duration > 0 else 0
+            print("  第 {} 轮: {} sandboxes ({:.1f}/s)".format(
+                rnd, wc, window_tps))
     else:
         print("各轮挂钟总耗时:")
         for rnd, wall in enumerate(all_wall_times, 1):
