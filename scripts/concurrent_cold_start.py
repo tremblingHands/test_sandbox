@@ -251,7 +251,7 @@ def worker_counted_serial(worker_id, task_queue, round_num):
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             add_result(SandboxResult(round_num, worker_id, task_index,
-                                     "TIMEOUT", G.runp_timeout * 1000, 0, G.runp_timeout * 1000))
+                                     "FAIL", 0, G.runp_timeout * 1000, G.runp_timeout * 1000))
             continue
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
@@ -347,7 +347,7 @@ def worker_timed_serial(worker_id, round_num, stop_event):
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
         except Exception:
             add_result(SandboxResult(round_num, worker_id, seq,
-                                     "TIMEOUT", G.runp_timeout * 1000, 0, G.runp_timeout * 1000))
+                                     "FAIL", 0, G.runp_timeout * 1000, G.runp_timeout * 1000))
             seq += 1
             continue
         t1 = time.perf_counter()
@@ -617,13 +617,13 @@ def print_summary(all_wall_times):
     else:
         stats_source = _results
 
-    # 延迟统计只算成功的 sandbox (排除 total_ms==0 的失败记录)
-    stats_ok = [r for r in stats_source if r.sandbox_id != "FAIL" and r.total_ms > 0]
+    # 排除 total_ms==0 的无效记录 (如果 worker 异常导致未赋值)
+    stats_ok = [r for r in stats_source if r.total_ms > 0]
     if not stats_ok:
-        stats_ok = stats_source  # 全失败时 fallback
+        stats_ok = stats_source
 
     runps = [r.t_runp_ms for r in stats_ok]
-    readys = [r.t_ready_ms for r in stats_ok if r.t_ready_ms >= 0]
+    readys = [r.t_ready_ms for r in stats_ok if r.t_ready_ms > 0]
     totals = [r.total_ms for r in stats_ok]
 
     r_stats = compute_stats(runps)
