@@ -159,23 +159,23 @@ def generate_pod_config(round_num, worker_id, local_seq):
 
 
 # 预生成的 config 文件：路径确定，文件即存储
-_prefetch_per_worker = 0
+_preconfig_per_worker = 0
 
 
-def prefetch_configs(round_num, concurrency, per_worker):
+def preconfig_configs(round_num, concurrency, per_worker):
     """预生成 pod config 文件：每个 worker 写 per_worker 个到磁盘。
        路径 = /tmp/conc-pod-configs/pod-w{worker_id}-{seq}.json，用时直接用。"""
-    global _prefetch_per_worker
-    _prefetch_per_worker = per_worker
+    global _preconfig_per_worker
+    _preconfig_per_worker = per_worker
     for w in range(concurrency):
         for i in range(per_worker):
             generate_pod_config(round_num, w, i)
-    print("  prefetch: {} workers x {} configs 已预生成".format(concurrency, per_worker))
+    print("  preconfig: {} workers x {} configs 已预生成".format(concurrency, per_worker))
 
 
 def get_config(round_num, worker_id, seq):
     """获取 pod config 路径：seq 在预生成范围内的直接返回路径，否则按需生成。"""
-    if seq < _prefetch_per_worker:
+    if seq < _preconfig_per_worker:
         return "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, seq)
     return generate_pod_config(round_num, worker_id, seq)
 
@@ -518,8 +518,8 @@ def run_round_timed_continuous(round_num, concurrency, duration):
     """固定时间 + continuous"""
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
-    if G.prefetch_count > 0:
-        prefetch_configs(round_num, concurrency, G.prefetch_count)
+    if G.preconfig_count > 0:
+        preconfig_configs(round_num, concurrency, G.preconfig_count)
 
     stop_event = threading.Event()
     ready_queue = queue.Queue()
@@ -567,8 +567,8 @@ def run_round_timed_serial(round_num, concurrency, duration):
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
 
-    if G.prefetch_count > 0:
-        prefetch_configs(round_num, concurrency, G.prefetch_count)
+    if G.preconfig_count > 0:
+        preconfig_configs(round_num, concurrency, G.preconfig_count)
     stop_event = threading.Event()
 
     print("[第 {}/{} 轮] serial(固定时间): {} workers, {}s".format(
@@ -725,7 +725,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--output", default=OUTPUT_FILE,
                         help="JSON 报告输出路径")
-    parser.add_argument("--prefetch", type=int, default=5000,
+    parser.add_argument("--preconfig", type=int, default=0,
                         help="提前生成 N 个 pod config (默认 5000, 0 即按需生成)")
     parser.add_argument("--cleanup", action="store_true",
                         help="每个 sandbox 就绪后立即清理（默认不清理）")
@@ -733,7 +733,7 @@ if __name__ == "__main__":
 
     G.cleanup = args.cleanup
     G.use_timed = args.duration is not None
-    G.prefetch_count = args.prefetch
+    G.preconfig_count = args.preconfig
     per_round_val = args.duration if G.use_timed else args.per_round
 
     if not os.path.isdir(POD_CONFIG_DIR):
