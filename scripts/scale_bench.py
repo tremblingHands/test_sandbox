@@ -126,6 +126,8 @@ if __name__ == "__main__":
                         help="起始并发线程数 (默认 1)")
     parser.add_argument("--max-concurrency", type=int, default=256,
                         help="最大并发线程数 (默认 256)")
+    parser.add_argument("--step", type=int, default=0,
+                        help="并发递增步长 (默认 0=翻倍, >0=线性)")
     parser.add_argument("--duration", type=int, default=30,
                         help="每级测试持续时间秒 (默认 30)")
     parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
@@ -140,13 +142,21 @@ if __name__ == "__main__":
     if not os.path.isdir(RESULTS_DIR):
         os.makedirs(RESULTS_DIR)
 
-    # 生成并发级别: min, min*2, min*4, ..., max
+    # 生成并发级别
     levels = []
-    c = args.min_concurrency
-    while c <= args.max_concurrency:
-        levels.append(c)
-        c *= 2
-    # 确保 max_concurrency 被包含 (如果不是2的幂)
+    if args.step > 0:
+        # 线性模式: min, min+step, min+2*step, ..., max
+        c = args.min_concurrency
+        while c <= args.max_concurrency:
+            levels.append(c)
+            c += args.step
+    else:
+        # 翻倍模式: min, min*2, min*4, ..., max
+        c = args.min_concurrency
+        while c <= args.max_concurrency:
+            levels.append(c)
+            c *= 2
+    # 确保 max_concurrency 被包含
     if not levels or levels[-1] != args.max_concurrency:
         levels.append(args.max_concurrency)
 
