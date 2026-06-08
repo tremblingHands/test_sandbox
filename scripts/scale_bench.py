@@ -63,12 +63,19 @@ def run_level(concurrency, duration, runtime, mode):
 
     total_sandboxes = summary.get("total_sandboxes", 0)
     throughput = total_sandboxes / duration if duration > 0 else 0
+    success_count = summary.get("success", total_sandboxes)
+    failed_count = summary.get("failed", 0)
+    total_count = success_count + failed_count
+    success_rate = success_count / total_count * 100 if total_count > 0 else 0
 
     result = {
         "concurrency": concurrency,
         "total_sandboxes": total_sandboxes,
         "wall_seconds": round(elapsed, 1),
         "throughput": round(throughput, 1),
+        "success": success_count,
+        "failed": failed_count,
+        "success_rate": round(success_rate, 1),
         "total_p50": round(total_stats.get("p50", 0), 1),
         "total_p95": round(total_stats.get("p95", 0), 1),
         "total_p99": round(total_stats.get("p99", 0), 1),
@@ -78,20 +85,20 @@ def run_level(concurrency, duration, runtime, mode):
         "t_runp_p99": round(t_runp.get("p99", 0), 1),
         "t_runp_mean": round(t_runp.get("mean", 0), 1),
     }
-    print("{} sandboxes, {:.1f}/s, P50={:.0f}ms P99={:.0f}ms".format(
-        total_sandboxes, throughput, result["total_p50"], result["total_p99"]))
+    print("{} sandboxes, {:.1f}/s, {}% OK, P50={:.0f}ms P99={:.0f}ms".format(
+        total_sandboxes, throughput, result["success_rate"], result["total_p50"], result["total_p99"]))
     return result
 
 
 def print_table(results):
     """打印汇总表"""
     print("")
-    print("=" * 120)
+    print("=" * 130)
     print("并发扩展性测试结果 (runtime={}, mode={})".format(args.runtime, args.mode))
-    print("=" * 120)
-    print("{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
-        "并发", "沙箱总数", "吞吐量/s", "P50(ms)", "P95(ms)", "P99(ms)", "Mean(ms)", "runpP50", "runpP95"))
-    print("-" * 120)
+    print("=" * 130)
+    print("{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8}".format(
+        "并发", "沙箱总数", "吞吐量/s", "%OK", "P50(ms)", "P95(ms)", "P99(ms)", "Mean(ms)", "runpP50", "runpP95"))
+    print("-" * 130)
 
     prev_tp = 0
     for r in results:
@@ -100,12 +107,14 @@ def print_table(results):
             tp_str += " ~"
         prev_tp = r["throughput"]
 
-        print("{:>6} {:>10} {:>10} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f}".format(
-            r["concurrency"], r["total_sandboxes"], tp_str,
+        ok_str = "{:.0f}%".format(r["success_rate"]) if r["success_rate"] >= 99 else "{:.0f}%!".format(r["success_rate"])
+
+        print("{:>6} {:>10} {:>10} {:>10} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f} {:>10.0f}".format(
+            r["concurrency"], r["total_sandboxes"], tp_str, ok_str,
             r["total_p50"], r["total_p95"], r["total_p99"], r["total_mean"],
             r["t_runp_p50"], r["t_runp_p95"]))
 
-    print("-" * 120)
+    print("-" * 130)
     print("~ 表示吞吐量趋于饱和")
 
 
