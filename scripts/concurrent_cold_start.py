@@ -93,9 +93,10 @@ class Stats(object):
 # 工具函数
 # ============================================================
 def _run(cmd):
+    to = getattr(G, 'runp_timeout', 60) or None
     r = subprocess.run(
         cmd, shell=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, timeout=60
+        stderr=subprocess.PIPE, timeout=to
     )
     stdout = r.stdout.decode("utf-8", errors="replace").strip()
     stderr = r.stderr.decode("utf-8", errors="replace").strip()
