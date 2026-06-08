@@ -158,27 +158,25 @@ def generate_pod_config(round_num, worker_id, local_seq):
     return path
 
 
-# 预生成的 config 池（线程安全队列）
-_config_pool = None  # queue.Queue or None
+# 预生成的 config 文件：路径确定，文件即存储
+_prefetch_per_worker = 0
 
 
-def prefetch_configs(round_num, count):
-    """预生成 count 个 pod config 文件，存入全局池。"""
-    global _config_pool
-    _config_pool = queue.Queue()
-    for i in range(count):
-        path = generate_pod_config(round_num, -1, i)
-        _config_pool.put(path)
-    print("  prefetch: {} pod configs 已预生成".format(count))
+def prefetch_configs(round_num, concurrency, per_worker):
+    """预生成 pod config 文件：每个 worker 写 per_worker 个到磁盘。
+       路径 = /tmp/conc-pod-configs/pod-w{worker_id}-{seq}.json，用时直接用。"""
+    global _prefetch_per_worker
+    _prefetch_per_worker = per_worker
+    for w in range(concurrency):
+        for i in range(per_worker):
+            generate_pod_config(round_num, w, i)
+    print("  prefetch: {} workers x {} configs 已预生成".format(concurrency, per_worker))
 
 
 def get_config(round_num, worker_id, seq):
-    """获取一个 pod config 路径：优先从预生成池取，池空则按需生成。"""
-    if _config_pool is not None:
-        try:
-            return _config_pool.get_nowait()
-        except (queue.Empty, AttributeError):
-            pass
+    """获取 pod config 路径：seq 在预生成范围内的直接返回路径，否则按需生成。"""
+    if seq < _prefetch_per_worker:
+        return "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, seq)
     return generate_pod_config(round_num, worker_id, seq)
 
 
@@ -521,7 +519,7 @@ def run_round_timed_continuous(round_num, concurrency, duration):
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
     if G.prefetch_count > 0:
-        prefetch_configs(round_num, G.prefetch_count)
+        prefetch_configs(round_num, concurrency, G.prefetch_count)
 
     stop_event = threading.Event()
     ready_queue = queue.Queue()
@@ -570,7 +568,7 @@ def run_round_timed_serial(round_num, concurrency, duration):
     clear_caches()
 
     if G.prefetch_count > 0:
-        prefetch_configs(round_num, G.prefetch_count)
+        prefetch_configs(round_num, concurrency, G.prefetch_count)
     stop_event = threading.Event()
 
     print("[第 {}/{} 轮] serial(固定时间): {} workers, {}s".format(
