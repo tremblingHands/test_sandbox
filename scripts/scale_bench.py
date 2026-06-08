@@ -162,12 +162,9 @@ if __name__ == "__main__":
             results.append(r)
         else:
             print("  [concurrency={}] 跳过 (失败)".format(level))
-        # 级别间冷却：清理残留 + 等待 containerd 恢复
-        print("  冷却 {}s...".format(max(5, args.duration // 4)), end=" ", flush=True)
-        subprocess.call(
-            "crictl pods -q 2>/dev/null | xargs -r -n1 sh -c 'crictl stopp \$1 2>/dev/null; crictl rmp \$1 2>/dev/null' --",
-            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 级别间冷却：等待 containerd 恢复，concurrent_cold_start 已自行清理
         cooldown = max(5, args.duration // 4)
+        print("  冷却 {}s...".format(cooldown), end=" ", flush=True)
         time.sleep(cooldown)
         print("done")
 
