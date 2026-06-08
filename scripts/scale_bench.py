@@ -62,7 +62,7 @@ def run_level(concurrency, duration, runtime, mode):
     total_stats = phases.get("total", {})
 
     total_sandboxes = summary.get("total_sandboxes", 0)
-    throughput = total_sandboxes / elapsed if elapsed > 0 else 0
+    throughput = total_sandboxes / duration if duration > 0 else 0
 
     result = {
         "concurrency": concurrency,
