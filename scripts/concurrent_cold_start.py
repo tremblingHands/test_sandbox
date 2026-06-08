@@ -617,13 +617,13 @@ def print_summary(all_wall_times):
     else:
         stats_source = _results
 
-    # 排除 total_ms==0 的无效记录 (如果 worker 异常导致未赋值)
-    stats_ok = [r for r in stats_source if r.total_ms > 0]
+    # 延迟统计排除超时/失败的 sandbox (sandbox_id == "FAIL")
+    stats_ok = [r for r in stats_source if r.sandbox_id != "FAIL"]
     if not stats_ok:
         stats_ok = stats_source
 
     runps = [r.t_runp_ms for r in stats_ok]
-    readys = [r.t_ready_ms for r in stats_ok if r.t_ready_ms > 0]
+    readys = [r.t_ready_ms for r in stats_ok if r.t_ready_ms >= 0]
     totals = [r.total_ms for r in stats_ok]
 
     r_stats = compute_stats(runps)
