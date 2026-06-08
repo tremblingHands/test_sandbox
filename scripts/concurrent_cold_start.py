@@ -158,6 +158,30 @@ def generate_pod_config(round_num, worker_id, local_seq):
     return path
 
 
+# 预生成的 config 池（线程安全队列）
+_config_pool = None  # queue.Queue or None
+
+
+def prefetch_configs(round_num, count):
+    """预生成 count 个 pod config 文件，存入全局池。"""
+    global _config_pool
+    _config_pool = queue.Queue()
+    for i in range(count):
+        path = generate_pod_config(round_num, -1, i)
+        _config_pool.put(path)
+    print("  prefetch: {} pod configs 已预生成".format(count))
+
+
+def get_config(round_num, worker_id, seq):
+    """获取一个 pod config 路径：优先从预生成池取，池空则按需生成。"""
+    if _config_pool is not None:
+        try:
+            return _config_pool.get_nowait()
+        except (queue.Empty, AttributeError):
+            pass
+    return generate_pod_config(round_num, worker_id, seq)
+
+
 # ============================================================
 # Pod 沙箱操作
 # ============================================================
@@ -317,7 +341,7 @@ def worker_timed_serial(worker_id, round_num, stop_event):
     """
     seq = 0
     while not stop_event.is_set():
-        pod_config_path = generate_pod_config(round_num, worker_id, seq)
+        pod_config_path = get_config(round_num, worker_id, seq)
 
         t0 = time.perf_counter()
         try:
@@ -353,7 +377,7 @@ def worker_timed_continuous_runp(worker_id, round_num, stop_event, ready_queue):
     """
     seq = 0
     while not stop_event.is_set():
-        pod_config_path = generate_pod_config(round_num, worker_id, seq)
+        pod_config_path = get_config(round_num, worker_id, seq)
 
         t0 = time.perf_counter()
         try:
@@ -496,6 +520,8 @@ def run_round_timed_continuous(round_num, concurrency, duration):
     """固定时间 + continuous"""
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
+    if G.prefetch_count > 0:
+        prefetch_configs(round_num, G.prefetch_count)
 
     stop_event = threading.Event()
     ready_queue = queue.Queue()
@@ -543,6 +569,8 @@ def run_round_timed_serial(round_num, concurrency, duration):
     print("[第 {}/{} 轮] 清缓存...".format(round_num, args.rounds))
     clear_caches()
 
+    if G.prefetch_count > 0:
+        prefetch_configs(round_num, G.prefetch_count)
     stop_event = threading.Event()
 
     print("[第 {}/{} 轮] serial(固定时间): {} workers, {}s".format(
@@ -699,12 +727,15 @@ if __name__ == "__main__":
 
     parser.add_argument("--output", default=OUTPUT_FILE,
                         help="JSON 报告输出路径")
+    parser.add_argument("--prefetch", type=int, default=5000,
+                        help="提前生成 N 个 pod config (默认 5000, 0 即按需生成)")
     parser.add_argument("--cleanup", action="store_true",
                         help="每个 sandbox 就绪后立即清理（默认不清理）")
     args = parser.parse_args()
 
     G.cleanup = args.cleanup
     G.use_timed = args.duration is not None
+    G.prefetch_count = args.prefetch
     per_round_val = args.duration if G.use_timed else args.per_round
 
     if not os.path.isdir(POD_CONFIG_DIR):
