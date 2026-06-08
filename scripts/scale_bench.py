@@ -23,6 +23,7 @@ RESULTS_DIR = "results"
 def run_level(concurrency, duration, runtime, mode, skip_check):
     """运行一个并发级别, 返回结果摘要"""
     output_file = "{}/scale-c{}.json".format(RESULTS_DIR, concurrency)
+    log_file = "{}/scale-c{}.log".format(RESULTS_DIR, concurrency)
 
     cmd = [
         "python3", CONCURRENT_SCRIPT,
@@ -38,11 +39,14 @@ def run_level(concurrency, duration, runtime, mode, skip_check):
 
     print("  [concurrency={}] 运行中...".format(concurrency), end=" ", flush=True)
     t0 = time.perf_counter()
-    rc = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    with open(log_file, "w") as log_f:
+        rc = subprocess.call(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+
     elapsed = time.perf_counter() - t0
 
     if rc != 0:
-        print("FAIL (exit={})".format(rc))
+        print("FAIL (exit={}, 日志: {})".format(rc, log_file))
         return None
 
     # 读取 JSON 结果
