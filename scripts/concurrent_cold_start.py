@@ -242,6 +242,7 @@ def batch_cleanup(round_num):
 # ============================================================
 _results_lock = threading.Lock()
 _results = []
+_window_counts = {}   # 每轮窗口期内的 sandbox 数量, 用于过滤延迟统计
 
 
 def add_result(result):
@@ -558,8 +559,9 @@ def run_round_timed_continuous(round_num, concurrency, duration):
         t.start(); poll_threads.append(t)
 
     time.sleep(duration)
-    # 窗口期结束，记录当时已完成数（快照）
+    # 窗口期结束快照
     window_count = len([r for r in _results if r.round_num == round_num])
+    _window_counts[round_num] = window_count
     window_ms = round((time.perf_counter() - t_start) * 1000, 1)
     stop_event.set()
 
@@ -567,15 +569,10 @@ def run_round_timed_continuous(round_num, concurrency, duration):
     for t in poll_threads: t.join()
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-    total_count = len([r for r in _results if r.round_num == round_num])
-    tail_count = total_count - window_count
-    tail_ms = elapsed_ms - window_ms
-
     window_tps = window_count / (window_ms / 1000.0) if window_ms > 0 else 0
-    total_tps = total_count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
 
-    print("  窗口 {}ms: {} sandboxes ({:.1f}/s) | tail {}ms: {} sandboxes | 总计 {:.1f}/s".format(
-        window_ms, window_count, window_tps, tail_ms, tail_count, total_tps))
+    print("  窗口 {}ms: {} sandboxes ({:.1f}/s)".format(
+        window_ms, window_count, window_tps))
     batch_cleanup(round_num)
     return elapsed_ms
 
@@ -601,21 +598,17 @@ def run_round_timed_serial(round_num, concurrency, duration):
     time.sleep(duration)
     # 窗口期结束快照
     window_count = len([r for r in _results if r.round_num == round_num])
+    _window_counts[round_num] = window_count
     window_ms = round((time.perf_counter() - t_start) * 1000, 1)
     stop_event.set()
 
     for t in threads: t.join()
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-    total_count = len([r for r in _results if r.round_num == round_num])
-    tail_count = total_count - window_count
-    tail_ms = elapsed_ms - window_ms
-
     window_tps = window_count / (window_ms / 1000.0) if window_ms > 0 else 0
-    total_tps = total_count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
 
-    print("  窗口 {}ms: {} sandboxes ({:.1f}/s) | tail {}ms: {} sandboxes | 总计 {:.1f}/s".format(
-        window_ms, window_count, window_tps, tail_ms, tail_count, total_tps))
+    print("  窗口 {}ms: {} sandboxes ({:.1f}/s)".format(
+        window_ms, window_count, window_tps))
     batch_cleanup(round_num)
     return elapsed_ms
 
@@ -624,11 +617,21 @@ def run_round_timed_serial(round_num, concurrency, duration):
 # 汇总报告
 # ============================================================
 def print_summary(all_wall_times):
-    global _results
+    global _results, _window_counts
 
-    runps = [r.t_runp_ms for r in _results]
-    readys = [r.t_ready_ms for r in _results if r.t_ready_ms >= 0]
-    totals = [r.total_ms for r in _results]
+    # 定时模式: 只统计窗口期内完成的 sandbox
+    if G.use_timed and _window_counts:
+        window_results = []
+        for rnd, wc in _window_counts.items():
+            round_results = [r for r in _results if r.round_num == rnd]
+            window_results.extend(round_results[:wc])  # 前 wc 个是窗口内的
+        stats_source = window_results
+    else:
+        stats_source = _results
+
+    runps = [r.t_runp_ms for r in stats_source]
+    readys = [r.t_ready_ms for r in stats_source if r.t_ready_ms >= 0]
+    totals = [r.total_ms for r in stats_source]
 
     r_stats = compute_stats(runps)
     d_stats = compute_stats(readys)
@@ -650,8 +653,8 @@ def print_summary(all_wall_times):
         print("总计沙箱: {}".format(args.rounds * args.per_round))
     print("总轮次:   {}".format(args.rounds))
     print("成功:     {}/{}".format(
-        sum(1 for r in _results if r.sandbox_id != "FAIL"),
-        len(_results)))
+        sum(1 for r in stats_source if r.sandbox_id != "FAIL"),
+        len(stats_source)))
     print("=" * 70)
 
     print("")
@@ -685,9 +688,13 @@ def print_summary(all_wall_times):
         t_stats.mean, t_stats.min_val, t_stats.max_val))
 
     print("")
-    print("各轮次耗时分布:")
+    print("各轮次耗时分布{}:".format("(窗口内)" if G.use_timed else ""))
     for rnd in range(1, args.rounds + 1):
-        round_res = [r for r in _results if r.round_num == rnd]
+        round_res_all = [r for r in _results if r.round_num == rnd]
+        if G.use_timed and _window_counts and rnd in _window_counts:
+            round_res = round_res_all[:_window_counts[rnd]]  # 只取窗口内
+        else:
+            round_res = round_res_all
         if round_res:
             round_totals = [r.total_ms for r in round_res]
             s = compute_stats(round_totals)
