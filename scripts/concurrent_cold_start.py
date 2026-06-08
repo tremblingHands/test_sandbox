@@ -733,8 +733,8 @@ if __name__ == "__main__":
                         help="JSON 报告输出路径")
     parser.add_argument("--preconfig", type=int, default=0,
                         help="提前生成 N 个 pod config (默认 0, 即按需生成)")
-    parser.add_argument("--timeout", type=int, default=600,
-                        help="crictl runp 单次调用超时秒数 (默认 600)")
+    parser.add_argument("--timeout", type=int, default=60,
+                        help="crictl runp 单次调用超时秒数 (默认 60)")
     parser.add_argument("--cleanup", action="store_true",
                         help="每个 sandbox 就绪后立即清理（默认不清理）")
     args = parser.parse_args()
