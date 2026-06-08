@@ -558,18 +558,24 @@ def run_round_timed_continuous(round_num, concurrency, duration):
         t.start(); poll_threads.append(t)
 
     time.sleep(duration)
+    # 窗口期结束，记录当时已完成数（快照）
+    window_count = len([r for r in _results if r.round_num == round_num])
+    window_ms = round((time.perf_counter() - t_start) * 1000, 1)
     stop_event.set()
 
     for t in runp_threads: t.join()
     for t in poll_threads: t.join()
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-    round_results = [r for r in _results if r.round_num == round_num]
-    count = len(round_results)
-    tps = count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+    total_count = len([r for r in _results if r.round_num == round_num])
+    tail_count = total_count - window_count
+    tail_ms = elapsed_ms - window_ms
 
-    print("  完成: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
-        elapsed_ms, count, tps))
+    window_tps = window_count / (window_ms / 1000.0) if window_ms > 0 else 0
+    total_tps = total_count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+
+    print("  窗口 {}ms: {} sandboxes ({:.1f}/s) | tail {}ms: {} sandboxes | 总计 {:.1f}/s".format(
+        window_ms, window_count, window_tps, tail_ms, tail_count, total_tps))
     batch_cleanup(round_num)
     return elapsed_ms
 
@@ -593,17 +599,23 @@ def run_round_timed_serial(round_num, concurrency, duration):
         t.start(); threads.append(t)
 
     time.sleep(duration)
+    # 窗口期结束快照
+    window_count = len([r for r in _results if r.round_num == round_num])
+    window_ms = round((time.perf_counter() - t_start) * 1000, 1)
     stop_event.set()
 
     for t in threads: t.join()
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-    round_results = [r for r in _results if r.round_num == round_num]
-    count = len(round_results)
-    tps = count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+    total_count = len([r for r in _results if r.round_num == round_num])
+    tail_count = total_count - window_count
+    tail_ms = elapsed_ms - window_ms
 
-    print("  完成: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
-        elapsed_ms, count, tps))
+    window_tps = window_count / (window_ms / 1000.0) if window_ms > 0 else 0
+    total_tps = total_count / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0
+
+    print("  窗口 {}ms: {} sandboxes ({:.1f}/s) | tail {}ms: {} sandboxes | 总计 {:.1f}/s".format(
+        window_ms, window_count, window_tps, tail_ms, tail_count, total_tps))
     batch_cleanup(round_num)
     return elapsed_ms
 
@@ -648,9 +660,10 @@ def print_summary(all_wall_times):
         for rnd in range(1, args.rounds + 1):
             wall = all_wall_times[rnd - 1]
             count = sum(1 for r in _results if r.round_num == rnd)
-            tps = count / (wall / 1000.0) if wall > 0 else 0
-            print("  第 {} 轮: {}ms, {} sandboxes, {:.1f} sandbox/s".format(
-                rnd, wall, count, tps))
+            total_tps = count / (wall / 1000.0) if wall > 0 else 0
+            tail_ms = int(wall - args.duration * 1000)
+            print("  第 {} 轮: {} sandboxes, wall={}ms tail={}ms, 总吞吐 {:.1f}/s".format(
+                rnd, count, int(wall), tail_ms, total_tps))
     else:
         print("各轮挂钟总耗时:")
         for rnd, wall in enumerate(all_wall_times, 1):
