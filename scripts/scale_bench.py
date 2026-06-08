@@ -114,8 +114,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="并发 Pod 沙箱扩展性测试"
     )
+    parser.add_argument("--min-concurrency", type=int, default=1,
+                        help="起始并发线程数 (默认 1)")
     parser.add_argument("--max-concurrency", type=int, default=256,
-                        help="最大并发线程数 (默认 256, 从1开始翻倍)")
+                        help="最大并发线程数 (默认 256)")
     parser.add_argument("--duration", type=int, default=30,
                         help="每级测试持续时间秒 (默认 30)")
     parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
@@ -132,14 +134,14 @@ if __name__ == "__main__":
     if not os.path.isdir(RESULTS_DIR):
         os.makedirs(RESULTS_DIR)
 
-    # 生成并发级别: 1, 2, 4, 8, 16, ...
+    # 生成并发级别: min, min*2, min*4, ..., max
     levels = []
-    c = 1
+    c = args.min_concurrency
     while c <= args.max_concurrency:
         levels.append(c)
         c *= 2
     # 确保 max_concurrency 被包含 (如果不是2的幂)
-    if levels[-1] != args.max_concurrency:
+    if not levels or levels[-1] != args.max_concurrency:
         levels.append(args.max_concurrency)
 
     print("=" * 50)
@@ -148,7 +150,8 @@ if __name__ == "__main__":
     print("Runtime:     {}".format(args.runtime))
     print("模式:        {}".format(args.mode))
     print("每级时长:    {}s".format(args.duration))
-    print("并发级别:    {}".format(levels))
+    print("并发范围:    {} → {}".format(args.min_concurrency, args.max_concurrency))
+    print("级别:        {}".format(levels))
     print("=" * 50)
     print("")
 
