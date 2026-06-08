@@ -6,3 +6,4 @@ concurrent_cold_start_report.json
 __pycache__/
 max_concurrency_report.json
 install/
+results/*.json

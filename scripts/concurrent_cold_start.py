@@ -45,7 +45,7 @@ except ImportError:
 # 配置
 # ============================================================
 PAUSE_IMAGE = "registry.aliyuncs.com/google_containers/pause:3.9"
-OUTPUT_FILE = "concurrent_cold_start_report.json"
+OUTPUT_FILE = "results/concurrent_cold_start_report.json"
 POD_CONFIG_DIR = "/tmp/conc-pod-configs"
 
 

@@ -140,7 +140,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max", type=int, default=0,
                         help="上限（0 = 无上限，直到创建失败）")
-    parser.add_argument("--output", default="max_concurrency_report.json",
+    parser.add_argument("--output", default="results/max_concurrency_report.json",
                         help="报告输出路径")
     parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
                         help="OCI 运行时 (默认 runc)")
