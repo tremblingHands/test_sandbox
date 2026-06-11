@@ -47,6 +47,7 @@ except ImportError:
 PAUSE_IMAGE = "registry.aliyuncs.com/google_containers/pause:3.9"
 OUTPUT_FILE = "results/concurrent_cold_start_report.json"
 POD_CONFIG_DIR = "/tmp/conc-pod-configs"
+CPUSET_K8S_IO = "/sys/fs/cgroup/cpuset/k8s.io"
 
 
 # ============================================================
@@ -134,6 +135,49 @@ def clear_caches():
         pass
 
 
+CPUSET_POOL_DIR = CPUSET_K8S_IO + "/conc-bench"
+
+
+def setup_cpuset_limits(cpuset_cpus, cpuset_mems):
+    """在 k8s.io 下创建 conc-bench 子 cgroup 并设置 cpuset 限制。
+       pod 通过 cgroup_parent 归入此 cgroup，effective 自动截断。"""
+    if not cpuset_cpus and not cpuset_mems:
+        return
+    # 创建子 cgroup 目录
+    if not os.path.isdir(CPUSET_POOL_DIR):
+        try:
+            os.mkdir(CPUSET_POOL_DIR)
+        except OSError:
+            pass
+    if not os.path.isdir(CPUSET_POOL_DIR):
+        print("  [cpuset] 跳过: 无法创建 {}".format(CPUSET_POOL_DIR))
+        return
+    if cpuset_cpus:
+        _write_file(os.path.join(CPUSET_POOL_DIR, "cpuset.cpus"),
+                     cpuset_cpus + "\n")
+        print("  [cpuset] {}/cpuset.cpus = {}".format(CPUSET_POOL_DIR, cpuset_cpus))
+    if cpuset_mems:
+        _write_file(os.path.join(CPUSET_POOL_DIR, "cpuset.mems"),
+                     cpuset_mems + "\n")
+        print("  [cpuset] {}/cpuset.mems = {}".format(CPUSET_POOL_DIR, cpuset_mems))
+
+
+def restore_cpuset_limits(cpuset_cpus, cpuset_mems):
+    """清理 conc-bench cgroup 目录。"""
+    if not cpuset_cpus and not cpuset_mems:
+        return
+    for base in (CPUSET_K8S_IO, "/sys/fs/cgroup/cpu,cpuacct/k8s.io",
+                 "/sys/fs/cgroup/memory/k8s.io",
+                 "/sys/fs/cgroup/systemd/k8s.io"):
+        pool_dir = os.path.join(base, "conc-bench")
+        if os.path.isdir(pool_dir):
+            try:
+                os.rmdir(pool_dir)
+            except OSError:
+                pass
+    print("  [cpuset] conc-bench 已清理")
+
+
 # ============================================================
 # Pod 配置生成
 # ============================================================
@@ -141,6 +185,13 @@ def generate_pod_config(round_num, worker_id, local_seq):
     task_label = "w{}-{}".format(worker_id, local_seq)
     unique_uid = "conc-{}-r{}".format(uuid.uuid4().hex[:12], round_num)
     path = "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, local_seq)
+    linux_config = {
+        "security_context": {
+            "namespace_options": {"network": 0}
+        }
+    }
+    if G.cpuset_cpus or G.cpuset_mems:
+        linux_config["cgroup_parent"] = "/k8s.io/conc-bench"
     content = json.dumps({
         "metadata": {
             "name": "conc-bench-r{}-w{}-{}".format(round_num, worker_id, local_seq),
@@ -149,11 +200,7 @@ def generate_pod_config(round_num, worker_id, local_seq):
             "attempt": 1
         },
         "log_directory": "/tmp/sandbox-logs",
-        "linux": {
-            "security_context": {
-                "namespace_options": {"network": 0}
-            }
-        }
+        "linux": linux_config,
     })
     _write_file(path, content)
     return path
@@ -202,7 +249,6 @@ def poll_until_ready(sandbox_id, timeout_sec=30.0):
                 return
         except RuntimeError:
             pass
-        time.sleep(0.01)
     raise RuntimeError("sandbox {} not ready in {}s".format(sandbox_id, timeout_sec))
 
 
@@ -742,12 +788,20 @@ if __name__ == "__main__":
                         help="crictl runp 单次调用超时秒数 (默认 60)")
     parser.add_argument("--cleanup", action="store_true",
                         help="每个 sandbox 就绪后立即清理（默认不清理）")
+    parser.add_argument("--cpuset-cpus", type=str, default=None,
+                        help="限制所有测试 pod 的 CPU 核心，如 '0-3' "
+                             "(写入 /sys/fs/cgroup/cpuset/k8s.io/cpuset.cpus)")
+    parser.add_argument("--cpuset-mems", type=str, default=None,
+                        help="限制所有测试 pod 的 NUMA 内存节点，如 '0' "
+                             "(写入 /sys/fs/cgroup/cpuset/k8s.io/cpuset.mems)")
     args = parser.parse_args()
 
     G.cleanup = args.cleanup
     G.use_timed = args.duration is not None
     G.runp_timeout = args.timeout
     G.preconfig_count = args.preconfig
+    G.cpuset_cpus = args.cpuset_cpus
+    G.cpuset_mems = args.cpuset_mems
     per_round_val = args.duration if G.use_timed else args.per_round
 
     if not os.path.isdir(POD_CONFIG_DIR):
@@ -765,6 +819,13 @@ if __name__ == "__main__":
     else:
         print("每轮数:   {} sandboxes (固定数量)".format(args.per_round))
     print("总轮次:   {}".format(args.rounds))
+    if G.cpuset_cpus or G.cpuset_mems:
+        parts = []
+        if G.cpuset_cpus:
+            parts.append("cpus={}".format(G.cpuset_cpus))
+        if G.cpuset_mems:
+            parts.append("mems={}".format(G.cpuset_mems))
+        print("cpuset:   {}".format(" ".join(parts)))
     print("=" * 50)
     print("")
 
@@ -779,12 +840,18 @@ if __name__ == "__main__":
         round_fn = (run_round_counted_continuous if args.mode == "continuous"
                     else run_round_counted_serial)
 
+    # 设置 cpuset 限制（k8s.io 父 cgroup）
+    setup_cpuset_limits(args.cpuset_cpus, args.cpuset_mems)
+
     all_wall_times = []
     for rnd in range(1, args.rounds + 1):
         wall = round_fn(rnd, args.concurrency, per_round_val)
         all_wall_times.append(wall)
 
     print_summary(all_wall_times)
+
+    # 恢复 cpuset 默认值
+    restore_cpuset_limits(args.cpuset_cpus, args.cpuset_mems)
 
     # JSON 报告
     report = {
@@ -798,6 +865,8 @@ if __name__ == "__main__":
             "pause_image": PAUSE_IMAGE,
             "runtime": "runc (via crictl)",
             "on_demand_config": _on_demand_triggered,
+            "cpuset_cpus": args.cpuset_cpus,
+            "cpuset_mems": args.cpuset_mems,
         },
         "summary": {
             "total_sandboxes": sum(G.window_counts.values()) if G.use_timed and G.window_counts else len(_results),
