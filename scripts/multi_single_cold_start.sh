@@ -4,18 +4,18 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <M>-<N> <K> [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <M>-<N> <K> <NUMA> [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
-#     M-N   CPU 范围，如 0-7。每个 CPU 启动一个 single_cold_start.py 进程，
-#           用 numactl --physcpubind=<cpu> 绑定到对应 CPU。
-#     K     NUMA 节点号，所有进程统一用 numactl --membind=<K> 绑定内存。
+#     M-N    CPU 范围，如 0-7。进程将从 M 开始依次绑定到核心。
+#     K      启动的进程数量。
+#     NUMA   NUMA 节点号，所有进程统一用 numactl --membind=<NUMA> 绑定内存。
 #
 #     额外参数通过 -- 分隔后透传给 single_cold_start.py。
 #
 # 示例:
-#     ./multi_single_cold_start.sh 0-7 0 -- --duration 60
-#     ./multi_single_cold_start.sh 4-11 1 -- --duration 30 --cleanup
+#     ./multi_single_cold_start.sh 0-7 4 0 -- --duration 60
+#     ./multi_single_cold_start.sh 4-11 8 1 -- --duration 30 --cleanup
 #
 # 前置条件:
 #     - numactl 已安装
@@ -28,20 +28,22 @@ set -euo pipefail
 # ============================================================
 # 参数解析
 # ============================================================
-if [ $# -lt 2 ]; then
-    echo "用法: $0 <M>-<N> <K> [-- <single_cold_start.py 的额外参数>]"
+if [ $# -lt 3 ]; then
+    echo "用法: $0 <M>-<N> <K> <NUMA> [-- <single_cold_start.py 的额外参数>]"
     echo ""
-    echo "  M-N   CPU 范围，每个 CPU 绑定一个进程"
-    echo "  K     NUMA 节点号，所有进程内存统一绑定"
+    echo "  M-N    CPU 范围，进程将依次绑定到 M, M+1, ..."
+    echo "  K      启动的进程数量"
+    echo "  NUMA   NUMA 节点号，所有进程内存统一绑定"
     echo ""
     echo "示例:"
-    echo "  $0 0-7 0 -- --duration 60 --cleanup"
+    echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
     exit 1
 fi
 
 CPU_RANGE="$1"
-NUMA_NODE="$2"
-shift 2
+PROC_COUNT="$2"
+NUMA_NODE="$3"
+shift 3
 
 # 解析 -- 后的透传参数
 PASSTHRU_ARGS=()
@@ -58,6 +60,13 @@ if [ -z "${CPU_START:-}" ] || [ -z "${CPU_END:-}" ]; then
 fi
 if [ "$CPU_START" -gt "$CPU_END" ]; then
     echo "错误: CPU 范围 $CPU_START > $CPU_END"
+    exit 1
+fi
+
+# 可用 CPU 数
+AVAILABLE_CPUS=$((CPU_END - CPU_START + 1))
+if [ "$PROC_COUNT" -le 0 ]; then
+    echo "错误: 进程数必须为正整数，当前为 $PROC_COUNT"
     exit 1
 fi
 
@@ -83,15 +92,19 @@ mkdir -p "$RESULT_DIR"
 # ============================================================
 # 输出配置
 # ============================================================
-CPU_COUNT=$((CPU_END - CPU_START + 1))
+CPU_COUNT=$AVAILABLE_CPUS
+CPU_END_IDX=$((CPU_START + PROC_COUNT - 1))
 
 echo ""
 echo "=================================================="
 echo "多进程 Pod 沙箱冷启动测试"
 echo "=================================================="
-echo "CPU 范围:  $CPU_RANGE  (共 $CPU_COUNT 个 CPU)"
+echo "CPU 范围:  $CPU_RANGE  (共 $CPU_COUNT 个核心)"
 echo "NUMA 节点: $NUMA_NODE"
-echo "进程数:    $CPU_COUNT"
+echo "进程数:    $PROC_COUNT"
+if [ "$PROC_COUNT" -gt "$CPU_COUNT" ]; then
+    echo "绑定策略: 轮转 (超出后回到 $CPU_START)"
+fi
 echo "结果目录:  $RESULT_DIR"
 echo "透传参数:  ${PASSTHRU_ARGS[*]:-(无)}"
 echo "=================================================="
@@ -110,23 +123,24 @@ echo ""
 # 启动进程（每个 single_cold_start.py 不再自行清缓存和清理）
 # ============================================================
 PIDS=()
-CPU=$CPU_START
-while [ "$CPU" -le "$CPU_END" ]; do
-    OUTPUT_FILE="${RESULT_DIR}/cpu${CPU}_node${NUMA_NODE}.json"
+PROC=0
+while [ "$PROC" -lt "$PROC_COUNT" ]; do
+    BIND_CPU=$((CPU_START + (PROC % CPU_COUNT)))
+    OUTPUT_FILE="${RESULT_DIR}/proc${PROC}_cpu${BIND_CPU}_node${NUMA_NODE}.json"
 
-    echo "[cpu $CPU] 启动: numactl --physcpubind=$CPU --membind=$NUMA_NODE"
+    echo "[proc $PROC] 启动: numactl --physcpubind=$BIND_CPU --membind=$NUMA_NODE"
 
-    numactl --physcpubind="$CPU" --membind="$NUMA_NODE" \
+    numactl --physcpubind="$BIND_CPU" --membind="$NUMA_NODE" \
         python3 "$SINGLE_PY" \
             --output "$OUTPUT_FILE" \
-            --worker-id "$CPU" \
+            --worker-id "$PROC" \
             --no-clear-caches \
             --no-batch-cleanup \
             "${PASSTHRU_ARGS[@]}" \
-        > "${RESULT_DIR}/cpu${CPU}_stdout.log" 2>&1 &
+        > "${RESULT_DIR}/proc${PROC}_stdout.log" 2>&1 &
 
     PIDS+=($!)
-    CPU=$((CPU + 1))
+    PROC=$((PROC + 1))
 done
 
 echo ""
@@ -157,23 +171,15 @@ echo "结果: $RESULT_DIR/"
 echo "=================================================="
 
 # ============================================================
-# 最终批量清理（由启动器统一完成）
-# ============================================================
-echo ""
-echo "[post] 清理所有残留 pod..."
-crictl rmp -a -f >/dev/null 2>&1 || crictl rmp --all --force >/dev/null 2>&1 || true
-echo "[post] 清理完成"
-
-# ============================================================
 # 汇总
 # ============================================================
 echo ""
-echo "--- 各 CPU 摘要 ---"
-printf "%-16s %10s %10s %10s %10s %10s %10s\n" \
-    "CPU" "sandboxes" "成功" "P50(ms)" "P95(ms)" "P99(ms)" "Mean(ms)"
-for f in "$RESULT_DIR"/cpu*_node*.json; do
+echo "--- 各进程摘要 ---"
+printf "%-20s %10s %10s %10s %10s %10s %10s\n" \
+    "PROC" "sandboxes" "成功" "P50(ms)" "P95(ms)" "P99(ms)" "Mean(ms)"
+for f in "$RESULT_DIR"/proc*_cpu*_node*.json; do
     [ -f "$f" ] || continue
-    cpu_label="$(basename "$f" .json)"
+    label="$(basename "$f" .json)"
     read -r total success p50 p95 p99 mean <<< \
         $(python3 -c "
 import json
@@ -186,8 +192,8 @@ print(d['summary']['total_sandboxes'],
       round(t['p99'], 1),
       round(t['mean'], 1))
 ")
-    printf "%-16s %10s %10s %10s %10s %10s %10s\n" \
-        "$cpu_label" "$total" "$success" "$p50" "$p95" "$p99" "$mean"
+    printf "%-20s %10s %10s %10s %10s %10s %10s\n" \
+        "$label" "$total" "$success" "$p50" "$p95" "$p99" "$mean"
 done
 
 # 汇总所有 CPU
@@ -201,7 +207,7 @@ total_sandboxes = 0
 total_success = 0
 duration = None
 
-for f in sorted(glob.glob('$RESULT_DIR/cpu*_node*.json')):
+for f in sorted(glob.glob('$RESULT_DIR/proc*_cpu*_node*.json')):
     d = json.load(open(f))
     total_sandboxes += d['summary']['total_sandboxes']
     total_success += d['summary']['success']
@@ -223,3 +229,11 @@ if all_results:
 else:
     print('(无数据)')
 "
+
+# ============================================================
+# 最终批量清理（由启动器统一完成）
+# ============================================================
+echo ""
+echo "[post] 清理所有残留 pod..."
+crictl rmp -a -f >/dev/null 2>&1 || crictl rmp --all --force >/dev/null 2>&1 || true
+echo "[post] 清理完成"
