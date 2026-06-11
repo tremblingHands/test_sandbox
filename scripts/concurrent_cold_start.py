@@ -161,6 +161,7 @@ def generate_pod_config(round_num, worker_id, local_seq):
 
 # 预生成的 config 文件：路径确定，文件即存储
 _preconfig_per_worker = 0
+_on_demand_triggered = False   # 是否触发了按需生成 config
 
 
 def preconfig_configs(round_num, concurrency, per_worker):
@@ -176,8 +177,10 @@ def preconfig_configs(round_num, concurrency, per_worker):
 
 def get_config(round_num, worker_id, seq):
     """获取 pod config 路径：seq 在预生成范围内的直接返回路径，否则按需生成。"""
+    global _on_demand_triggered
     if seq < _preconfig_per_worker:
         return "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, seq)
+    _on_demand_triggered = True
     return generate_pod_config(round_num, worker_id, seq)
 
 
@@ -605,7 +608,7 @@ def run_round_timed_serial(round_num, concurrency, duration):
 # 汇总报告
 # ============================================================
 def print_summary(all_wall_times):
-    global _results
+    global _results, _on_demand_triggered
 
     # 定时模式: 只统计窗口期内完成的 sandbox
     if G.use_timed and G.window_counts:
@@ -648,6 +651,8 @@ def print_summary(all_wall_times):
     print("成功:     {}/{}".format(
         sum(1 for r in stats_source if r.sandbox_id != "FAIL"),
         len(stats_source)))
+    if _on_demand_triggered:
+        print("Config:   预生成不足，触发了按需生成")
     print("=" * 70)
 
     print("")
@@ -792,6 +797,7 @@ if __name__ == "__main__":
             "duration": args.duration,
             "pause_image": PAUSE_IMAGE,
             "runtime": "runc (via crictl)",
+            "on_demand_config": _on_demand_triggered,
         },
         "summary": {
             "total_sandboxes": sum(G.window_counts.values()) if G.use_timed and G.window_counts else len(_results),

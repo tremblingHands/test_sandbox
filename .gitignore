@@ -8,3 +8,4 @@ max_concurrency_report.json
 install/
 results/*.json
 results/scale-c*.log
+tmp/
