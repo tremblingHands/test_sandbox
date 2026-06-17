@@ -24,6 +24,14 @@ import uuid
 import argparse
 import sys
 import os
+import datetime
+import math
+
+# 允许 import 同目录下的 trace_analyzer
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+import trace_analyzer
 
 
 # ============================================================
@@ -197,6 +205,185 @@ def clear_caches():
 
 
 # ============================================================
+# Profile: containerd trace 分析
+# ============================================================
+_profile_spans = []   # (display_name, duration_ms) 汇总
+_profile_order = []   # [(display_name, depth)] 首次出现顺序
+
+
+def _span_display(s):
+    """生成 span 的显示名（包含 (#N) 标记重复调用）。"""
+    name = s.name
+    if s.dup_index > 0:
+        name += " (#{})".format(s.dup_index + 1)
+    return name
+
+
+def _walk_order(spans, depth=0):
+    """DFS 遍历 span 树，记录首次出现的 span 名顺序及深度。"""
+    for s in spans:
+        display = _span_display(s)
+        if display not in [n for n, _d in _profile_order]:
+            _profile_order.append((display, depth))
+        _walk_order(s.children, depth + 1)
+
+
+def profile_sandbox(sandbox_id, t_before, t_after):
+    """查询 containerd trace 日志并打印该 sandbox 的时延树。"""
+    since = (t_before - datetime.timedelta(seconds=2)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    until = (t_after + datetime.timedelta(seconds=3)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+
+    try:
+        output = _run(
+            'journalctl -u containerd --since="{}" --until="{}"'
+            ' -o cat --no-pager'.format(since, until))
+    except RuntimeError:
+        return
+
+    lines = output.split("\n")
+
+    # 使用 trace_analyzer 的解析逻辑
+    raw_spans = {}
+    for line in lines:
+        m = trace_analyzer._TRACE_RE.search(line)
+        if not m:
+            continue
+
+        kind = m.group("kind")
+        span_id = m.group("span")
+        trace_id_out = m.group("trace")
+        parent = m.group("parent") or "0000000000000000"
+
+        if kind == "start":
+            attrs = trace_analyzer.parse_attrs(m.group("attrs") or "")
+            raw_spans[span_id] = trace_analyzer.Span(
+                name=m.group("name"),
+                trace_id=trace_id_out,
+                span_id=span_id,
+                parent_span_id=parent,
+                attrs=attrs,
+                started=True,
+            )
+        elif kind == "end":
+            dur = trace_analyzer.parse_duration(m.group("dur") or "0ms")
+            if span_id in raw_spans:
+                raw_spans[span_id].duration_ms = dur
+                raw_spans[span_id].ended = True
+                end_attrs = trace_analyzer.parse_attrs(
+                    m.group("attrs") or "")
+                raw_spans[span_id].attrs.update(end_attrs)
+            else:
+                attrs = trace_analyzer.parse_attrs(m.group("attrs") or "")
+                raw_spans[span_id] = trace_analyzer.Span(
+                    name=m.group("name"),
+                    trace_id=trace_id_out,
+                    span_id=span_id,
+                    parent_span_id=parent,
+                    attrs=attrs,
+                    duration_ms=dur,
+                    ended=True,
+                )
+
+    spans = [s for s in raw_spans.values() if s.ended]
+    if not spans:
+        return
+
+    trace_analyzer.backfill_sandbox_id(spans)
+
+    # 按 sandbox_id 过滤
+    matching_traces = set()
+    for s in spans:
+        sid = s.attrs.get("sandbox.id", "")
+        if sid == sandbox_id:
+            matching_traces.add(s.trace_id)
+
+    if not matching_traces:
+        return
+
+    filtered = [s for s in spans if s.trace_id in matching_traces]
+
+    # 按 trace_id 分组
+    by_trace = {}
+    for s in filtered:
+        by_trace.setdefault(s.trace_id, []).append(s)
+
+    for trace_id, tspans in by_trace.items():
+        roots = trace_analyzer.build_trees(tspans)
+        if not roots:
+            continue
+        total_ms = sum(r.duration_ms for r in roots)
+
+        print("")
+        print("═══ Sandbox: {} ═══".format(sandbox_id))
+        print("Trace: {}".format(trace_id))
+        print("Total wall-clock: {}".format(
+            trace_analyzer.format_ms(total_ms)))
+        print("")
+        trace_analyzer.print_tree(roots, total_ms)
+
+        # 收集 span 数据 + 记录树结构顺序
+        _walk_order(roots)
+        for s in tspans:
+            _profile_spans.append((_span_display(s), s.duration_ms))
+
+
+def print_profile_summary(total_runs):
+    """打印所有 profiled sandbox 的各阶段汇总统计。"""
+    global _profile_spans
+    if not _profile_spans:
+        return
+
+    from collections import defaultdict
+    stats = defaultdict(list)
+    for name, dur in _profile_spans:
+        stats[name].append(dur)
+
+    print("")
+    print("=" * 110)
+    print("Profile 各阶段时延汇总 ({} sandboxes)".format(total_runs))
+    print("=" * 110)
+    print("{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
+        "Span Name", "Cnt", "Avg", "P50", "P95", "P99"))
+    print("-" * 110)
+
+    def percentile(data, p):
+        if not data:
+            return 0
+        n = len(data)
+        k = (p / 100.0) * (n - 1)
+        f = int(math.floor(k))
+        c = int(math.ceil(k))
+        if f == c:
+            return data[int(k)]
+        return data[f] * (c - k) + data[c] * (k - f)
+
+    # 按树结构顺序输出（而非字母序）
+    # 构建 name → depth 映射
+    name_depth = {n: d for n, d in _profile_order}
+    ordered_names = [n for n, _d in _profile_order if n in stats]
+    for name in ordered_names:
+        durs = sorted(stats[name])
+        n = len(durs)
+        avg = sum(durs) / n
+        p50 = percentile(durs, 50)
+        p95 = percentile(durs, 95)
+        p99 = percentile(durs, 99)
+
+        depth = name_depth.get(name, 0)
+        indent = "  " * depth
+        display = indent + name
+
+        print("{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
+            display[:65], n,
+            trace_analyzer.format_ms(avg),
+            trace_analyzer.format_ms(p50),
+            trace_analyzer.format_ms(p95),
+            trace_analyzer.format_ms(p99)))
+
+
+# ============================================================
 # 核心测试：单次冷启动
 # ============================================================
 def single_cold_start(run_id):
@@ -209,6 +396,7 @@ def single_cold_start(run_id):
     pod_config_path = prepare_pod_config(run_id)
 
     # ---- 阶段 1: t_runp ---- #
+    t_before_wall = datetime.datetime.now() if args.profile else None
     t0 = time.perf_counter()
     sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
     t1 = time.perf_counter()
@@ -218,6 +406,11 @@ def single_cold_start(run_id):
     wait_until_ready(sandbox_id)
     t2 = time.perf_counter()
     t_ready_ms = (t2 - t1) * 1000
+    t_after_wall = datetime.datetime.now() if args.profile else None
+
+    # ---- Profile: containerd trace 分析 ---- #
+    if args.profile:
+        profile_sandbox(sandbox_id, t_before_wall, t_after_wall)
 
     # ---- 清理 ---- #
     stop_pod_sandbox(sandbox_id)
@@ -288,6 +481,8 @@ if __name__ == "__main__":
     parser.add_argument("--runtime", choices=["runc", "kata"], default="runc",
                         help="OCI 运行时 (默认 runc)")
     parser.add_argument("--output", default=OUTPUT_FILE, help="JSON 报告输出路径")
+    parser.add_argument("--profile", action="store_true",
+                        help="开启 containerd trace 分析，统计各阶段时延")
     args = parser.parse_args()
 
     report = run_benchmark(runs=args.runs)
@@ -323,3 +518,7 @@ if __name__ == "__main__":
         total["p50"], total["p95"], total["p99"], total["mean"]))
     print("")
     print("报告已保存: {}".format(args.output))
+
+    # Profile 汇总
+    if args.profile:
+        print_profile_summary(report["summary"]["success_runs"])
