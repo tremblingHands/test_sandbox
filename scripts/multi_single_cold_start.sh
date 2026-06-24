@@ -4,10 +4,11 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
-#     M-N    CPU 范围，如 0-7。进程将从 M 开始依次绑定到核心。
+#     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
+#            进程将按列表顺序依次绑定到核心。
 #     K      启动的进程数量。
 #     NUMA   NUMA 节点号，所有进程统一用 numactl --membind=<NUMA> 绑定内存。
 #     --profile    通过 containerd trace 日志统计各阶段时延（P50/P95/P99/Mean）
@@ -17,6 +18,7 @@
 # 示例:
 #     ./multi_single_cold_start.sh 0-7 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 4-11 8 1 -- --duration 30 --cleanup
+#     ./multi_single_cold_start.sh 32,34,36,38 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
 #
 # 前置条件:
@@ -31,14 +33,15 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
     echo ""
-    echo "  M-N    CPU 范围，进程将依次绑定到 M, M+1, ..."
+    echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
     echo "  NUMA   NUMA 节点号，所有进程内存统一绑定"
     echo ""
     echo "示例:"
     echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
+    echo "  $0 32,34,36,38 4 0 -- --duration 60"
     exit 1
 fi
 
@@ -58,24 +61,41 @@ while [[ $# -gt 0 ]]; do
             shift; PASSTHRU_ARGS=("$@"); break ;;
         *)
             echo "错误: 未知参数: $1"
-            echo "用法: $0 <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
+            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
             exit 1 ;;
     esac
 done
 
-# 解析 CPU 范围 M-N
-IFS='-' read -r CPU_START CPU_END <<< "$CPU_RANGE"
-if [ -z "${CPU_START:-}" ] || [ -z "${CPU_END:-}" ]; then
-    echo "错误: CPU 范围格式不正确，应为 M-N (如 0-7)"
-    exit 1
-fi
-if [ "$CPU_START" -gt "$CPU_END" ]; then
-    echo "错误: CPU 范围 $CPU_START > $CPU_END"
-    exit 1
+# 解析 CPU 列表: "M-N" (连续范围) 或 "C1,C2,C3,..." (指定核心)
+CPU_LIST=()                     # 所有可用 CPU 核心的数组
+if [[ "$CPU_RANGE" == *,* ]]; then
+    # 逗号分隔的 CPU 核心列表
+    IFS=',' read -ra CPU_LIST <<< "$CPU_RANGE"
+    for cpu in "${CPU_LIST[@]}"; do
+        if ! [[ "$cpu" =~ ^[0-9]+$ ]]; then
+            echo "错误: CPU 核心列表格式不正确: $CPU_RANGE (应为数字逗号分隔，如 32,34,36,38)"
+            exit 1
+        fi
+    done
+else
+    # M-N 连续范围
+    IFS='-' read -r CPU_START CPU_END <<< "$CPU_RANGE"
+    if [ -z "${CPU_START:-}" ] || [ -z "${CPU_END:-}" ]; then
+        echo "错误: CPU 范围格式不正确，应为 M-N (如 0-7) 或逗号分隔列表 (如 32,34,36,38)"
+        exit 1
+    fi
+    if [ "$CPU_START" -gt "$CPU_END" ]; then
+        echo "错误: CPU 范围 $CPU_START > $CPU_END"
+        exit 1
+    fi
+    # 展开范围为数组
+    for ((c=CPU_START; c<=CPU_END; c++)); do
+        CPU_LIST+=("$c")
+    done
 fi
 
 # 可用 CPU 数
-AVAILABLE_CPUS=$((CPU_END - CPU_START + 1))
+AVAILABLE_CPUS=${#CPU_LIST[@]}
 if [ "$PROC_COUNT" -le 0 ]; then
     echo "错误: 进程数必须为正整数，当前为 $PROC_COUNT"
     exit 1
@@ -104,17 +124,16 @@ mkdir -p "$RESULT_DIR"
 # 输出配置
 # ============================================================
 CPU_COUNT=$AVAILABLE_CPUS
-CPU_END_IDX=$((CPU_START + PROC_COUNT - 1))
 
 echo ""
 echo "=================================================="
 echo "多进程 Pod 沙箱冷启动测试"
 echo "=================================================="
-echo "CPU 范围:  $CPU_RANGE  (共 $CPU_COUNT 个核心)"
+echo "CPU 列表:  $CPU_RANGE  (共 $CPU_COUNT 个核心)"
 echo "NUMA 节点: $NUMA_NODE"
 echo "进程数:    $PROC_COUNT"
 if [ "$PROC_COUNT" -gt "$CPU_COUNT" ]; then
-    echo "绑定策略: 轮转 (超出后回到 $CPU_START)"
+    echo "绑定策略: 轮转 (超出后回到 ${CPU_LIST[0]})"
 fi
 echo "结果目录:  $RESULT_DIR"
 echo "透传参数:  ${PASSTHRU_ARGS[*]:-(无)}"
@@ -148,7 +167,7 @@ fi
 PIDS=()
 PROC=0
 while [ "$PROC" -lt "$PROC_COUNT" ]; do
-    BIND_CPU=$((CPU_START + (PROC % CPU_COUNT)))
+    BIND_CPU=${CPU_LIST[$((PROC % CPU_COUNT))]}
     OUTPUT_FILE="${RESULT_DIR}/proc${PROC}_cpu${BIND_CPU}_node${NUMA_NODE}.json"
 
     echo "[proc $PROC] 启动: numactl --physcpubind=$BIND_CPU --membind=$NUMA_NODE"
