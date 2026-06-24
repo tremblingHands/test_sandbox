@@ -4,18 +4,20 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <M>-<N> <K> <NUMA> [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
 #     M-N    CPU 范围，如 0-7。进程将从 M 开始依次绑定到核心。
 #     K      启动的进程数量。
 #     NUMA   NUMA 节点号，所有进程统一用 numactl --membind=<NUMA> 绑定内存。
+#     --profile    通过 containerd trace 日志统计各阶段时延（P50/P95/P99/Mean）
 #
 #     额外参数通过 -- 分隔后透传给 single_cold_start.py。
 #
 # 示例:
 #     ./multi_single_cold_start.sh 0-7 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 4-11 8 1 -- --duration 30 --cleanup
+#     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
 #
 # 前置条件:
 #     - numactl 已安装
@@ -29,7 +31,7 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <M>-<N> <K> <NUMA> [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
     echo ""
     echo "  M-N    CPU 范围，进程将依次绑定到 M, M+1, ..."
     echo "  K      启动的进程数量"
@@ -45,12 +47,21 @@ PROC_COUNT="$2"
 NUMA_NODE="$3"
 shift 3
 
-# 解析 -- 后的透传参数
+# 解析 --profile 和 -- 后的透传参数
+PROFILE=false
 PASSTHRU_ARGS=()
-if [ "${1:-}" = "--" ]; then
-    shift
-    PASSTHRU_ARGS=("$@")
-fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile)
+            PROFILE=true; shift ;;
+        --)
+            shift; PASSTHRU_ARGS=("$@"); break ;;
+        *)
+            echo "错误: 未知参数: $1"
+            echo "用法: $0 <M>-<N> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
+            exit 1 ;;
+    esac
+done
 
 # 解析 CPU 范围 M-N
 IFS='-' read -r CPU_START CPU_END <<< "$CPU_RANGE"
@@ -107,6 +118,9 @@ if [ "$PROC_COUNT" -gt "$CPU_COUNT" ]; then
 fi
 echo "结果目录:  $RESULT_DIR"
 echo "透传参数:  ${PASSTHRU_ARGS[*]:-(无)}"
+if $PROFILE; then
+    echo "Profile:   已开启 (containerd trace 各阶段时延汇总)"
+fi
 echo "=================================================="
 echo ""
 
@@ -118,6 +132,15 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' || true
 sleep 2
 echo "[pre] 清缓存完成"
 echo ""
+
+# ============================================================
+# Profile: 记录测试窗口起止时间（journalctl --since/--until 使用）
+# ============================================================
+if $PROFILE; then
+    PROFILE_START=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[profile] 测试窗口起始: $PROFILE_START"
+    echo ""
+fi
 
 # ============================================================
 # 启动进程（每个 single_cold_start.py 不再自行清缓存和清理）
@@ -169,6 +192,37 @@ else
 fi
 echo "结果: $RESULT_DIR/"
 echo "=================================================="
+
+# ============================================================
+# Profile: containerd trace 分析（所有 worker 的所有 sandbox 汇总）
+# ============================================================
+if $PROFILE; then
+    PROFILE_END=$(date '+%Y-%m-%d %H:%M:%S')
+    PROFILE_LOG="/tmp/multi-profile-$$.log"
+
+    echo ""
+    echo "[profile] 采集窗口: $PROFILE_START → $PROFILE_END"
+    echo "[profile] 正在查询 containerd 日志..."
+
+    journalctl -u containerd \
+        --since="$PROFILE_START" \
+        --until="$PROFILE_END" \
+        -o cat --no-pager \
+        > "$PROFILE_LOG" 2>/dev/null || true
+
+    log_size=$(wc -c < "$PROFILE_LOG" 2>/dev/null || echo 0)
+    echo "[profile] 日志大小: ${log_size} bytes"
+
+    if [ "$log_size" -gt 0 ]; then
+        echo ""
+        python3 "${SCRIPT_DIR}/trace_analyzer.py" "$PROFILE_LOG" --summary-tree || \
+            echo "[profile] ⚠ 未在日志中找到 trace span（containerd 可能未配置 TRACE 级别日志）"
+    else
+        echo "[profile] ⚠ containerd 日志为空（可能未开启 TRACE 级别日志）"
+    fi
+
+    rm -f "$PROFILE_LOG"
+fi
 
 # ============================================================
 # 汇总

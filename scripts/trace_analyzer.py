@@ -319,6 +319,87 @@ def print_summary_report(traces, file=sys.stdout):
         )
 
 
+def print_summary_tree_report(traces, file=sys.stdout):
+    """Print per-stage summary in tree-structure order across all sandboxes.
+
+    Unlike --summary (alphabetical), this walks each trace's span tree and
+    preserves the parent-child ordering with indentation, so the output
+    mirrors the hierarchical structure of the sandbox creation flow.
+    """
+    order = []       # [(display_name, depth)] in first-appearance order
+    all_spans = []   # [(display_name, duration_ms)]
+
+    for _trace_id, spans in traces.items():
+        roots = build_trees(spans)
+        if not roots:
+            continue
+
+        def walk(nodes, depth):
+            for s in nodes:
+                display = s.name
+                if s.dup_index > 0:
+                    display += " (#{})".format(s.dup_index + 1)
+
+                if display not in [n for n, _ in order]:
+                    order.append((display, depth))
+
+                all_spans.append((display, s.duration_ms))
+                walk(s.children, depth + 1)
+
+        walk(roots, 0)
+
+    if not all_spans:
+        print("No spans to summarize.", file=file)
+        return
+
+    # Aggregate stats per display name
+    stats = defaultdict(list)
+    for name, dur in all_spans:
+        stats[name].append(dur)
+
+    # Header
+    header = "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
+        "Span Name", "Cnt", "Avg", "P50", "P95", "P99")
+    print(header, file=file)
+    print("-" * 105, file=file)
+
+    # Print in tree order with indentation
+    name_depth = {n: d for n, d in order}
+    for name, depth in order:
+        if name not in stats:
+            continue
+        durs = sorted(stats[name])
+        n = len(durs)
+        avg = sum(durs) / n
+
+        def percentile(data, p):
+            if not data:
+                return 0
+            k = (p / 100.0) * (len(data) - 1)
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                return data[int(k)]
+            return data[int(f)] * (c - k) + data[int(c)] * (k - f)
+
+        p50 = percentile(durs, 50)
+        p95 = percentile(durs, 95)
+        p99 = percentile(durs, 99)
+
+        indent = "  " * depth
+        display = indent + name
+
+        print(
+            "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
+                display[:65], n,
+                format_ms(avg),
+                format_ms(p50),
+                format_ms(p95),
+                format_ms(p99)),
+            file=file,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -345,7 +426,12 @@ def main():
     parser.add_argument(
         "--summary",
         action="store_true",
-        help="Print per-stage summary statistics across all sandboxes",
+        help="Print per-stage summary statistics across all sandboxes (alphabetical)",
+    )
+    parser.add_argument(
+        "--summary-tree",
+        action="store_true",
+        help="Print per-stage summary in tree-structure order with indentation",
     )
     args = parser.parse_args()
 
@@ -428,6 +514,8 @@ def main():
     # Output
     if args.json:
         print_json_report(by_trace)
+    elif args.summary_tree:
+        print_summary_tree_report(by_trace)
     elif args.summary:
         print_summary_report(by_trace)
     else:
