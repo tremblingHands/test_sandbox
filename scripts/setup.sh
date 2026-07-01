@@ -8,6 +8,7 @@
 #   ./setup.sh --runtime kata                # kata + dragonball（默认）
 #   ./setup.sh --runtime kata --hypervisor qemu  # kata + QEMU
 #   ./setup.sh --cni-type bridge             # 使用 bridge CNI
+#   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --check-only                   # 仅检查，不安装
 # ============================================================
 set -euo pipefail
@@ -17,6 +18,7 @@ CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.6.32"
 CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 CONTAINERD_RUNTIME="runc"       # 默认: runc
+SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs）
 KATA_VERSION="3.22.0"           # kata containers 版本
 
 # 自动检测架构
@@ -55,9 +57,16 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: --runtime 必须是 runc | kata"; exit 1 ;;
             esac
             shift 2 ;;
+        --snapshotter)
+            SNAPSHOTTER="$2"
+            case "$SNAPSHOTTER" in
+                overlayfs|erofs) ;;
+                *) echo "ERROR: --snapshotter 必须是 overlayfs | erofs"; exit 1 ;;
+            esac
+            shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--snapshotter overlayfs|erofs] [--check-only]"
             exit 1 ;;
     esac
 done
@@ -666,6 +675,51 @@ TOML
 }
 
 # ============================================================
+# 检查 snapshotter 配置
+# ============================================================
+check_snapshotter() {
+    echo ""
+    echo "--- snapshotter ---"
+
+    local config_file="/etc/containerd/config.toml"
+    local current_snapshotter
+    current_snapshotter=$(grep -oP "snapshotter\s*=\s*'\K[^']*" "$config_file" 2>/dev/null | head -1)
+
+    if [ "$current_snapshotter" = "$SNAPSHOTTER" ]; then
+        pass "snapshotter 已配置: $SNAPSHOTTER"
+        return 0
+    fi
+
+    if $CHECK_ONLY; then
+        warn "snapshotter 不匹配: 当前=${current_snapshotter:-未设置}, 需要=$SNAPSHOTTER"
+        return 1
+    fi
+
+    if [ -z "$current_snapshotter" ]; then
+        warn "snapshotter 未配置，正在设置为 $SNAPSHOTTER ..."
+    else
+        warn "snapshotter 当前为 $current_snapshotter，正在切换为 $SNAPSHOTTER ..."
+    fi
+
+    # 修改 containerd config 中的 snapshotter 设置
+    if grep -q "snapshotter\s*=" "$config_file" 2>/dev/null; then
+        sudo sed -i "s|snapshotter = '[^']*'|snapshotter = '$SNAPSHOTTER'|" "$config_file"
+    else
+        # 如果没有 snapshotter 行，在 [plugins."io.containerd.cri.v1.images"] 下添加
+        sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'\]/a\\
+      snapshotter = '$SNAPSHOTTER'" "$config_file"
+    fi
+
+    # 重启 containerd 使配置生效
+    echo "  重启 containerd..."
+    sudo systemctl restart containerd
+    sleep 2
+    pass "snapshotter 已切换为: $SNAPSHOTTER"
+
+    return 0
+}
+
+# ============================================================
 # 检查 pause 镜像
 # ============================================================
 check_pause_image() {
@@ -734,9 +788,10 @@ main() {
     echo "  沙箱冷启动测试 — 环境准备"
     echo "=============================================="
     echo "  检测架构: $(uname -m) → $ARCH"
-    echo "  Runtime:  $CONTAINERD_RUNTIME"
-    echo "  CNI 类型: $CNI_TYPE"
-    echo "  pause 镜像: $PAUSE_IMAGE"
+    echo "  Runtime:     $CONTAINERD_RUNTIME"
+    echo "  CNI 类型:    $CNI_TYPE"
+    echo "  Snapshotter: $SNAPSHOTTER"
+    echo "  pause 镜像:  $PAUSE_IMAGE"
     echo "=============================================="
     echo
 
@@ -748,6 +803,7 @@ main() {
     check_crictl          || errors=$((errors + 1))
     check_crictl_config   || { [[ $? -eq 1 ]] && errors=$((errors + 1)); }
     check_registry_mirror || errors=$((errors + 1))
+    check_snapshotter     || errors=$((errors + 1))
     check_pause_image     || errors=$((errors + 1))
     check_kernel_params
 
