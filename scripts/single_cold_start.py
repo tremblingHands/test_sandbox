@@ -158,10 +158,13 @@ def restore_cpuset_limits(cpuset_cpus, cpuset_mems):
 def generate_pod_config(worker_id, seq):
     unique_uid = "single-{}".format(uuid.uuid4().hex[:12])
     path = "{}/pod-w{}-{}.json".format(POD_CONFIG_DIR, worker_id, seq)
+    sec_ctx = {
+        "namespace_options": {"network": 0}
+    }
+    if G.readonly_rootfs:
+        sec_ctx["readonly_rootfs"] = True
     linux_config = {
-        "security_context": {
-            "namespace_options": {"network": 0}
-        }
+        "security_context": sec_ctx
     }
     if G.cpuset_cpus or G.cpuset_mems:
         linux_config["cgroup_parent"] = "/k8s.io/conc-bench"
@@ -302,6 +305,7 @@ G = _Globals()
 G.cpuset_cpus = None
 G.cpuset_mems = None
 G.cleanup = False
+G.readonly_rootfs = False
 
 
 # ============================================================
@@ -333,11 +337,14 @@ if __name__ == "__main__":
                         help="跳过最终批量清理（由外部调用者统一处理）")
     parser.add_argument("--worker-id", type=int, default=0,
                         help="Worker 标识，用于区分不同进程的配置文件和 pod 名称 (默认 0)")
+    parser.add_argument("--readonly-rootfs", action="store_true",
+                        help="Pod 沙箱 rootfs 以只读方式挂载 (默认关闭)")
     args = parser.parse_args()
 
     G.cleanup = args.cleanup
     G.cpuset_cpus = args.cpuset_cpus
     G.cpuset_mems = args.cpuset_mems
+    G.readonly_rootfs = args.readonly_rootfs
 
     if not os.path.isdir(POD_CONFIG_DIR):
         os.makedirs(POD_CONFIG_DIR)
@@ -437,6 +444,7 @@ if __name__ == "__main__":
             "on_demand_config": _on_demand_triggered,
             "cpuset_cpus": args.cpuset_cpus,
             "cpuset_mems": args.cpuset_mems,
+            "readonly_rootfs": args.readonly_rootfs,
         },
         "summary": {
             "total_sandboxes": len(results),
