@@ -4,7 +4,7 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
 #     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
@@ -16,6 +16,10 @@
 #                     抓取时长默认与 single_cold_start --duration 保持一致
 #         --pprof-cpu-seconds SEC     CPU profile 采样时长（默认: 与 duration 相同）
 #         --pprof-series-interval SEC 瞬时 profile 抓取间隔（默认: 1）
+#     --perf       通过 perf 抓取 containerd on/off CPU 火焰图（调用 containerd_perf.sh）
+#                     采样时长默认与 --duration 保持一致
+#         --perf-frequency HZ        采样频率（默认: 99）
+#         --perf-duration SEC        采样时长（默认: 与 duration 相同）
 #
 #     额外参数通过 -- 分隔后透传给 single_cold_start.py。
 #
@@ -25,6 +29,7 @@
 #     ./multi_single_cold_start.sh 32,34,36,38 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --pprof -- --duration 60
+#     ./multi_single_cold_start.sh 0-7 4 0 --pprof --perf -- --duration 60
 #
 # 前置条件:
 #     - numactl 已安装
@@ -38,18 +43,20 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]"
     echo ""
     echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
     echo "  NUMA   NUMA 节点号，所有进程内存统一绑定"
     echo "  --profile    通过 containerd trace 日志统计各阶段时延"
     echo "  --pprof      通过 go pprof 抓取 containerd profile"
+    echo "  --perf       通过 perf 抓取 containerd on/off CPU 火焰图"
     echo ""
     echo "示例:"
     echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
     echo "  $0 32,34,36,38 4 0 -- --duration 60"
     echo "  $0 0-7 4 0 --pprof -- --duration 60"
+    echo "  $0 0-7 4 0 --pprof --perf -- --duration 60"
     exit 1
 fi
 
@@ -58,11 +65,14 @@ PROC_COUNT="$2"
 NUMA_NODE="$3"
 shift 3
 
-# 解析 --profile, --pprof 和 -- 后的透传参数
+# 解析 --profile, --pprof, --perf 和 -- 后的透传参数
 PROFILE=false
 PPROF=false
 PPROF_CPU_SECONDS=""           # 空 = 自动与 duration 对齐
 PPROF_SERIES_INTERVAL=1
+PERF=false
+PERF_FREQUENCY=99
+PERF_DURATION=""               # 空 = 自动与 duration 对齐
 PASSTHRU_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -80,7 +90,22 @@ while [[ $# -gt 0 ]]; do
                     --)
                         shift; PASSTHRU_ARGS=("$@"); break 2 ;;
                     *)
-                        # 不是 pprof 子选项，可能是下一个顶层选项或 --
+                        break ;;
+                esac
+            done
+            ;;
+        --perf)
+            PERF=true; shift
+            # 可选: --perf 后跟子选项 (--perf-frequency HZ --perf-duration SEC)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --perf-frequency)
+                        PERF_FREQUENCY="$2"; shift 2 ;;
+                    --perf-duration)
+                        PERF_DURATION="$2"; shift 2 ;;
+                    --)
+                        shift; PASSTHRU_ARGS=("$@"); break 2 ;;
+                    *)
                         break ;;
                 esac
             done
@@ -89,7 +114,7 @@ while [[ $# -gt 0 ]]; do
             shift; PASSTHRU_ARGS=("$@"); break ;;
         *)
             echo "错误: 未知参数: $1"
-            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]"
+            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]"
             exit 1 ;;
     esac
 done
@@ -175,6 +200,23 @@ if $PPROF; then
     PPROF_OUTPUT_DIR="${RESULT_DIR}/pprof"
 fi
 
+# perf 时长: 优先用户指定的，否则与 test duration 对齐
+if $PERF; then
+    if [ -z "$PERF_DURATION" ]; then
+        if [ -n "$TEST_DURATION" ]; then
+            PERF_DURATION="$TEST_DURATION"
+        else
+            PERF_DURATION=30
+        fi
+    fi
+    PERF_SCRIPT="${SCRIPT_DIR}/containerd_perf.sh"
+    if [ ! -f "$PERF_SCRIPT" ]; then
+        echo "错误: 未找到 perf 脚本: $PERF_SCRIPT"
+        exit 1
+    fi
+    PERF_OUTPUT_DIR="${RESULT_DIR}/perf"
+fi
+
 # ============================================================
 # 输出配置
 # ============================================================
@@ -198,6 +240,10 @@ fi
 if $PPROF; then
     echo "pprof:     已开启 (go pprof)"
     echo "           采样时长: ${PPROF_CPU_SECONDS}s, 间隔: ${PPROF_SERIES_INTERVAL}s"
+fi
+if $PERF; then
+    echo "perf:      已开启 (on/off CPU 火焰图)"
+    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
 fi
 echo "=================================================="
 echo ""
@@ -249,13 +295,16 @@ echo "已启动 ${#PIDS[@]} 个进程, PID: ${PIDS[*]}"
 echo ""
 
 # ============================================================
-# pprof: 抓取 containerd profile（与测试进程并行）
+# profiling: 启动 pprof / perf 抓取（与测试进程并行）
 # ============================================================
 PPROF_PID=""
-if $PPROF; then
-    echo "[pprof] 等待 3s 让沙箱进入稳态..."
+PERF_PID=""
+if $PPROF || $PERF; then
+    echo "[profile] 等待 3s 让沙箱进入稳态..."
     sleep 3
+fi
 
+if $PPROF; then
     echo "[pprof] 启动 containerd profile 抓取..."
     echo "[pprof]   CPU 采样: ${PPROF_CPU_SECONDS}s, 瞬时间隔: ${PPROF_SERIES_INTERVAL}s, 总时长: ${PPROF_SERIES_DURATION}s"
 
@@ -266,6 +315,21 @@ if $PPROF; then
         --series-duration "${PPROF_SERIES_DURATION}" &
     PPROF_PID=$!
     echo "[pprof] pprof 抓取进程 PID: $PPROF_PID"
+fi
+
+if $PERF; then
+    echo "[perf] 启动 perf 火焰图抓取..."
+    echo "[perf]   时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+
+    sudo "${PERF_SCRIPT}" capture \
+        --output-dir "${PERF_OUTPUT_DIR}" \
+        --duration "${PERF_DURATION}" \
+        --frequency "${PERF_FREQUENCY}" &
+    PERF_PID=$!
+    echo "[perf] perf 抓取进程 PID: $PERF_PID"
+fi
+
+if $PPROF || $PERF; then
     echo ""
 fi
 
@@ -309,6 +373,23 @@ if $PPROF && [ -n "$PPROF_PID" ]; then
         fi
     else
         echo "[pprof] ⚠ pprof 抓取失败 (exit=$?)"
+    fi
+fi
+
+# ============================================================
+# perf: 等待抓取完成并生成火焰图
+# ============================================================
+if $PERF && [ -n "$PERF_PID" ]; then
+    echo ""
+    echo "[perf] 等待 perf 抓取完成 (PID: $PERF_PID)..."
+    if wait "$PERF_PID"; then
+        echo "[perf] 抓取完成"
+
+        # perf capture 内部已生成 SVG，这里无需再调用 analyze
+        svg_count=$(find "${PERF_OUTPUT_DIR}" -name '*.svg' -type f 2>/dev/null | wc -l)
+        echo "[perf] 火焰图 × ${svg_count} → ${PERF_OUTPUT_DIR}/"
+    else
+        echo "[perf] ⚠ perf 抓取失败 (exit=$?)"
     fi
 fi
 
