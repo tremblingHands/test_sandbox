@@ -4,7 +4,7 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
 #     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
@@ -12,6 +12,10 @@
 #     K      启动的进程数量。
 #     NUMA   NUMA 节点号，所有进程统一用 numactl --membind=<NUMA> 绑定内存。
 #     --profile    通过 containerd trace 日志统计各阶段时延（P50/P95/P99/Mean）
+#     --pprof      通过 go pprof 抓取 containerd profile（调用 containerd_pprof.sh）
+#                     抓取时长默认与 single_cold_start --duration 保持一致
+#         --pprof-cpu-seconds SEC     CPU profile 采样时长（默认: 与 duration 相同）
+#         --pprof-series-interval SEC 瞬时 profile 抓取间隔（默认: 1）
 #
 #     额外参数通过 -- 分隔后透传给 single_cold_start.py。
 #
@@ -20,6 +24,7 @@
 #     ./multi_single_cold_start.sh 4-11 8 1 -- --duration 30 --cleanup
 #     ./multi_single_cold_start.sh 32,34,36,38 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
+#     ./multi_single_cold_start.sh 0-7 4 0 --pprof -- --duration 60
 #
 # 前置条件:
 #     - numactl 已安装
@@ -33,15 +38,18 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]"
     echo ""
     echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
     echo "  NUMA   NUMA 节点号，所有进程内存统一绑定"
+    echo "  --profile    通过 containerd trace 日志统计各阶段时延"
+    echo "  --pprof      通过 go pprof 抓取 containerd profile"
     echo ""
     echo "示例:"
     echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
     echo "  $0 32,34,36,38 4 0 -- --duration 60"
+    echo "  $0 0-7 4 0 --pprof -- --duration 60"
     exit 1
 fi
 
@@ -50,18 +58,38 @@ PROC_COUNT="$2"
 NUMA_NODE="$3"
 shift 3
 
-# 解析 --profile 和 -- 后的透传参数
+# 解析 --profile, --pprof 和 -- 后的透传参数
 PROFILE=false
+PPROF=false
+PPROF_CPU_SECONDS=""           # 空 = 自动与 duration 对齐
+PPROF_SERIES_INTERVAL=1
 PASSTHRU_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile)
             PROFILE=true; shift ;;
+        --pprof)
+            PPROF=true; shift
+            # 可选: --pprof 后跟子选项 (--pprof-cpu-seconds N --pprof-series-interval N)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --pprof-cpu-seconds)
+                        PPROF_CPU_SECONDS="$2"; shift 2 ;;
+                    --pprof-series-interval)
+                        PPROF_SERIES_INTERVAL="$2"; shift 2 ;;
+                    --)
+                        shift; PASSTHRU_ARGS=("$@"); break 2 ;;
+                    *)
+                        # 不是 pprof 子选项，可能是下一个顶层选项或 --
+                        break ;;
+                esac
+            done
+            ;;
         --)
             shift; PASSTHRU_ARGS=("$@"); break ;;
         *)
             echo "错误: 未知参数: $1"
-            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [-- <single_cold_start.py 的额外参数>]"
+            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [-- <single_cold_start.py 的额外参数>]"
             exit 1 ;;
     esac
 done
@@ -115,10 +143,37 @@ if [ ! -f "$SINGLE_PY" ]; then
     exit 1
 fi
 
+# 从透传参数中提取 --duration 值（用于 pprof 时长对齐）
+TEST_DURATION=""
+for ((i=0; i<${#PASSTHRU_ARGS[@]}; i++)); do
+    if [ "${PASSTHRU_ARGS[$i]}" = "--duration" ] && [ $((i+1)) -lt ${#PASSTHRU_ARGS[@]} ]; then
+        TEST_DURATION="${PASSTHRU_ARGS[$((i+1))]}"
+        break
+    fi
+done
+
 # 结果目录（运行前清理旧结果）
 RESULT_DIR="results/multi"
 rm -rf "$RESULT_DIR"
 mkdir -p "$RESULT_DIR"
+
+# pprof 时长: 优先用户指定的，否则与 test duration 对齐
+if $PPROF; then
+    if [ -z "$PPROF_CPU_SECONDS" ]; then
+        if [ -n "$TEST_DURATION" ]; then
+            PPROF_CPU_SECONDS="$TEST_DURATION"
+        else
+            PPROF_CPU_SECONDS=30
+        fi
+    fi
+    PPROF_SERIES_DURATION="$PPROF_CPU_SECONDS"
+    PPROF_SCRIPT="${SCRIPT_DIR}/containerd_pprof.sh"
+    if [ ! -f "$PPROF_SCRIPT" ]; then
+        echo "错误: 未找到 pprof 脚本: $PPROF_SCRIPT"
+        exit 1
+    fi
+    PPROF_OUTPUT_DIR="${RESULT_DIR}/pprof"
+fi
 
 # ============================================================
 # 输出配置
@@ -139,6 +194,10 @@ echo "结果目录:  $RESULT_DIR"
 echo "透传参数:  ${PASSTHRU_ARGS[*]:-(无)}"
 if $PROFILE; then
     echo "Profile:   已开启 (containerd trace 各阶段时延汇总)"
+fi
+if $PPROF; then
+    echo "pprof:     已开启 (go pprof)"
+    echo "           采样时长: ${PPROF_CPU_SECONDS}s, 间隔: ${PPROF_SERIES_INTERVAL}s"
 fi
 echo "=================================================="
 echo ""
@@ -190,6 +249,27 @@ echo "已启动 ${#PIDS[@]} 个进程, PID: ${PIDS[*]}"
 echo ""
 
 # ============================================================
+# pprof: 抓取 containerd profile（与测试进程并行）
+# ============================================================
+PPROF_PID=""
+if $PPROF; then
+    echo "[pprof] 等待 3s 让沙箱进入稳态..."
+    sleep 3
+
+    echo "[pprof] 启动 containerd profile 抓取..."
+    echo "[pprof]   CPU 采样: ${PPROF_CPU_SECONDS}s, 瞬时间隔: ${PPROF_SERIES_INTERVAL}s, 总时长: ${PPROF_SERIES_DURATION}s"
+
+    sudo "${PPROF_SCRIPT}" capture \
+        --output-dir "${PPROF_OUTPUT_DIR}" \
+        --cpu-seconds "${PPROF_CPU_SECONDS}" \
+        --series-interval "${PPROF_SERIES_INTERVAL}" \
+        --series-duration "${PPROF_SERIES_DURATION}" &
+    PPROF_PID=$!
+    echo "[pprof] pprof 抓取进程 PID: $PPROF_PID"
+    echo ""
+fi
+
+# ============================================================
 # 等待所有进程退出
 # ============================================================
 FAILED=0
@@ -211,6 +291,26 @@ else
 fi
 echo "结果: $RESULT_DIR/"
 echo "=================================================="
+
+# ============================================================
+# pprof: 等待抓取完成并分析
+# ============================================================
+if $PPROF && [ -n "$PPROF_PID" ]; then
+    echo ""
+    echo "[pprof] 等待 pprof 抓取完成 (PID: $PPROF_PID)..."
+    if wait "$PPROF_PID"; then
+        echo "[pprof] 抓取完成"
+
+        # 分析
+        if [ -f "${PPROF_SCRIPT}" ]; then
+            echo "[pprof] 开始分析..."
+            "${PPROF_SCRIPT}" analyze "${PPROF_OUTPUT_DIR}" || \
+                echo "[pprof] ⚠ 分析过程中出现问题（profile 文件仍保留在 ${PPROF_OUTPUT_DIR}）"
+        fi
+    else
+        echo "[pprof] ⚠ pprof 抓取失败 (exit=$?)"
+    fi
+fi
 
 # ============================================================
 # Profile: containerd trace 分析（所有 worker 的所有 sandbox 汇总）
