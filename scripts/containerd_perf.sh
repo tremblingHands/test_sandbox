@@ -8,7 +8,7 @@
 #     ./containerd_perf.sh analyze <OUTPUT_DIR>    # 从已有数据生成 SVG
 #
 # capture 选项:
-#     --output-dir DIR          输出目录（必需）
+#     --output-dir DIR          输出目录（默认: results/perf）
 #     --duration SEC            采样时长（默认: 30）
 #     --frequency HZ            on-CPU 采样频率 Hz（默认: 99）
 #     --offcpu-method METHOD    off-CPU 抓取方式: perf（默认）| ebpf
@@ -40,6 +40,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ============================================================
 DEFAULT_FREQUENCY=99
 DEFAULT_DURATION=30
+DEFAULT_OUTPUT_DIR="results/perf"
 DEFAULT_OFFCPU_METHOD="perf"
 
 # ============================================================
@@ -236,6 +237,7 @@ cmd_capture() {
     local DURATION="$DEFAULT_DURATION"
     local FREQUENCY="$DEFAULT_FREQUENCY"
     local OFFCPU_METHOD="$DEFAULT_OFFCPU_METHOD"
+    local CPUS=""          # 空 = 自动从 containerd.service 解析
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -243,6 +245,7 @@ cmd_capture() {
             --duration)        DURATION="$2";       shift 2 ;;
             --frequency)       FREQUENCY="$2";      shift 2 ;;
             --offcpu-method)   OFFCPU_METHOD="$2";  shift 2 ;;
+            --cpus)            CPUS="$2";           shift 2 ;;
             *)
                 echo "错误: 未知参数: $1"
                 echo "用法: $0 capture --output-dir DIR [...]"
@@ -252,9 +255,7 @@ cmd_capture() {
     done
 
     if [ -z "$OUTPUT_DIR" ]; then
-        echo "错误: --output-dir 是必需参数"
-        echo "用法: $0 capture --output-dir DIR [...]"
-        exit 1
+        OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
     fi
 
     if [ "$OFFCPU_METHOD" != "ebpf" ] && [ "$OFFCPU_METHOD" != "perf" ]; then
@@ -265,7 +266,11 @@ cmd_capture() {
     check_prereqs "$OFFCPU_METHOD" || exit 1
 
     local CONTAINERD_CPUS
+    if [ -n "$CPUS" ]; then
+        CONTAINERD_CPUS="$CPUS"
+    else
     CONTAINERD_CPUS=$(find_containerd_cpus) || exit 1
+    fi
 
     mkdir -p "$OUTPUT_DIR"
 
@@ -482,7 +487,7 @@ usage() {
     echo "  analyze   从已有数据生成 SVG"
     echo ""
     echo "capture 选项:"
-    echo "  --output-dir DIR          输出目录（必需）"
+    echo "  --output-dir DIR          输出目录（默认: results/perf）"
     echo "  --duration SEC            采样时长（默认: $DEFAULT_DURATION）"
     echo "  --frequency HZ            on-CPU 采样频率（默认: $DEFAULT_FREQUENCY）"
     echo "  --offcpu-method METHOD    off-CPU 抓取方式: perf（默认）| perf"

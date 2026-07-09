@@ -4,7 +4,7 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
 #     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
@@ -17,6 +17,7 @@
 #         --pprof-cpu-seconds SEC     CPU profile 采样时长（默认: 与 duration 相同）
 #         --pprof-series-interval SEC 瞬时 profile 抓取间隔（默认: 1）
 #     --perf       通过 perf 抓取 containerd on/off CPU 火焰图（调用 containerd_perf.sh）
+#     --perf_sandbox 通过 perf 抓取沙箱 on/off CPU 火焰图（CPU 由 --cpuset-cpus 决定）
 #                     采样时长默认与 --duration 保持一致
 #         --perf-frequency HZ        采样频率（默认: 99）
 #         --perf-duration SEC        采样时长（默认: 与 duration 相同）
@@ -43,7 +44,7 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]"
     echo ""
     echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
@@ -73,6 +74,7 @@ PPROF_SERIES_INTERVAL=1
 PERF=false
 PERF_FREQUENCY=99
 PERF_DURATION=""               # 空 = 自动与 duration 对齐
+PERF_SANDBOX=false
 PASSTHRU_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -110,11 +112,13 @@ while [[ $# -gt 0 ]]; do
                 esac
             done
             ;;
+        --perf_sandbox)
+            PERF_SANDBOX=true; shift ;;
         --)
             shift; PASSTHRU_ARGS=("$@"); break ;;
         *)
             echo "错误: 未知参数: $1"
-            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [-- <single_cold_start.py 的额外参数>]"
+            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]"
             exit 1 ;;
     esac
 done
@@ -168,12 +172,15 @@ if [ ! -f "$SINGLE_PY" ]; then
     exit 1
 fi
 
-# 从透传参数中提取 --duration 值（用于 pprof 时长对齐）
+# 从透传参数中提取 --duration 和 --cpuset-cpus 值
 TEST_DURATION=""
+SANDBOX_CPUS=""
 for ((i=0; i<${#PASSTHRU_ARGS[@]}; i++)); do
     if [ "${PASSTHRU_ARGS[$i]}" = "--duration" ] && [ $((i+1)) -lt ${#PASSTHRU_ARGS[@]} ]; then
         TEST_DURATION="${PASSTHRU_ARGS[$((i+1))]}"
-        break
+    fi
+    if [ "${PASSTHRU_ARGS[$i]}" = "--cpuset-cpus" ] && [ $((i+1)) -lt ${#PASSTHRU_ARGS[@]} ]; then
+        SANDBOX_CPUS="${PASSTHRU_ARGS[$((i+1))]}"
     fi
 done
 
@@ -216,6 +223,26 @@ if $PERF; then
     fi
     PERF_OUTPUT_DIR="${RESULT_DIR}/perf"
 fi
+# perf_sandbox 时长: 优先用 --perf-duration，否则与 test duration 对齐
+if $PERF_SANDBOX; then
+    if [ -z "$SANDBOX_CPUS" ]; then
+        echo "错误: --perf_sandbox 需要通过 --cpuset-cpus 指定沙箱 CPU"
+        exit 1
+    fi
+    if [ -z "$PERF_DURATION" ]; then
+        if [ -n "$TEST_DURATION" ]; then
+            PERF_DURATION="$TEST_DURATION"
+        else
+            PERF_DURATION=30
+        fi
+    fi
+    PERF_SANDBOX_SCRIPT="${SCRIPT_DIR}/containerd_perf.sh"
+    if [ ! -f "$PERF_SANDBOX_SCRIPT" ]; then
+        echo "错误: 未找到 perf 脚本: $PERF_SANDBOX_SCRIPT"
+        exit 1
+    fi
+    PERF_SANDBOX_OUTPUT_DIR="${RESULT_DIR}/perf_sandbox"
+fi
 
 # ============================================================
 # 输出配置
@@ -245,6 +272,10 @@ if $PERF; then
     echo "perf:      已开启 (on/off CPU 火焰图)"
     echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
 fi
+	if $PERF_SANDBOX; then
+	    echo "perf_sbox: 已开启 (沙箱火焰图, CPUs: ${SANDBOX_CPUS})"
+	    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+	fi
 echo "=================================================="
 echo ""
 
@@ -299,7 +330,8 @@ echo ""
 # ============================================================
 PPROF_PID=""
 PERF_PID=""
-if $PPROF || $PERF; then
+PERF_SANDBOX_PID=""
+if $PPROF || $PERF || $PERF_SANDBOX; then
     echo "[profile] 等待 3s 让沙箱进入稳态..."
     sleep 3
 fi
@@ -328,8 +360,20 @@ if $PERF; then
     PERF_PID=$!
     echo "[perf] perf 抓取进程 PID: $PERF_PID"
 fi
+if $PERF_SANDBOX; then
+    echo "[perf_sbox] 启动沙箱火焰图抓取..."
+    echo "[perf_sbox]   CPUs: ${SANDBOX_CPUS}, 时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
 
-if $PPROF || $PERF; then
+    sudo "${PERF_SANDBOX_SCRIPT}" capture \
+        --cpus "${SANDBOX_CPUS}" \
+        --output-dir "${PERF_SANDBOX_OUTPUT_DIR}" \
+        --duration "${PERF_DURATION}" \
+        --frequency "${PERF_FREQUENCY}" &
+    PERF_SANDBOX_PID=$!
+    echo "[perf_sbox] 抓取进程 PID: $PERF_SANDBOX_PID"
+fi
+
+if $PPROF || $PERF || $PERF_SANDBOX; then
     echo ""
 fi
 
@@ -390,6 +434,21 @@ if $PERF && [ -n "$PERF_PID" ]; then
         echo "[perf] 火焰图 × ${svg_count} → ${PERF_OUTPUT_DIR}/"
     else
         echo "[perf] ⚠ perf 抓取失败 (exit=$?)"
+    fi
+fi
+
+# ============================================================
+# perf_sandbox: 等待抓取完成并生成火焰图
+# ============================================================
+if $PERF_SANDBOX && [ -n "$PERF_SANDBOX_PID" ]; then
+    echo ""
+    echo "[perf_sbox] 等待沙箱火焰图抓取完成 (PID: $PERF_SANDBOX_PID)..."
+    if wait "$PERF_SANDBOX_PID"; then
+        echo "[perf_sbox] 抓取完成"
+        svg_count=$(find "${PERF_SANDBOX_OUTPUT_DIR}" -name '*.svg' -type f 2>/dev/null | wc -l)
+        echo "[perf_sbox] 火焰图 × ${svg_count} → ${PERF_SANDBOX_OUTPUT_DIR}/"
+    else
+        echo "[perf_sbox] ⚠ 抓取失败 (exit=$?)"
     fi
 fi
 
