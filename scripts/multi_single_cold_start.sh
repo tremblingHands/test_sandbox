@@ -4,7 +4,7 @@
 # 多进程 Pod 沙箱冷启动测试启动器
 #
 # 用法:
-#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]
+#     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [--resources [OPTS]] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
 #     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
@@ -21,6 +21,8 @@
 #                     采样时长默认与 --duration 保持一致
 #         --perf-frequency HZ        采样频率（默认: 99）
 #         --perf-duration SEC        采样时长（默认: 与 duration 相同）
+#     --resources  采集系统资源时序（CPU/内存/磁盘/沙箱数/containerd/cgroup）
+#         --resource-interval SEC    采样间隔（默认: 0.1）
 #
 #     额外参数通过 -- 分隔后透传给 single_cold_start.py。
 #
@@ -31,6 +33,7 @@
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --pprof -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --pprof --perf -- --duration 60
+#     ./multi_single_cold_start.sh 0-7 4 0 --resources -- --duration 60
 #
 # 前置条件:
 #     - numactl 已安装
@@ -44,7 +47,7 @@ set -euo pipefail
 # 参数解析
 # ============================================================
 if [ $# -lt 3 ]; then
-    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]"
+    echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [--resources [OPTS]] [-- <single_cold_start.py 的额外参数>]"
     echo ""
     echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
@@ -52,6 +55,7 @@ if [ $# -lt 3 ]; then
     echo "  --profile    通过 containerd trace 日志统计各阶段时延"
     echo "  --pprof      通过 go pprof 抓取 containerd profile"
     echo "  --perf       通过 perf 抓取 containerd on/off CPU 火焰图"
+    echo "  --resources  采集系统资源时序 (CPU/内存/磁盘/沙箱数)"
     echo ""
     echo "示例:"
     echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
@@ -75,11 +79,26 @@ PERF=false
 PERF_FREQUENCY=99
 PERF_DURATION=""               # 空 = 自动与 duration 对齐
 PERF_SANDBOX=false
+RESOURCES=false
+RESOURCE_INTERVAL=0.1
 PASSTHRU_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile)
             PROFILE=true; shift ;;
+        --resources)
+            RESOURCES=true; shift
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --resource-interval)
+                        RESOURCE_INTERVAL="$2"; shift 2 ;;
+                    --)
+                        shift; PASSTHRU_ARGS=("$@"); break 2 ;;
+                    *)
+                        break ;;
+                esac
+            done
+            ;;
         --pprof)
             PPROF=true; shift
             # 可选: --pprof 后跟子选项 (--pprof-cpu-seconds N --pprof-series-interval N)
@@ -118,7 +137,7 @@ while [[ $# -gt 0 ]]; do
             shift; PASSTHRU_ARGS=("$@"); break ;;
         *)
             echo "错误: 未知参数: $1"
-            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [-- <single_cold_start.py 的额外参数>]"
+            echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [--resources [OPTS]] [-- <single_cold_start.py 的额外参数>]"
             exit 1 ;;
     esac
 done
@@ -244,6 +263,22 @@ if $PERF_SANDBOX; then
     PERF_SANDBOX_OUTPUT_DIR="${RESULT_DIR}/perf_sandbox"
 fi
 
+# resources 时长: 与 test duration 对齐
+if $RESOURCES; then
+    if [ -n "$TEST_DURATION" ]; then
+        RESOURCE_DURATION="$TEST_DURATION"
+    else
+        RESOURCE_DURATION=30
+    fi
+    RESOURCES_SCRIPT="${SCRIPT_DIR}/system_resources.sh"
+    if [ ! -f "$RESOURCES_SCRIPT" ]; then
+        echo "错误: 未找到资源采集脚本: $RESOURCES_SCRIPT"
+        exit 1
+    fi
+    RESOURCE_OUTPUT_DIR="${RESULT_DIR}/resources"
+    mkdir -p "$RESOURCE_OUTPUT_DIR"
+fi
+
 # ============================================================
 # 输出配置
 # ============================================================
@@ -276,6 +311,10 @@ fi
 	    echo "perf_sbox: 已开启 (沙箱火焰图, CPUs: ${SANDBOX_CPUS})"
 	    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
 	fi
+if $RESOURCES; then
+    echo "resources: 已开启 (系统资源时序)"
+    echo "           采样时长: ${RESOURCE_DURATION}s, 间隔: ${RESOURCE_INTERVAL}s"
+fi
 echo "=================================================="
 echo ""
 
@@ -287,6 +326,20 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' || true
 sleep 2
 echo "[pre] 清缓存完成"
 echo ""
+
+# ============================================================
+# Resources: 静态环境快照
+# ============================================================
+if $RESOURCES; then
+    echo "[resources] 采集静态环境快照..."
+    "${RESOURCES_SCRIPT}" metadata \
+        --output "${RESOURCE_OUTPUT_DIR}/metadata.json" \
+        --cpus "$CPU_RANGE" \
+        --numa "$NUMA_NODE" \
+        --proc-count "$PROC_COUNT" \
+        --passthru-args "${PASSTHRU_ARGS[*]:-}"
+    echo ""
+fi
 
 # ============================================================
 # Profile: 记录测试窗口起止时间（journalctl --since/--until 使用）
@@ -331,9 +384,25 @@ echo ""
 PPROF_PID=""
 PERF_PID=""
 PERF_SANDBOX_PID=""
+RESOURCE_PID=""
 if $PPROF || $PERF || $PERF_SANDBOX; then
     echo "[profile] 等待 3s 让沙箱进入稳态..."
     sleep 3
+fi
+
+if $RESOURCES; then
+    echo "[resources] 启动时序采样..."
+    echo "[resources]   时长: ${RESOURCE_DURATION}s, 间隔: ${RESOURCE_INTERVAL}s, CPUs: ${CPU_RANGE}"
+
+    "${RESOURCES_SCRIPT}" capture \
+        --output-dir "${RESOURCE_OUTPUT_DIR}" \
+        --duration "${RESOURCE_DURATION}" \
+        --interval "${RESOURCE_INTERVAL}" \
+        --worker-cpus "$CPU_RANGE" \
+        --sandbox-cpus "${SANDBOX_CPUS:-}" \
+        --numa "$NUMA_NODE" &
+    RESOURCE_PID=$!
+    echo "[resources] 采样进程 PID: $RESOURCE_PID"
 fi
 
 if $PPROF; then
@@ -373,7 +442,7 @@ if $PERF_SANDBOX; then
     echo "[perf_sbox] 抓取进程 PID: $PERF_SANDBOX_PID"
 fi
 
-if $PPROF || $PERF || $PERF_SANDBOX; then
+if $PPROF || $PERF || $PERF_SANDBOX || $RESOURCES; then
     echo ""
 fi
 
@@ -399,6 +468,24 @@ else
 fi
 echo "结果: $RESULT_DIR/"
 echo "=================================================="
+
+# ============================================================
+# resources: 等待采样完成并汇总
+# ============================================================
+if $RESOURCES && [ -n "$RESOURCE_PID" ]; then
+    echo ""
+    echo "[resources] 等待采样完成 (PID: $RESOURCE_PID)..."
+    if wait "$RESOURCE_PID"; then
+        echo "[resources] 采样完成"
+        "${RESOURCES_SCRIPT}" summarize "${RESOURCE_OUTPUT_DIR}" || \
+            echo "[resources] ⚠ 汇总过程中出现问题"
+        echo "[resources] 开始关联分析..."
+        python3 "${SCRIPT_DIR}/resource_analyzer.py" "${RESULT_DIR}" || \
+            echo "[resources] ⚠ 关联分析过程中出现问题"
+    else
+        echo "[resources] ⚠ 采样失败 (exit=$?)"
+    fi
+fi
 
 # ============================================================
 # pprof: 等待抓取完成并分析

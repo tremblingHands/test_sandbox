@@ -36,12 +36,13 @@ CPUSET_K8S_IO = "/sys/fs/cgroup/cpuset/k8s.io"
 # ============================================================
 class SandboxResult(object):
     def __init__(self, task_index, sandbox_id,
-                 t_runp_ms, t_ready_ms, total_ms):
+                 t_runp_ms, t_ready_ms, total_ms, elapsed_ms=0):
         self.task_index = task_index
         self.sandbox_id = sandbox_id
         self.t_runp_ms = t_runp_ms
         self.t_ready_ms = t_ready_ms
         self.total_ms = total_ms
+        self.elapsed_ms = elapsed_ms
 
     def to_dict(self):
         return {
@@ -50,6 +51,7 @@ class SandboxResult(object):
             "t_runp_ms": self.t_runp_ms,
             "t_ready_ms": self.t_ready_ms,
             "total_ms": self.total_ms,
+            "elapsed_ms": self.elapsed_ms,
         }
 
 
@@ -398,7 +400,8 @@ if __name__ == "__main__":
         except Exception:
             t1 = time.perf_counter()
             t_runp_ms = round((t1 - t0) * 1000, 3)
-            results.append(SandboxResult(seq, "FAIL", t_runp_ms, 0, t_runp_ms))
+            results.append(SandboxResult(seq, "FAIL", t_runp_ms, 0, t_runp_ms,
+                                         round((time.perf_counter() - t_start) * 1000, 3)))
             seq += 1
             continue
         t1 = time.perf_counter()
@@ -415,7 +418,8 @@ if __name__ == "__main__":
             sandbox_id[:12],
             t_runp_ms,
             t_ready_ms if t_ready_ms >= 0 else 0,
-            round(t_runp_ms + max(t_ready_ms, 0), 3)))
+            round(t_runp_ms + max(t_ready_ms, 0), 3),
+            round((time.perf_counter() - t_start) * 1000, 3)))
         if G.cleanup:
             cleanup_sandbox(sandbox_id)
         seq += 1
