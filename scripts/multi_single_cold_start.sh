@@ -347,6 +347,8 @@ fi
 if $PROFILE; then
     PROFILE_START=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[profile] 测试窗口起始: $PROFILE_START"
+    # Host-visible runc TRACE file (stderr is often redirected by shim).
+    : > /tmp/runc-trace.log 2>/dev/null || true
     echo ""
 fi
 
@@ -555,6 +557,12 @@ if $PROFILE; then
         --until="$PROFILE_END" \
         -o cat --no-pager \
         > "$PROFILE_LOG" 2>/dev/null || true
+
+    # Merge runc [TRACE] lines (written to host file; stderr may be container IO).
+    if [ -s /tmp/runc-trace.log ]; then
+        echo "[profile] 合并 runc TRACE 文件 (/tmp/runc-trace.log, $(wc -l < /tmp/runc-trace.log) lines)..."
+        cat /tmp/runc-trace.log >> "$PROFILE_LOG"
+    fi
 
     log_size=$(wc -c < "$PROFILE_LOG" 2>/dev/null || echo 0)
     echo "[profile] 日志大小: ${log_size} bytes"

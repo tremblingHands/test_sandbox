@@ -442,7 +442,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | `shim.init.create` | `Init.Create` | 准备并创建 init |
 | `shim.runc.create` | `go-runc Create` | 真正 `runc create` |
 
-安装新 shim 后，将 **containerd + shim** 的 `[TRACE]` 合并进同一日志，再用 `scripts/trace_analyzer.py --summary-tree` 即可看到子阶段占比。亦可继续用 `--perf_sandbox` 交叉验证。
+进一步可在 `/home/nathan/runc` 打同格式 TRACE，拆开 `runc.create` 内部（见 §13）。安装带 TRACE 的 **shim + runc** 后，`--profile` 会合并 journal 与 `/tmp/runc-trace.log`，再用 `scripts/trace_analyzer.py --summary-tree` 看子阶段。亦可继续用 `--perf_sandbox` 交叉验证。
 
 ### 8.3 小结（瓶颈 B）
 
@@ -517,7 +517,251 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ---
 
-## 13. 复现与分析命令
+## 13. 带 TRACE / debug 符号的组件编译与安装
+
+本节同时覆盖两类需求：
+
+1. **`[TRACE]` 时延分解**（`--profile` / `trace_analyzer.py`）——containerd / shim / runc
+2. **保留 DWARF/Go 符号**，便于 `perf` 火焰图看到函数名（而不是 `elf` / 地址）——以上三者 + CNI
+
+源码与安装路径（本机）：
+
+| 组件 | 源码目录 | 系统安装路径（常见） |
+|------|----------|----------------------|
+| containerd | `/home/nathan/containerd` | `/usr/local/bin/containerd`（及 `/usr/bin`） |
+| containerd-shim-runc-v2 | 同上 | `/usr/local/bin`、`/usr/bin` |
+| runc | `/home/nathan/runc` | `/usr/local/sbin/runc`（及 `/usr/sbin`、`/usr/bin`） |
+| CNI 插件 | `/home/nathan/plugins` | `/opt/cni/bin/`（bridge、loopback、host-local 等） |
+
+安装前请备份现网二进制。新起的 sandbox 才用新 shim/runc/CNI；替换 **containerd** 后需 `systemctl restart containerd`。
+
+### 13.0 本机构建注意（必读）
+
+发行版 / 默认 `make` 常带 **`-ldflags '-s -w'`**，会剥掉符号表与 DWARF。分析用构建应：
+
+| 做法 | 作用 |
+|------|------|
+| **不要** `-s -w` | 保留符号表与 DWARF |
+| `-gcflags 'all=-N -l'` | 关闭优化与内联，栈更可读（二进制更慢，仅分析用） |
+| 不要依赖会覆盖 `-N -l` 的其它 `-gcflags` | 见下方 Makefile 坑 |
+| `file` + `go version -m` 自检 | 确认 `not stripped` 且含 `all=-N -l` |
+
+**本机（arm64）链接坑：`undefined reference to res_search`**
+
+| 组件 | 处理 |
+|------|------|
+| containerd / shim / CNI | **`CGO_ENABLED=0`** |
+| runc | 保留 CGO（seccomp），加 build tag **`netgo`** |
+
+**不要盲目信 `make ... GODEBUG=1`：**
+
+1. **containerd**：`GODEBUG=1` 会加 `-gcflags=all="-N -l"`，但 Makefile 还会再传 `-gcflags=-trimpath=...`；多个 `-gcflags` 时后者会盖掉前者，`go version -m` 可能只剩 trimpath、**没有** `-N -l`。
+2. **shim**：`bin/containerd-shim-runc-v2` 规则**根本不引用** `DEBUG_GO_GCFLAGS`，`GODEBUG=1` 对 `-N -l` **无效**。
+
+因此分析构建一律用下文的 **显式 `go build`**（已在本机验证通过）。
+
+通用自检：
+
+```bash
+file /path/to/binary | grep -Ei 'not stripped|with debug_info'
+go version -m /path/to/binary | grep gcflags   # 应含 all=-N -l
+```
+
+> **注意**：`-N -l` 会明显降低性能，只用于瓶颈分析；测吞吐时请改回优化构建。
+
+---
+
+### 13.1 containerd（daemon）
+
+daemon 侧 `[TRACE]` 由 `pkg/tracing` 写到 stderr → `journalctl -u containerd`。源码树已带 TRACE，无需额外 build tag。
+
+```bash
+cd /home/nathan/containerd
+TS=$(date +%Y%m%d%H%M%S)
+
+# 显式 go build：CGO=0 + -N -l；勿用 make GODEBUG=1（见 §13.0）
+VER=$(git describe --tags --always)
+REV=$(git rev-parse HEAD)
+CGO_ENABLED=0 go build -buildmode=pie -gcflags 'all=-N -l' \
+  -o bin/containerd \
+  -ldflags "-X github.com/containerd/containerd/v2/version.Version=${VER} -X github.com/containerd/containerd/v2/version.Revision=${REV} -X github.com/containerd/containerd/v2/version.Package=github.com/containerd/containerd/v2" \
+  -tags "urfave_cli_no_docs static_build" \
+  ./cmd/containerd
+
+for p in /usr/local/bin/containerd /usr/bin/containerd; do
+  [ -e "$p" ] || continue
+  sudo cp -a "$p" "${p}.bak.${TS}"
+  sudo install -m 0755 bin/containerd "$p"
+done
+file "$(command -v containerd)"
+go version -m "$(command -v containerd)" | grep gcflags
+sudo systemctl restart containerd
+containerd --version
+```
+
+确认 TRACE：创建沙箱后  
+`journalctl -u containerd --since '5 min ago' | grep '\[TRACE\]' | head`。
+
+---
+
+### 13.2 containerd-shim-runc-v2
+
+当前树已默认启用 TRACE（`EnsureTracerProvider` + Create 子 span），**不必** `-tags shim_tracing`。
+
+```bash
+cd /home/nathan/containerd
+TS=$(date +%Y%m%d%H%M%S)
+
+# Makefile 的 GODEBUG 对 shim 无效；必须显式 -gcflags
+VER=$(git describe --tags --always)
+REV=$(git rev-parse HEAD)
+CGO_ENABLED=0 go build -gcflags 'all=-N -l' \
+  -o bin/containerd-shim-runc-v2 \
+  -ldflags "-X github.com/containerd/containerd/v2/version.Version=${VER} -X github.com/containerd/containerd/v2/version.Revision=${REV} -X github.com/containerd/containerd/v2/version.Package=github.com/containerd/containerd/v2 -extldflags \"-static\"" \
+  -tags "urfave_cli_no_docs static_build no_grpc" \
+  ./cmd/containerd-shim-runc-v2
+
+for p in /usr/local/bin/containerd-shim-runc-v2 /usr/bin/containerd-shim-runc-v2; do
+  [ -e "$p" ] || continue
+  sudo cp -a "$p" "${p}.bak.${TS}"
+  sudo install -m 0755 bin/containerd-shim-runc-v2 "$p"
+done
+file "$(command -v containerd-shim-runc-v2)"
+go version -m "$(command -v containerd-shim-runc-v2)" | grep gcflags
+containerd-shim-runc-v2 -v
+```
+
+Create 相关 TRACE span：
+
+| Span | 含义 |
+|------|------|
+| `shim.container.create` | shim 侧整段 Create |
+| `shim.rootfs.mount` | 挂 rootfs |
+| `shim.init.create` | 准备 init |
+| `shim.runc.create` | 调用 `runc create`（墙钟） |
+
+shim `[TRACE]` 经 log fifo 进入 containerd stderr / journal。
+
+---
+
+### 13.3 runc
+
+runc 使用 `internal/traceutil` 打 `[TRACE]`。因 shim 常重定向 stderr，TRACE **同时写入** `/tmp/runc-trace.log`（`RUNC_TRACE_FILE` 可改；`RUNC_TRACE=0` 关闭）。源码树已带 TRACE。
+
+分析构建：加 `-gcflags 'all=-N -l'`，**不要** `-s -w`；本机需 **`netgo`**（否则易 `res_search` 链接失败）。runc 保留 CGO 以链接 libseccomp。
+
+```bash
+cd /home/nathan/runc
+TS=$(date +%Y%m%d%H%M%S)
+
+go build -buildmode=pie \
+  -gcflags 'all=-N -l' \
+  -tags "seccomp urfave_cli_no_docs netgo" \
+  -o runc .
+
+for p in /usr/local/sbin/runc /usr/sbin/runc /usr/bin/runc; do
+  [ -e "$p" ] || continue
+  sudo cp -a "$p" "${p}.bak.${TS}"
+  sudo install -m 0755 runc "$p"
+done
+file "$(command -v runc)"
+go version -m "$(command -v runc)" | grep gcflags
+runc --version
+```
+
+Create 内部 TRACE span：
+
+| Span | 含义 |
+|------|------|
+| `runc.create` | 整次 `runc create` |
+| `runc.spec.load` | 读 OCI config |
+| `runc.container.new` | libcontainer Create |
+| `runc.container.start` | `Container.Start` |
+| `runc.init.start` | 拉起 / 等待 init |
+| `runc.cgroup.apply` | 写 cgroup |
+| `runc.init.sync` | 与 init 同步（通常最大） |
+
+---
+
+### 13.4 CNI 插件（`/home/nathan/plugins`）
+
+压测常用 `bridge`、`loopback`、`host-local` 等，安装在 **`/opt/cni/bin`**。`build_linux.sh` 默认不 strip；分析请显式加 debug gcflags，且**不要**自行加 `-ldflags '-s -w'`。本机需 **`CGO_ENABLED=0`**。
+
+```bash
+cd /home/nathan/plugins
+TS=$(date +%Y%m%d%H%M%S)
+
+# 构建全部插件到 ./bin（带 debug；CGO=0 避免 res_search）
+CGO_ENABLED=0 ./build_linux.sh -gcflags 'all=-N -l'
+
+# 或只编关心的插件：
+# CGO_ENABLED=0 go build -mod=vendor -gcflags 'all=-N -l' -o bin/bridge ./plugins/main/bridge
+# CGO_ENABLED=0 go build -mod=vendor -gcflags 'all=-N -l' -o bin/loopback ./plugins/main/loopback
+# CGO_ENABLED=0 go build -mod=vendor -gcflags 'all=-N -l' -o bin/host-local ./plugins/ipam/host-local
+
+sudo cp -a /opt/cni/bin "/opt/cni/bin.bak.${TS}"
+sudo mkdir -p /opt/cni/bin
+sudo install -m 0755 bin/* /opt/cni/bin/
+file /opt/cni/bin/bridge /opt/cni/bin/loopback /opt/cni/bin/host-local
+go version -m /opt/cni/bin/bridge | grep gcflags
+```
+
+确认 CNI 配置指向该目录（`/etc/cni/net.d`，以及 containerd CRI 的 `bin_dir`）。无需重启 containerd；下一轮 CNI ADD 即用新二进制。
+
+---
+
+### 13.5 一键核对（安装后）
+
+```bash
+for b in /usr/local/bin/containerd \
+         /usr/local/bin/containerd-shim-runc-v2 \
+         /usr/local/sbin/runc \
+         /opt/cni/bin/bridge; do
+  echo "== $b =="
+  file "$b"
+  go version -m "$b" | grep -E 'gcflags|CGO_ENABLED'
+done
+# 期望：with debug_info, not stripped；gcflags 含 all=-N -l
+```
+
+---
+
+### 13.6 用 `--profile` / `--perf` 验证
+
+**TRACE：**
+
+```bash
+cd /home/nathan/sandbox-tests
+./scripts/multi_single_cold_start.sh 128-131 4 1 --profile -- \
+  --duration 15 --preconfig 5 --cleanup
+```
+
+脚本会清空并合并 `/tmp/runc-trace.log`，预期同时看到 `shim.*` 与 `runc.*`。
+
+**perf 符号：**
+
+```bash
+# containerd 绑核 + sandbox 侧（shim / runc / CNI 进程常在 worker 核上）
+./scripts/multi_single_cold_start.sh 128-131 4 1 \
+  --profile --perf --perf_sandbox -- \
+  --duration 30 --cpuset-cpus 128-131 --cleanup
+```
+
+打开 `RESULT/perf/*.svg` 或 `perf report`：应能看到  
+`github.com/containernetworking/plugins/...`、`github.com/opencontainers/runc/...`、  
+`github.com/containerd/containerd/...` 等符号，而不是大量无名 `elf`。
+
+若仍无符号：确认安装的是刚编的二进制（`file` 显示 not stripped）、`readlink /proc/<pid>/exe` 指向该路径、且 perf 能读该文件。
+
+---
+
+### 13.7 回滚
+
+用安装时的 `.bak.<时间戳>` 覆盖对应路径（CNI 整目录备份为 `/opt/cni/bin.bak.<TS>`）；回滚 containerd 后执行 `sudo systemctl restart containerd`。CNI 回滚后无需重启 daemon。
+
+---
+
+## 14. 复现与分析命令
 
 ```bash
 RESULT=tmp/containerd-0-127_workers-cores-128-255_workers-nums-127_sandbox-0-255
@@ -539,9 +783,11 @@ ls "$RESULT/perf"/*.svg
   -- --duration 60 --cpuset-cpus 0-255 --cpuset-mems 0-1 --preconfig 50
 ```
 
+带 TRACE / debug 符号的编译安装见 **§13**（含 CNI `/home/nathan/plugins`）。
+
 ---
 
-## 14. 总结
+## 15. 总结
 
 | 层次 | 结论 |
 |------|------|
@@ -553,7 +799,7 @@ ls "$RESULT/perf"/*.svg
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：先由 profile 看到 CNI 配网最重，再由 perf 下钻到 **`rtnl_mutex` 全局串行**（含 loopback）；持锁路径上还有 bridge STP 日志打到串口的 **`printk` 放大**；shim、metadata DB 与 4 核漏斗是并列的其它瓶颈；iptables/masquerade 只是当前 CNI 配置下的叠加项，不是整篇分析的主线。
+**一句话**：先由 profile 看到 CNI 配网最重，再由 perf 下钻到 **`rtnl_mutex` 全局串行**（含 loopback）；持锁路径上还有 bridge STP 日志打到串口的 **`printk` 放大**；shim、metadata DB 与 4 核漏斗是并列的其它瓶颈；iptables/masquerade 只是当前 CNI 配置下的叠加项，不是整篇分析的主线。带 TRACE / debug 符号的 containerd、shim、runc、CNI 编译安装见 **§13**。
 
 ---
 
@@ -567,3 +813,6 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-16 | §7.3 补充：`rtnl_mutex` 等锁让出 CPU、持锁跑临界区；让出 CPU ≠ 释放锁 |
 | 2026-07-16 | §7.5 补充：火焰图 `printk` 来自 bridge `br_set_state`/`br_info`，经 PL011 串口放大 RTNL 持锁 |
 | 2026-07-16 | §8.2：shim Create 子 span 下钻说明（`shim.runc.create` 等） |
+| 2026-07-16 | **§13**：补充 containerd / shim / runc 带 TRACE 的编译安装与验证 |
+| 2026-07-16 | **§13**：补充 debug 符号构建（`GODEBUG=1` / `-N -l`、禁 `-s -w`）及 CNI（`/home/nathan/plugins` → `/opt/cni/bin`），便于 perf 解析符号 |
+| 2026-07-16 | **§13**：按本机实测改写：显式 `go build` + `-N -l`；`CGO_ENABLED=0` / runc `netgo`；注明 Makefile `GODEBUG` 对 containerd/shim 的坑 |
