@@ -426,14 +426,23 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 - `container.NewTask` Avg **4.76s**（~41%）；其中 `shim.task.create` Avg **4.12s**。
 - perf：`runc` / `containerd-shim` on-CPU 高；off-CPU 大量 futex / schedule。
 
-### 8.2 机制（当前深度）
+### 8.2 机制（当前深度）与下钻方式
 
 每沙箱需 fork/exec shim、完成 task 创建握手。高并发下：
 
 - 进程创建与就绪等待叠加；
 - 与 CNI、metadata 争用同一批 containerd 核时，等待被进一步拉长。
 
-尚未像 RTNL 那样拆到单一内核锁；后续可用 `--perf_sandbox` 与更细 span 继续下钻。
+**`shim.task.create` 只覆盖 containerd 等 ttrpc Create 返回的墙钟时间。** 要拆内部，需使用带细粒度 span 的 shim（`/home/nathan/containerd` 已在 Create 路径增加）：
+
+| Span | 位置 | 含义 |
+|------|------|------|
+| `shim.container.create` | shim `task.Create` | server 侧整段 Create |
+| `shim.rootfs.mount` | `mount.All` | 挂 rootfs |
+| `shim.init.create` | `Init.Create` | 准备并创建 init |
+| `shim.runc.create` | `go-runc Create` | 真正 `runc create` |
+
+安装新 shim 后，将 **containerd + shim** 的 `[TRACE]` 合并进同一日志，再用 `scripts/trace_analyzer.py --summary-tree` 即可看到子阶段占比。亦可继续用 `--perf_sandbox` 交叉验证。
 
 ### 8.3 小结（瓶颈 B）
 
@@ -557,3 +566,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-16 | **重构结构**：观测 → 瓶颈候选 → 逐项深挖；以 CNI 时延引出 RTNL，弱化与 iptables 的捆绑叙述 |
 | 2026-07-16 | §7.3 补充：`rtnl_mutex` 等锁让出 CPU、持锁跑临界区；让出 CPU ≠ 释放锁 |
 | 2026-07-16 | §7.5 补充：火焰图 `printk` 来自 bridge `br_set_state`/`br_info`，经 PL011 串口放大 RTNL 持锁 |
+| 2026-07-16 | §8.2：shim Create 子 span 下钻说明（`shim.runc.create` 等） |
