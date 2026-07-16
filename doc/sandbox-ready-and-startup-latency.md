@@ -148,7 +148,72 @@ fifoFile.Write([]byte("0"))
 |------|----------|
 | CNI Setup 完成 | 只有网络，进程未 exec |
 | `NewTask` / `runc create` 完成 | 环境就绪，pause 仍在等 fifo |
+| OCI `poststart` hook | 在 create 末尾触发，**早于** `runc start` / execve（见 §3.4） |
+| OCI `startContainer` hook | 紧挨在 execve **之前**，仍非「已开始跑」 |
 | `ListPodSandbox` 查到 READY | 是查询结果，不是创建完成时刻本身（可用作校验，不宜作唯一计时终点） |
+
+### 3.4 OCI Hook 与「程序开始跑」的关系
+
+沙箱启动后可以有自己的用户程序（pause / 业务进程）。若用 OCI Hook 埋点，必须分清各 hook 相对 **execve** 的时机；**不能想当然把 `poststart` 当成「程序已跑」**。
+
+#### 3.4.1 OCI 规范表述
+
+| Hook | 规范描述（摘要） | 运行命名空间 |
+|------|------------------|--------------|
+| `createRuntime` | 容器已创建、pivot 前 | Runtime（宿主机） |
+| `createContainer` | 同上，在容器侧 | Container |
+| `startContainer` | start 已调用，**用户进程启动之前** | Container |
+| `poststart` | **container process is started 之后** | Runtime（宿主机） |
+| `poststop` | 容器进程退出后 | Runtime |
+
+规范里 `poststart` 的措辞容易理解成「用户进程已经在跑」。在 containerd 使用的 **create + start** 路径下，runc 实现并不如此。
+
+#### 3.4.2 runc 实际调用点（create + start）
+
+`poststart` 挂在 `Container.start()` 末尾（`libcontainer/container_linux.go`），即 **`runc create` 返回前**，**不是** `runc start`（`Exec`）里：
+
+```go
+// Container.start() — create 路径会走到这里
+if err := parent.start(); err != nil { ... }
+if process.Init {
+    c.fifo.Close()
+    if c.config.HasHook(configs.Poststart) {
+        c.config.Hooks.Run(configs.Poststart, s)  // ★ 此时仍在等 exec.fifo
+    }
+}
+```
+
+用户程序要等 **`runc start` 打开 `exec.fifo`** 之后才会 `execve`（`standard_init_linux.go`）：
+
+```go
+fifoFile.Write([]byte("0"))           // 被 runc start 打开读端后才继续
+Hooks.Run(configs.StartContainer, s)  // 仍在 exec 前
+// 然后才是 execve(pause)
+```
+
+#### 3.4.3 与沙箱用户程序的时序
+
+```
+runc create（containerd NewTask）
+  ├─ 建 ns / cgroup / rootfs
+  ├─ runc init 就绪，阻塞在 exec.fifo
+  └─ ★ poststart 在这里跑              ← pause 还没 exec
+         │
+runc start（containerd task.Start）
+  ├─ 打开 fifo
+  ├─ startContainer hook（可选）       ← 仍在 exec 前
+  └─ execve(pause)                     ← 沙箱「自己的程序」从这里才开始
+         │
+task.Start 返回 / SANDBOX_READY         ← 评估终点
+```
+
+| 时机 | 沙箱程序（pause）是否已执行 |
+|------|---------------------------|
+| `poststart` | **否**（还在等 fifo） |
+| `startContainer` | **否**（紧挨在 execve 前） |
+| `task.Start` 成功 / Ready | **是**（已进入或刚完成 exec） |
+
+**结论**：`poststart` 是「容器 init 已创建、宿主机侧收尾」的 hook，**不是**「沙箱内用户程序已开始跑」。评估「程序开始执行」时，**不要用 `poststart` 作终点**。
 
 ---
 
@@ -244,20 +309,36 @@ tracepoint:syscalls:sys_exit_execve
 | 终点 | pause 二进制 `execve` 返回成功 |
 | 用途 | 校验「`task.Start` ≈ 真实进程已跑」；一般不做日常监控 |
 
-### 4.5 方案 D：OCI Hook 埋点
+### 4.5 方案 D：进程内打点 / Hook 的正确用法
 
-在 sandbox OCI spec 中增加 hook，在进程 exec 后打点：
+OCI Hook **可以**用来辅助观测，但在 create + start 模型下：
+
+| Hook | 能否作为「程序已跑」终点 |
+|------|--------------------------|
+| `poststart` | **否**（create 末尾，早于 execve） |
+| `startContainer` | **否**（execve 前一瞬间） |
+| `poststop` | 否（测销毁） |
+
+若仍要用 hook 做分段埋点（例如量 create 完成时刻），示例：
 
 ```json
 "hooks": {
   "poststart": [{
     "path": "/usr/local/bin/latency-hook",
-    "args": ["poststart", "--mark", "sandbox-running"]
+    "args": ["poststart", "--mark", "create-done-before-exec"]
   }]
 }
 ```
 
-`poststart` 语义为 **exec 之后**，与「程序开始跑」一致。hook 可将时间戳写入共享文件或 histogram。
+注意：这里标记的是 **create 完成 / 尚未 exec**，不是「程序已跑」。
+
+真正贴近「沙箱自己的程序已执行」的埋点方式：
+
+1. **pause / 自定义入口进程自己打点**（启动后写时间戳到共享文件或 fd）——语义最准  
+2. **方案 C**（bpftrace / perf 抓 execve）  
+3. **方案 A/B**（以 `task.Start` / Ready 为终点）——日常足够
+
+Hook 本身还有一次进程启动开销，高并发压测可能略抬高延迟，更适合语义校验或中低并发对比。
 
 ### 4.6 方案选型建议
 
@@ -265,7 +346,8 @@ tracepoint:syscalls:sys_exit_execve
 |------|------|
 | 日常 / CI 评估 | **A**（端到端）+ 可选 **B**（trace 拆阶段） |
 | 优化前后对比 | **A** 报 p50/p95/p99；**B** 看 CNI vs NewTask vs Start 占比 |
-| 论文 / 严格定义校验 | **C** 或 **D**，确认与 `task.Start` 一致 |
+| 论文 / 严格定义校验 | **C**，或进程内打点；**不要**用 `poststart` 充当「已跑」终点 |
+| 量 create 完成时刻 | 可用 `poststart` 作分段标记（明确标注「早于 exec」） |
 
 ---
 
@@ -275,13 +357,17 @@ tracepoint:syscalls:sys_exit_execve
 crictl runp
   └─ RunPodSandbox                          ← 计时起点 T0
        ├─ netns + CNI                       ← 主要耗时，但进程未跑
-       ├─ NewTask (runc create)             ← 环境就绪，pause 等 fifo
-       ├─ task.Start (runc start)           ← ★ 终点：程序开始跑 / Ready
-       └─ State = SANDBOX_READY
+       ├─ NewTask (runc create)
+       │     ├─ init 等 exec.fifo
+       │     └─ poststart（若配置）         ← 仍早于用户程序
+       ├─ task.Start (runc start)
+       │     ├─ startContainer（若配置）    ← 仍早于 exec
+       │     └─ execve(pause)               ← ★ 程序开始跑
+       └─ State = SANDBOX_READY             ← 评估终点 / Ready
   └─ 返回 PodSandboxId
 ```
 
-**一句话**：用 crictl 评估时，沙箱在 **CNI 配好且 pause 经 shim/runc start 启动成功** 后立刻 Ready；「成功创建时延」应量到 **`task.Start` / Ready**，本质是 infra 容器（pause）已活，不是业务就绪。
+**一句话**：用 crictl 评估时，沙箱在 **CNI 配好且 pause 经 shim/runc start 启动成功** 后立刻 Ready；「成功创建时延」应量到 **`task.Start` / Ready**。`poststart` 发生在 create 阶段、**用户程序尚未 exec**，不能当作「程序已跑」的埋点终点。
 
 ---
 
@@ -290,3 +376,4 @@ crictl runp
 | 日期 | 说明 |
 |------|------|
 | 2026-07-16 | 初稿：Ready 置位原理、create/start 与 exec 语义、四种时延评估方式 |
+| 2026-07-16 | 更正：补充 OCI Hook（尤其 poststart）相对 execve 的真实时机；方案 D 改为勿用 poststart 作「已跑」终点 |
