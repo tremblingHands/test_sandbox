@@ -18,12 +18,14 @@
 
 ### 2.1 启动延迟（Startup Latency）
 
-衡量 Pod 沙箱从 `RunPodSandbox` 调用到 Ready 状态的端到端时间。测试对象为 containerd/CRI-O 管理的 Pod 沙箱，沙箱内仅运行一个轻量 pause 容器，**不包含镜像拉取时延**（pause 镜像已预先缓存至节点）。
+衡量 Pod 沙箱从 `RunPodSandbox` 调用到 **sandbox 内程序（pause）已开始运行** 的端到端时间。CRI 上对应 `SANDBOX_READY`：containerd 在 `task.Start`（`runc start` → execve pause）成功后置位，**不是**仅 CNI/`runc create` 完成。测试对象为 containerd 管理的 Pod 沙箱，**不包含镜像拉取时延**（pause 镜像已预先缓存至节点）。
+
+更细的 Ready 语义、create/start 与评估方案见：[`sandbox-ready-and-startup-latency.md`](./sandbox-ready-and-startup-latency.md)。
 
 | 指标 | 说明 | 采集方式 |
 |------|------|-------------|
-| 冷启动时间（P50/P95/P99） | `crictl runp` 调用到 PodSandboxStatus 就绪的耗时（不含镜像拉取） | `crictl runp` + `crictl inspectp` 计时 |
-| 冷启动分解（各阶段） | 拆分为 RunPodSandbox API 响应时间 + PodSandboxStatus 就绪等待时间 | `time crictl runp` / CRI 事件时间戳 |
+| 冷启动时间（P50/P95/P99） | `crictl runp` 调用到返回的耗时（此时 pause 已 exec，`SANDBOX_READY`） | `time crictl runp` / 压测脚本 |
+| 冷启动分解（各阶段） | 拆分为 CNI、`NewTask`(create)、`task.Start`(exec) 等 | containerd TRACE / metrics |
 | 热启动时间（P50/P95/P99） | 复用预热池中已有沙箱的耗时 | 计时沙箱复用/快照恢复 |
 | 预热池命中率 | 预创建沙箱的复用比例 | 统计命中次数 / 总请求数 |
 | 并发创建吞吐量 | N 并发 `crictl runp` 的完成速率 | 批量创建计时 |
@@ -31,16 +33,20 @@
 **测试模型说明**：
 
 ```
-用户请求 → RunPodSandbox API → 网络命名空间创建 → pause 容器启动
-                                     ↓
-                              PodSandboxStatus == Ready
-                                     ↓
-                            用户可调度业务容器到该沙箱
+用户请求 → RunPodSandbox
+             ├─ netns + CNI          （网络就绪，进程未跑）
+             ├─ NewTask / runc create（环境就绪，pause 等 exec.fifo）
+             └─ task.Start / runc start → execve(pause)
+                      ↓
+               SANDBOX_READY（程序已跑）
+                      ↓
+               用户可调度业务容器到该沙箱
 ```
 
-- **不含镜像拉取**：pause 镜像（`registry.aliyuncs.com/google_containers/pause`）已通过 `crictl pull` 预先缓存至所有节点
+- **不含镜像拉取**：pause 镜像已通过 `crictl pull` 预先缓存至所有节点
 - **仅测沙箱本身**：只创建 Pod 沙箱 + pause 容器，不部署业务容器，聚焦沙箱基础设施时延
 - **pause 容器作用**：占用网络命名空间，是 Kubernetes Pod 的标准模式
+- **终点不是 NewTask**：`runc create` 完成 ≠ 程序已跑；成功定义落在 `task.Start` / Ready
 
 ### 2.2 执行性能（Execution Performance）
 
