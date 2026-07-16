@@ -140,6 +140,7 @@ cri.sandbox.run ≈ 11.73s
 | `netlink_*` / `rtnetlink_*` / `rtnl_*` | 高 | 内核 rtnetlink 路径活跃 |
 | `rtnl_setlink` | **~7.3%** | `RTM_SETLINK` 改链路 |
 | `rtnl_newlink` | ~0.3–0.5% | 新建链路 |
+| `printk` / `pl011_console_write` | **~6.7%**（多在 `rtnetlink_rcv_msg` 之下） | bridge STP 状态日志打到串口（见 §7.5） |
 | `loopback` / `loopback_net_init` | ~2.3% / ~0.5% | lo 相关 |
 | `xtables-nft-multi` / `iptables` | 高 | 本配置下还有 netfilter 规则写入 |
 | `runc` / `containerd-shim` | 高 | 启动 shim |
@@ -156,7 +157,7 @@ cri.sandbox.run ≈ 11.73s
 
 > 本次 perf **未覆盖** worker 核 128–255。分析沙箱侧 CPU 需加 `--perf_sandbox`。
 
-**数据要点**：核 1–4 上配网（bridge/loopback/netlink）与 shim 都很热；off-CPU 大量 futex，且已能看到与 `rtnl_lock*` 相关的等待栈。
+**数据要点**：核 1–4 上配网（bridge/loopback/netlink）与 shim 都很热；`rtnetlink_rcv_msg` 栈上可见大量 `printk`→串口输出；off-CPU 大量 futex，且已能看到与 `rtnl_lock*` 相关的等待栈。
 
 ---
 
@@ -216,6 +217,7 @@ resources: containerd 4 核饱和；磁盘/内存非主因
 - `cni.setup_pod_network` Avg **5.77s**，P95 **~10.4s**，约占 `cri.sandbox.run` 的一半。
 - 子 span：`cni.plugin.bridge` 主导；`cni.plugin.loopback` Avg 仍约 **1.0s**（每个沙箱都会跑）。
 - perf：核 1–4 上 `bridge`、`loopback`、`rtnetlink`/`rtnl_*` 显著；off-CPU 可见 `rtnl_lock_killable`。
+- 火焰图中 **`rtnetlink_rcv_msg` 上方（子栈）出现大量 `printk` → `pl011_console_write`**，需单独解释（§7.5）。
 
 结论先停留在：**配网阶段本身就是最大时间桶**；需要回答「配网内部卡在什么机制」。
 
@@ -242,7 +244,40 @@ CNI 插件（bridge / loopback）
 
 **这是从「CNI 时延高」推出的核心机制：高并发下大量配网操作在 `rtnl_mutex` 上串行。**
 
-### 7.3 谁在抢这把锁（不只是 bridge）
+### 7.3 持锁 / 等锁时，CPU 会不会被让出？
+
+`rtnl_mutex` 是 **sleeping mutex**（`mutex_lock` / `mutex_lock_killable`），**不是** spinlock。持锁与等锁对 CPU 的行为不同，需分开看：
+
+| 角色 | 是否占用 CPU 跑临界区 | 会不会让出 CPU | 说明 |
+|------|----------------------|----------------|------|
+| **等锁者**（未拿到 `rtnl_mutex`） | 否（阻塞等待） | **会** | `mutex_lock*` 拿不到锁时进入睡眠，经 `schedule` 让出 CPU；其它线程/进程可在该核上运行 |
+| **持锁者**（已拿到锁，正在跑 doit） | **通常会**（执行 `rtnl_setlink` / `newlink` / `register_netdev` 等） | **可以，但不等于「因持锁而主动让出」** | 临界区内是普通内核路径：可被抢占；也可能在持锁期间因内存分配等进入睡眠。睡眠时 **CPU 让出，但锁仍被占用** |
+
+要点：
+
+1. **等锁会让出 CPU**  
+   等高并发 CNI 时，大量线程堵在 `rtnl_lock*` / `mutex_lock*` 上睡觉，对应 perf **off-CPU**（如 `loopback_net_init → register_netdev → rtnl_lock_killable`）。这些线程 **不空转占核**，但端到端延迟照样涨——在等唯一持锁者做完。
+
+2. **持锁者主要在消耗 CPU 做配网工作**  
+   拿到锁之后要跑完链路配置；火焰图 **on-CPU** 上 `rtnl_setlink` ~7% 等帧，就是持锁临界区在跑。mutex **不会**像 spinlock 那样关抢占死占核空转；但临界区本身往往是 CPU 密集的内核工作，表现为占核执行。
+
+3. **「让出 CPU」≠「放开锁」**  
+   - 等锁者：让出 CPU，且 **未持锁**。  
+   - 持锁者若在临界区内 sleep：让出 CPU，但 **`rtnl_mutex` 仍被持有**，其它配网请求继续排队——这是 mutex 允许 sleep 带来的典型放大点（锁持有时间变长）。  
+   - 因此：不能指望「持锁线程 sleep 了，别人就能配网」；全局串行仍然成立。
+
+4. **和本压测的对应关系**
+
+```
+线程 A：持锁跑 rtnl_setlink / register_netdev …  →  on-CPU（占核做活）
+线程 B/C/…：mutex_lock 失败 → schedule 睡眠     →  off-CPU（让出 CPU，等锁）
+         ↑
+    同一把 rtnl_mutex：A 做完才轮到下一个
+```
+
+对 containerd 绑定的 **4 核**而言：等锁线程让出 CPU 后，核可以被持锁配网、shim、其它工作使用；但配网吞吐仍被 **一把锁串行**卡住，多核帮不上「并行配网」。这与 resources 里的 CPU 饱和、以及「大量 futex/schedule 等待」可以同时成立。
+
+### 7.4 谁在抢这把锁（不只是 bridge）
 
 火焰图与内核/CNI 源码对照：凡改链路或注册 netdev 都会拿 RTNL。本压测至少包括：
 
@@ -268,18 +303,104 @@ RunPodSandbox
 - **loopback 与 bridge 共用同一把锁**；loopback 看似轻，但每沙箱必跑，会放大尾延迟。
 - 关某一类用户态附加步骤（例如本配置里的 masquerade）**不能消除** RTNL；只要还有 netns/lo/veth/bridge 链路操作，锁仍在。
 
-### 7.4 火焰图中与 RTNL 相关的量化线索
+### 7.5 火焰图中的 `printk`：为何出现在 `rtnetlink_rcv_msg` 下
+
+#### 现象
+
+on-CPU 火焰图 / `perf report` call-graph 中，在 **`rtnetlink_rcv_msg` 之下**（不是之上；堆栈自下而上为调用者→被调用者）可见大段：
+
+```
+printk → vprintk_emit → console_unlock → pl011_console_write → …
+```
+
+定量：`printk` 相关 children 约 **6.7%**，几乎全部落在 **`pl011_console_write`（ARM UART 串口控制台）**。容易误解成「rtnetlink 协议栈在狂打日志」——实际不是。
+
+#### 调用链（perf 还原）
+
+```
+rtnetlink_rcv_msg          ← 持 rtnl_mutex 处理 RTM_SETLINK
+  → rtnl_setlink
+  → do_setlink
+  → do_set_master
+  → br_add_slave / br_add_if   ← CNI bridge 把 veth 挂到网桥
+  → br_init_port / br_stp_enable_port / …
+  → br_set_state               ← 切换 STP 端口状态
+  → br_info(…) → printk(…)
+  → console_unlock → pl011_console_write   ← 同步写串口，极慢
+```
+
+即：**CNI bridge 加端口 → 内核 bridge STP 改状态 → 打 KERN_INFO → 当前 console_loglevel 允许打到串口 → CPU 耗在 UART。**
+
+#### 结合代码
+
+1. **STP 状态变更必打 info 日志**（`net/bridge/br_stp.c`）：
+
+```c
+void br_set_state(struct net_bridge_port *p, unsigned int state)
+{
+	/* ... */
+	p->state = state;
+	err = switchdev_port_attr_set(p->dev, &attr);
+	if (err && err != -EOPNOTSUPP)
+		br_warn(...);
+	else
+		br_info(p->br, "port %u(%s) entered %s state\n",
+			(unsigned int) p->port_no, p->dev->name,
+			br_port_state_names[p->state]);
+	/* ... */
+}
+```
+
+每个沙箱把 veth 加入 bridge 时，端口会经历 blocking / listening / learning / forwarding 等切换，**每次 `br_set_state` 成功路径都走 `br_info`**。高并发下日志条数随沙箱数 × 状态切换次数膨胀。
+
+2. **`br_info` 就是带级别的 `printk`**（`net/bridge/br_private.h`）：
+
+```c
+#define br_printk(level, br, format, args...) \
+	printk(level "%s: " format, (br)->dev->name, ##args)
+
+#define br_info(__br, format, args...) \
+	br_printk(KERN_INFO, __br, format, ##args)
+```
+
+`KERN_INFO` 对应级别 **6**。本机压测时 `/proc/sys/kernel/printk` 首项 **console_loglevel=7**，INFO 会输出到 console。
+
+3. **为何 CPU 占比高**：`printk` 写入 ring buffer 后，若未按级别抑制，会走 `console_unlock` → 各 console 驱动。本机是 **PL011 串口**，按字符输出，远慢于内存日志；故火焰图热点在 `pl011_console_write`，而不是「格式化字符串」本身。
+
+4. **与 `rtnl_mutex` 的关系**：上述路径发生在 **`rtnl_setlink` 持锁临界区内**。串口打印拉长持锁时间 → 其它等锁的配网请求排队更久。因此 `printk` 既是独立的 on-CPU 浪费，也是 RTNL 串行的放大器。
+
+#### 调 `console_loglevel` 能否去掉？
+
+| 手段 | 还会调用 `br_info`/`printk`？ | 还写 dmesg ring buffer？ | 还写串口（火焰图热点）？ |
+|------|------------------------------|--------------------------|---------------------------|
+| `dmesg -n 4` 或 `kernel.printk='4 4 1 7'` | **会** | **会** | **基本不会**（INFO 被 `suppress_message_printing` 跳过） |
+| 去掉/不用串口 console | 会 | 会 | 不会 |
+| 改内核去掉 `br_info` | 不会 | 不会 | 不会 |
+
+内核逻辑（`level >= console_loglevel` 则不上 console）：把 console 调到 **4** 即可让 INFO 不上串口，**打掉火焰图里绝大部分 `pl011_*`**；但不会让 `br_set_state` 里的 `br_info` 调用消失。压测对照：
+
+```bash
+# 临时抑制 INFO 上串口（推荐压测时使用）
+sudo dmesg -n 4
+# 或: echo '4 4 1 7' | sudo tee /proc/sys/kernel/printk
+
+# 恢复
+sudo dmesg -n 7
+```
+
+### 7.6 火焰图中与 RTNL 相关的量化线索
 
 | 符号 | 约占比（on-CPU 核 1–4） | 含义 |
 |------|-------------------------|------|
-| `rtnl_setlink` | **~7.3%** | 持锁改链路（veth/lo 起停、master 等） |
-| `rtnl_newlink` | ~0.3–0.5% | 新建链路 |
-| `rtnl_lock` / `rtnl_lock_killable` | 分散累计 | 加锁与持锁前路径 |
+| `rtnl_setlink` | **~7.3%** | **持锁**改链路（含 `br_add_if`；其下嵌套 `printk`） |
+| `printk` / `pl011_console_write` | **~6.7%** | bridge STP `br_info` → 串口（§7.5） |
+| `rtnl_newlink` | ~0.3–0.5% | 新建链路（持锁路径） |
+| `rtnl_lock` / `rtnl_lock_killable` | 分散累计 | 加锁入口；争用剧烈时与等锁相关 |
 | `loopback` / `loopback_net_init` | ~2.3% / ~0.5% | lo：CNI 插件 + netns 内注册 |
 
-off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 进一步说明：**等锁时间**也进入端到端延迟。
+off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对应 **等锁睡眠（已让出 CPU）**，这部分时间仍计入端到端延迟（见 §7.3）。
 
-### 7.5 同属 CNI 桶内的其它开销（次要、与配置相关）
+### 7.7 同属 CNI 桶内的其它开销（次要、与配置相关）
 
 本次 CNI 配置开启了 `ipMasq: true`，perf 中还能看到 `xtables-nft-multi` / `iptables`：每沙箱写 `CNI-*` MASQUERADE 链会额外引入 **xtables 全局锁**。
 
@@ -288,14 +409,14 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 进�
 | 机制 | 触发 | 与「CNI 时延」关系 |
 |------|------|-------------------|
 | **`rtnl_mutex`** | 链路/netdev 配置（bridge、loopback、netns lo） | **配网主路径上的结构性串行**；换 CNI 形态也常仍存在 |
+| **串口 `printk`**（本机） | bridge `br_set_state` → `br_info` | 拉长 RTNL 持锁；调低 console_loglevel 可验证 |
 | **xtables**（本配置） | `ipMasq` 写 nat | 可叠加恶化；`ipMasq: false` 可去掉，**但不取消 RTNL** |
 
-对照实验时需分开看：关 masquerade 主要验证 xtables 贡献；减 veth/bridge 或跳过 CNI（如 ipvlan / hostNetwork）才更直接打到 RTNL 竞争。
+对照实验时需分开看：关 masquerade 主要验证 xtables；`dmesg -n 4` 验证串口日志；减 veth/bridge 或跳过 CNI（如 ipvlan / hostNetwork）才更直接打到 RTNL 竞争。
 
-### 7.6 小结（瓶颈 A）
+### 7.8 小结（瓶颈 A）
 
-**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 本配置下的 masquerade/iptables 是同桶内的额外开销，分析与优化时应与 RTNL 分开评估。
-
+**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）。本配置下的 masquerade/iptables 是同桶内的额外开销，应与 RTNL / 日志开销分开评估。
 ---
 
 ## 8. 瓶颈 B：shim / NewTask 创建慢
@@ -376,6 +497,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 进�
 | A. hostNetwork 对照 | 整段跳过 CNI | `cni.setup` 接近消失 → 量化配网（含 RTNL）上限 |
 | B. CNI 改为 ipvlan | 减少 veth/bridge 类链路操作 | `cni.setup` 与 `rtnl_*` 帧下降 |
 | C. 仅关 `ipMasq` | 去掉本配置的 xtables 叠加 | `cni.setup` 可能下降；**`rtnl_*` / loopback 仍在** |
+| C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
@@ -417,11 +539,12 @@ ls "$RESULT/perf"/*.svg
 | 端到端 | 128 并发 P95 ≈ **15.6s** |
 | 最大阶段（profile） | **CNI 配网 ~49%**，**shim/NewTask ~41%** |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
+| 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（~6.7%，见 §7.5） |
 | 瓶颈 A 配置叠加 | 本环境 `ipMasq` 额外引入 xtables（与 RTNL 分开看） |
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：先由 profile 看到 CNI 配网最重，再由 perf 下钻到 **`rtnl_mutex` 全局串行**（含 loopback）；shim、metadata DB 与 4 核漏斗是并列的其它瓶颈；iptables/masquerade 只是当前 CNI 配置下的叠加项，不是整篇分析的主线。
+**一句话**：先由 profile 看到 CNI 配网最重，再由 perf 下钻到 **`rtnl_mutex` 全局串行**（含 loopback）；持锁路径上还有 bridge STP 日志打到串口的 **`printk` 放大**；shim、metadata DB 与 4 核漏斗是并列的其它瓶颈；iptables/masquerade 只是当前 CNI 配置下的叠加项，不是整篇分析的主线。
 
 ---
 
@@ -432,3 +555,5 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-16 | 基于四类数据初稿 |
 | 2026-07-16 | 补充 `rtnl_mutex` 分析 |
 | 2026-07-16 | **重构结构**：观测 → 瓶颈候选 → 逐项深挖；以 CNI 时延引出 RTNL，弱化与 iptables 的捆绑叙述 |
+| 2026-07-16 | §7.3 补充：`rtnl_mutex` 等锁让出 CPU、持锁跑临界区；让出 CPU ≠ 释放锁 |
+| 2026-07-16 | §7.5 补充：火焰图 `printk` 来自 bridge `br_set_state`/`br_info`，经 PL011 串口放大 RTNL 持锁 |
