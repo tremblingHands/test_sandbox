@@ -477,7 +477,41 @@ sudo dmesg -n 7
 3. **阶段再次换位**：CNI 只剩 ~6%；**`container.NewTask` / shim / runc 成为新的头号阶段**（Avg 1.71s→2.48s，占比 ~36%）。配网更快后，更多工作更早堆到 task 创建与 cgroup，与关 printk 后 NewContainer 被暴露是同一类「松绑→下一层冒头」。
 4. **NewContainer / metadata / snapshotter 这次变快**（与关 printk 对照时它们变慢不同）：去掉占满 4 核的 iptables 后，bbolt/snapshot 路径少受队头阻塞，Avg 下降。说明这些阶段对「谁在占核」敏感，对照之间不可只看绝对毫秒、还要看争用对象。
 5. **RTNL 仍在**：`bridge`/`loopback`/`host-local` 仍有可观 on-CPU；关 masq **不取消** `rtnl_mutex`。若要继续压 CNI，需换形态（ipvlan / hostNetwork）或接受 bridge+veth 的结构性串行。
-6. 生产侧等价手段：节点级一条（或少量）MASQUERADE 覆盖子网（如 `10.0.0.0/12`），CNI 保持 `ipMasq: false`，避免每沙箱调 iptables。下一轮优先：**NewTask / shim / runc.cgroup** 与 **bbolt/snapshot**。
+6. **出网规则迁移（已写入 `setup.sh`）**：关 `ipMasq` 后冷启动不再写 per-sandbox NAT，出网改由**节点级一条** MASQUERADE 承担（见下）。下一轮优先：**NewTask / shim / runc.cgroup** 与 **bbolt/snapshot**。
+
+**原规则 vs 节点级规则**
+
+`ipMasq: true` 时，每个沙箱 ADD 写一套（iptables 后端示例）：
+
+```text
+-A POSTROUTING -s <pod-ip>/32 -m comment --comment "name: \"mynet\" id: \"...\"" -j CNI-<hash>
+-A CNI-<hash> -d 10.0.0.0/12 ... -j ACCEPT          # 池内不伪装
+-A CNI-<hash> ! -d 224.0.0.0/4 ... -j MASQUERADE   # 出网（非组播）伪装
+```
+
+N 个沙箱 → N 条 POSTROUTING 跳转 + N 条 `CNI-*` 链；DEL 时拆除。这是冷启动路径上 xtables/nft 开销的来源。
+
+`ipMasq: false` 时 CNI 不再写上述规则。出网改为节点级一条（与 per-sandbox 出网效果对齐，冷启动不碰 iptables）：
+
+```text
+-A POSTROUTING -s 10.0.0.0/12 ! -o cni0 -j MASQUERADE
+```
+
+| | 原 CNI per-sandbox | 节点级一条 |
+|--|--|--|
+| 粒度 | 每沙箱 `/32` + 专用链 | 整池 `10.0.0.0/12` |
+| 谁写 | bridge ADD/DEL | `setup.sh` 一次 ensure |
+| 冷启动 | 每次改 nat | 不碰 |
+| 出网 SNAT | 有 | 有（本场景等价） |
+| 池内互访 | 链内 `-d 池 ACCEPT` | 走 `cni0`，不命中 `! -o cni0` |
+
+复现 / 日常配置：
+
+```bash
+bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
+```
+
+脚本会：① 把 `/etc/cni/net.d/10-mynet.conf` 的 `"ipMasq"` 设为 `false`；② 若不存在则添加上述节点级规则；③ 若改回 `--ip-masq true` 则删除该节点级规则，改由 CNI 维护。重启后 iptables 可能丢失，需重跑 `setup.sh` 或自行做 iptables 持久化。
 
 ### 7.6 火焰图中与 RTNL 相关的量化线索
 
@@ -495,7 +529,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 本次 CNI 配置曾开启 `ipMasq: true`，perf 中能看到 `xtables-nft-multi` / `iptables`：每沙箱写 `CNI-*` MASQUERADE 链会额外引入 **xtables 全局锁**与大量 nft dump/validate 开销。
 
-**关 `ipMasq` 对照已完成**（§7.5 末）：on-CPU `iptables` **~25%→0%**，`cni.setup` Avg **1.21s→386ms**，吞吐 **15.1→17.3/s**。这是 **CNI 桶内、与配置相关的叠加因素**，不是「配网慢」的唯一定义，也与 `rtnl_mutex` 不是同一把锁：
+**关 `ipMasq` 对照已完成**（§7.5 末）：on-CPU `iptables` **~25%→0%**，`cni.setup` Avg **1.21s→386ms**，吞吐 **15.1→17.3/s**。出网改由节点级 `-s 10.0.0.0/12 ! -o cni0 -j MASQUERADE`（`setup.sh --ip-masq false` 自动 ensure）。这是 **CNI 桶内、与配置相关的叠加因素**，不是「配网慢」的唯一定义，也与 `rtnl_mutex` 不是同一把锁：
 
 | 机制 | 触发 | 与「CNI 时延」关系 |
 |------|------|-------------------|
@@ -596,7 +630,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 |------|------|------|
 | A. hostNetwork 对照 | 整段跳过 CNI | `cni.setup` 接近消失 → 量化配网（含 RTNL）上限 |
 | B. CNI 改为 ipvlan | 减少 veth/bridge 类链路操作 | `cni.setup` 与 `rtnl_*` 帧下降 |
-| C. **仅关 `ipMasq`**（已做） | 去掉本配置的 xtables 叠加 | 在关 printk 上：吞吐 **15.1→17.3/s**；`cni.setup` **1.21s→386ms**；iptables on-CPU **~25%→0%**（见 §7.5） |
+| C. **仅关 `ipMasq`**（已做） | 去掉本配置的 xtables 叠加；出网改节点级 MASQ | 在关 printk 上：吞吐 **15.1→17.3/s**；`cni.setup` **1.21s→386ms**；iptables on-CPU **~25%→0%**；`setup.sh --ip-masq false` 自动加 `-s 10.0.0.0/12 ! -o cni0`（见 §7.5） |
 | C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
@@ -892,7 +926,7 @@ ls "$RESULT/perf"/*.svg
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
-| 瓶颈 A 配置叠加 | **`ipMasq`→xtables**（对照已验证，见 §7.5）；与 RTNL 分开看 |
+| 瓶颈 A 配置叠加 | **`ipMasq`→xtables**（对照已验证）；出网改节点级 MASQ（`setup.sh --ip-masq false`） |
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
@@ -917,3 +951,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §7.5：补充关 printk 后 containerd 核 idle ~12%→1%、usr↑——等锁空闲被有效工作吃掉 |
 | 2026-07-17 | §7.5：补充关 printk 后阶段换位（NewContainer 成头号）、NewTask/cgroup 连带变快、metadata/snapshotter 变慢、iptables 相对更显眼 |
 | 2026-07-17 | §7.5：写入 `ipMasq: false` 对照（吞吐 15.1→17.3/s，`cni.setup` 1.21s→386ms，iptables on-CPU ~25%→0%；NewTask 成新头号） |
+| 2026-07-17 | §7.5：补充原 CNI per-sandbox 规则 vs 节点级 MASQ；`setup.sh --ip-masq false` 自动 ensure 出网规则 |

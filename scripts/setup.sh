@@ -179,6 +179,46 @@ detect_master_iface() {
     echo "${iface:-eth0}"
 }
 
+# bridge + ipMasq=false：用节点级一条 MASQUERADE 替代 CNI 每沙箱 CNI-* 链
+# 规则: -s $CNI_SUBNET ! -o cni0 -j MASQUERADE
+# ipMasq=true 时删除该节点级规则，改由 CNI 维护 per-sandbox 规则
+ensure_bridge_egress_masq() {
+    if [ "$CNI_TYPE" != "bridge" ]; then
+        return 0
+    fi
+
+    local bridge_if="cni0"
+    if [ "$IP_MASQ" = "false" ]; then
+        if sudo iptables -t nat -C POSTROUTING -s "$CNI_SUBNET" ! -o "$bridge_if" -j MASQUERADE 2>/dev/null; then
+            pass "节点级 MASQUERADE 已存在: -s $CNI_SUBNET ! -o $bridge_if"
+            return 0
+        fi
+        if $CHECK_ONLY; then
+            warn "缺少节点级 MASQUERADE（ipMasq=false 出网需要）: -s $CNI_SUBNET ! -o $bridge_if"
+            return 1
+        fi
+        echo "  添加节点级 MASQUERADE: -s $CNI_SUBNET ! -o $bridge_if -j MASQUERADE ..."
+        if ! sudo iptables -t nat -A POSTROUTING -s "$CNI_SUBNET" ! -o "$bridge_if" -j MASQUERADE; then
+            fail "添加节点级 MASQUERADE 失败"
+            return 1
+        fi
+        pass "节点级 MASQUERADE 已添加"
+        return 0
+    fi
+
+    # ipMasq=true：去掉本脚本维护的节点级规则，避免与 CNI per-sandbox 规则叠加
+    if sudo iptables -t nat -C POSTROUTING -s "$CNI_SUBNET" ! -o "$bridge_if" -j MASQUERADE 2>/dev/null; then
+        if $CHECK_ONLY; then
+            warn "ipMasq=true 时仍存在节点级 MASQUERADE（建议删除）: -s $CNI_SUBNET ! -o $bridge_if"
+            return 0
+        fi
+        echo "  删除节点级 MASQUERADE（改由 CNI ipMasq 负责）..."
+        sudo iptables -t nat -D POSTROUTING -s "$CNI_SUBNET" ! -o "$bridge_if" -j MASQUERADE
+        pass "节点级 MASQUERADE 已删除"
+    fi
+    return 0
+}
+
 # ============================================================
 # 检查 kata runtime（仅在 --runtime kata 时执行）
 # ============================================================
@@ -454,6 +494,8 @@ check_cni_network() {
         pass "CNI $CNI_TYPE 配置已创建"
         sudo systemctl restart containerd
         sleep 2
+        # 新建配置后仍需同步节点级出网规则（尤其 ipMasq=false）
+        ensure_bridge_egress_masq || return 1
         return 0
     fi
 
@@ -516,10 +558,9 @@ check_cni_network() {
                 return 1
             fi
             pass "CNI ipMasq 已更新为: $IP_MASQ"
-            if [ "$IP_MASQ" = "false" ]; then
-                warn "ipMasq=false 时 CNI 不再为每沙箱调用 iptables；若需出网请自行配置节点级 MASQUERADE（如 -s $CNI_SUBNET ! -o cni0）"
-            fi
         fi
+        # ipMasq=false → 确保节点级 MASQUERADE；true → 清理节点级规则
+        ensure_bridge_egress_masq || return 1
     fi
 
     # ---- bridge 专属：hash_max ---- #
@@ -872,9 +913,9 @@ main() {
     echo "  ./scripts/concurrent_cold_start.sh 10 3"
     echo ""
     if [ "$CNI_TYPE" = "bridge" ] && [ "$IP_MASQ" = "false" ]; then
-        echo "提示: bridge + ipMasq=false 时，若沙箱需访问外网，请配置节点级 MASQUERADE，例如:"
-        echo "  iptables -t nat -C POSTROUTING -s $CNI_SUBNET ! -o cni0 -j MASQUERADE 2>/dev/null || \\"
-        echo "    iptables -t nat -A POSTROUTING -s $CNI_SUBNET ! -o cni0 -j MASQUERADE"
+        echo "提示: bridge + ipMasq=false 已由本脚本配置节点级出网规则:"
+        echo "  iptables -t nat -A POSTROUTING -s $CNI_SUBNET ! -o cni0 -j MASQUERADE"
+        echo "  （重启后若规则丢失，重新执行 setup.sh 或自行做 iptables 持久化）"
         echo ""
     fi
 
