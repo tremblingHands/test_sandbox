@@ -39,9 +39,9 @@
 | containerd CPU | **1–4**（仅 4 核） |
 | 沙箱 CPU | `--cpuset-cpus 0-255`，`--cpuset-mems 0-1` |
 | 时长 / 预配置 | `--duration 60`，`--preconfig 50` |
-| CNI | bridge（`/etc/cni/net.d`；配置含 `ipMasq: true`） |
+| CNI | bridge（基线 `ipMasq: true`；后续对照改为 `false`，见 §2.3 / §7.5） |
 
-### 2.2 端到端延迟（resources）
+### 2.2 端到端延迟（resources，初始基线）
 
 | 指标 | 数值 |
 |------|------|
@@ -50,7 +50,21 @@
 | 资源瓶颈标记 | **`containerd_cpu_saturation`** |
 | Spike（约 51s） | P95 ≈ 16.3s，同时约 616 个沙箱活跃 |
 
-**宏观结论**：128 路并发下冷启动 P95 约 **15.6s**；系统标记 containerd CPU 饱和。
+**宏观结论（初始基线）**：128 路并发下冷启动 P95 约 **15.6s**；系统标记 containerd CPU 饱和。后续优化后的当前工作点见 §2.3。
+
+### 2.3 优化阶梯与当前工作点（同配置对照）
+
+同配置除非另注：128 workers、containerd 绑核 1–4、`--duration 60`。数据目录在 `profile/`。
+
+| 阶梯 | 吞吐（沙箱/s） | 端到端 P95 | `cri.sandbox.run` Avg | `cni.setup` Avg | 当前头号阶段 |
+|------|----------------|------------|----------------------|-----------------|--------------|
+| 初始基线（printk 开、`ipMasq: true`） | **~12.8** | **~15.6s** | ~11.7s | **~5.2–5.8s** | CNI ≈ NewTask |
+| + 关 printk（`0d91342dba12`） | **~15.1** | **~13.1s** | 8.86s | **1.21s** | NewContainer ~30% |
+| + `ipMasq: false`（目录较干净） | **~17.3** | **~10.7s** | 6.92s | **386ms** | **NewTask ~36%** |
+| 同上 + host-local 预填 5000（无索引） | （以 profile 为主） | run P95 ~12.8s | 9.26s | **8.83s** | **CNI / bridge** |
+| + host-local **旁路索引**（`by_id.idx`） | — | run P95 **~11.9s** | **7.49s** | **342ms** | **NewTask ~3.24s**；**端到端未见收益** |
+
+**当前工作点**：关 printk + `ipMasq: false`、目录较干净时，以 `profile/..._disable-printk_ip-masq-false` 为准（吞吐 ~17.3/s，`cni.setup` ~386ms，NewTask 为首）。host-local 旁路索引改动后的复测与该点同量级，**未带来可感知的端到端改善**（见 §7.5）。
 
 ---
 
@@ -553,7 +567,35 @@ bash scripts/hostlocal_prefill.sh prefill 5000
 # … 同配置压测，结果目录带 hostlocal-prefill5000 …
 ```
 
-5. 优化方向：换带索引的 IPAM / fork host-local；运维上压测前后 `clear`、避免占位泄漏导致目录只增不减。空目录时下一刀仍可看 NewTask；**长期跑满或泄漏后必须正视 Walk**。
+5. 优化方向：运维上压测前后 `clear`、避免占位泄漏导致目录只增不减。空目录时下一刀仍可看 NewTask；**长期跑满或泄漏后必须正视 Walk**。曾尝试 fork host-local 加旁路索引，见下节（**端到端未见效果**）。
+
+#### 对照实验：host-local 旁路索引（`by_id.idx`）——**未见端到端效果**
+
+针对预填对照暴露的 `GetByID` Walk，在 `/home/nathan/plugins` 的 host-local disk backend 增加旁路索引：`/var/lib/cni/networks/mynet/by_id.idx`（`ID+ifname → IP`），`GetByID` 读索引而非全目录 Walk；`Reserve`/`Release` 同步更新。可通过 `HOSTLOCAL_DISABLE_ID_INDEX=1` 关闭。二进制曾安装到 `/opt/cni/bin/host-local`（备份如 `host-local.bak.20260717164403`）。
+
+同配置压测后 profile（用户复测）：
+
+| Span | Avg | P50 | P95 |
+|------|-----|-----|-----|
+| `cri.sandbox.run` | **7.49s** | 7.64s | **11.85s** |
+| `cni.setup_pod_network` | **342ms** | 329ms | 661ms |
+| └ `cni.plugin.bridge` | 322ms | — | — |
+| `client.NewContainer` | **1.82s** | — | — |
+| `container.NewTask` | **3.24s** | — | — |
+
+与关 masq、目录较干净的基线对照：
+
+| 指标 | 关 masq 基线（无索引） | + 旁路索引复测 | 结论 |
+|------|------------------------|----------------|------|
+| `cni.setup` Avg | **386ms** | **342ms** | 同量级，无数量级变化 |
+| `cri.sandbox.run` Avg | 6.92s | 7.49s | **端到端未变好** |
+| 头号阶段 | NewTask ~2.48s | NewTask **~3.24s** | 仍被 task 创建主导 |
+
+**解读（为何判「没有效果」）**：
+
+1. **相对干净目录基线，改 host-local 未见收益**：`cni.setup` 本已在 ~0.4s，索引后仍 ~0.3s；run 仍是秒级，由 NewTask / NewContainer 决定。
+2. 索引只能缩短 **脏目录下的 GetByID 扫盘**；在目录不脏、CNI 已非头号时，**动 IPAM 不会拉动端到端**——本次复测符合这一点。
+3. 本次未做「同一 prefill 5000 × 有/无索引」的铁证对照；预填 5000 无索引的 ×23 恶化仍成立，但 **旁路索引作为当前冷启动优化手段，实测未体现端到端价值**，不以有效优化记入阶梯。
 
 ### 7.6 火焰图中与 RTNL 相关的量化线索
 
@@ -584,15 +626,27 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 7.8 小结（瓶颈 A）
 
-**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）；**关掉该 `printk` 后，`cni.setup` Avg 从 ~5.2s 降到 ~1.2s、吞吐约 +18%**。其上再关 **`ipMasq`**，`cni.setup` 再降到 **~386ms**、吞吐约 **+14%**，perf 上 iptables 归零——验证 xtables 为同桶叠加项。关 masq 且目录较干净时阶段换位到 **NewTask/shim/runc**；但 **host-local 预填 5000** 后 `cni.setup` 又升到 **~8.8s**（约 ×23），说明 IPAM 扫盘在脏目录下可重新主导 CNI 桶。RTNL 与 loopback 仍在。
+**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）；**关掉该 `printk` 后，`cni.setup` Avg 从 ~5.2s 降到 ~1.2s、吞吐约 +18%**。其上再关 **`ipMasq`**，`cni.setup` 再降到 **~386ms**、吞吐约 **+14%**，perf 上 iptables 归零——验证 xtables 为同桶叠加项。关 masq 且目录较干净时阶段换位到 **NewTask/shim/runc**；**host-local 预填 5000** 后 `cni.setup` 又升到 **~8.8s**（约 ×23）。随后 fork 的 **旁路索引（`by_id.idx`）相对干净目录基线端到端未见效果**（`cni.setup` 仍 ~0.3s，NewTask 仍主导）。RTNL 与 loopback 仍在。
 ---
 
 ## 8. 瓶颈 B：shim / NewTask 创建慢
 
 ### 8.1 现象
 
+**初始基线**（CNI 仍很重时）：
+
 - `container.NewTask` Avg **4.76s**（~41%）；其中 `shim.task.create` Avg **4.12s**。
 - perf：`runc` / `containerd-shim` on-CPU 高；off-CPU 大量 futex / schedule。
+
+**关 printk + `ipMasq: false` 后**（目录较干净）：
+
+| Span | Avg（关 masq 基线） | 约占 run |
+|------|---------------------|----------|
+| `container.NewTask` | **2.48s** | **~36%** ← 端到端头号 |
+| `client.NewContainer` | 1.95s | ~28% |
+| `cni.setup_pod_network` | 386ms | ~6% |
+
+关 masq 后 NewTask 从 1.71s（关 printk）升到 **2.48s**：配网变轻后更多工作堆到 task 创建，**瓶颈 B 已是当前主战场**。host-local 旁路索引复测里 NewTask 仍约 **3.2s**、CNI 仍约 **0.3s**，进一步说明动 IPAM **拉不动** 端到端（§7.5）。
 
 ### 8.2 机制（当前深度）与下钻方式
 
@@ -614,7 +668,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 8.3 小结（瓶颈 B）
 
-**第二大时间桶是 shim 创建路径**；表现为 CPU + 大量 off-CPU 等待。优化方向：预热/复用、减少 per-sandbox 进程成本、或先用降并发观察是否线性改善。
+基线下 NewTask 是与 CNI 并列的大桶；**关 printk + 关 ipMasq 且 IPAM 目录较干净之后，NewTask 升为端到端头号（Avg ~2.5s，约占 run 的 ~36%）**。表现为 CPU + 大量 off-CPU 等待。优化方向：用带 TRACE 的 shim/runc 拆 `shim.task.create`（§8.2 / §13）、预热/复用、减少 per-sandbox 进程成本、或降并发观察是否线性改善。
 
 ---
 
@@ -677,13 +731,14 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | C4. **host-local 预填 5000**（已做） | 量化 `GetByID` Walk | 关 masq 上：`cni.setup` **386ms→8.83s**（约 ×23）；`scripts/hostlocal_prefill.sh`（见 §7.5） |
+| C5. **host-local 旁路索引 `by_id.idx`**（已做） | 去掉/缩短脏目录 Walk | **相对干净目录基线端到端未见效果**：run ~7.5s、`cni.setup` ~342ms vs 基线 386ms；NewTask 仍主导（见 §7.5） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；shim 路径优化；压测加 `--perf_sandbox`。关 printk + 关 `ipMasq` 且 **目录干净** 时优先 **NewTask / shim / runc.cgroup**；**脏目录 / 长期泄漏** 时优先 **host-local 索引或换 IPAM**。建议补跑 `hostlocal_prefill.sh clear` 空目录对照并带 `--resources`。
+中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 shim / NewTask / runc**（关 printk + 关 `ipMasq` 且目录干净时）。host-local 旁路索引在当前工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM 应对，不宜再指望旁路索引拉动冷启动 P95。建议补跑 `hostlocal_prefill.sh clear` 空目录对照并带 `--resources`。
 
-不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）。
+不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**。
 
 ---
 
@@ -972,18 +1027,20 @@ ls "$RESULT/perf"/*.svg
 | 端到端（关 printk，`0d91342dba12`） | P95 ≈ **13.1s**，吞吐约 **15.1** 沙箱/s；`cni.setup` Avg **5.15→1.21s** |
 | 端到端（关 printk + `ipMasq: false`） | P95 ≈ **10.7s**，吞吐约 **17.3** 沙箱/s；`cni.setup` Avg **1.21s→386ms**；iptables on-CPU **~25%→0%** |
 | 端到端（同上 + host-local 预填 5000） | `cni.setup` Avg **386ms→8.83s**（约 ×23）；CNI 再次主导 `cri.sandbox.run` |
+| **host-local 旁路索引**（`by_id.idx`） | **端到端未见效果**：相对关 masq 干净目录，`cni.setup` 386→342ms（同量级），run ~7.5s 仍由 NewTask 主导 |
+| **当前工作点**（关 printk + masq false，目录较干净） | 吞吐 ~**17.3**/s，P95 ~**10.7s**；`cni.setup` ~**386ms**；**NewTask ~2.48s（~36%）** |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
 | 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
-| 再关 ipMasq 后主阶段（目录较干净） | **`container.NewTask` ~36%**；CNI 仅 ~6%；iptables 消失 |
+| 再关 ipMasq 后主阶段（目录较干净） | **`container.NewTask` ~2.5s / ~36%**；CNI 仅 ~6%；iptables 消失 |
 | 预填 5000 后主阶段 | **`cni.setup` / bridge ~8.8s**；NewTask/NewContainer Avg 骤降（队头在 IPAM） |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
-| 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证） |
-| 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
+| 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证）；旁路索引**未拉到端到端** |
+| 瓶颈 B / C / D | **当前主战场：shim/NewTask**；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4）。其上再关 **`ipMasq`**，吞吐约 15.1→17.3/s、`cni.setup` 再降到约 386ms。目录较干净时瓶颈换位到 **NewTask**；**host-local 预填 5000** 后 `cni.setup` 又升到约 8.8s，扫盘可重新主导 CNI。带 TRACE / debug 符号的编译安装见 **§13**。
+**一句话**：基线下 CNI 最重，下钻到 **`rtnl_mutex`**；**`br_info`→串口 printk** 与 **`ipMasq`→xtables** 已对照验证（吞吐约 12.8→15.1→17.3/s，`cni.setup` 约 5s→1.2s→0.4s）。脏目录下 Walk 可使 CNI 回升到 ~8.8s；**host-local 旁路索引相对干净目录基线未见端到端效果**。当前工作点下瓶颈在 **NewTask / shim / runc**。下一刀：shim/runc TRACE 下钻（§8 / §13）。
 
 ---
 
@@ -1007,3 +1064,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §7.5：补充原 CNI per-sandbox 规则 vs 节点级 MASQ；`setup.sh --ip-masq false` 自动 ensure 出网规则 |
 | 2026-07-17 | §13：补充 on-CPU `--call-graph dwarf`（默认仍 fp；仅影响 on-CPU）以减少 Go `[unknown]` |
 | 2026-07-17 | §7.5：写入 host-local 预填 5000 对照（`cni.setup` 386ms→8.83s；`hostlocal_prefill.sh`） |
+| 2026-07-17 | §2.3 / §7.5 / §12 / §15：记录 host-local 旁路索引（`by_id.idx`）改动后**端到端未见效果** |

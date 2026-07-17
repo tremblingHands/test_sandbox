@@ -993,11 +993,12 @@ cat /var/lib/cni/networks/mynet/10.0.0.2
 | 定期清理确认无主的孤儿 IP 文件 | 同上 |
 | 火焰图对上 `GetByID`/`ReadFile` | 与「纯 flock 空转」区分：是 **持锁读盘** 而非仅排队 |
 | 换带索引/集中式的 IPAM | 避开 host-local 这种「文件名=IP、内容=ID」模型（超出本 conf） |
+| **本机旁路索引试改（负结果）** | 曾在 host-local 加 `by_id.idx`；相对关 masq **干净目录**基线，`cni.setup` ~386→342ms、端到端仍 NewTask 主导 → **未见冷启动收益**（详见 `doc/sandbox-cold-start-bottleneck-analysis.md` §7.5） |
 
 ### 9.10 小结
 
 **host-local = 本机、基于磁盘文件与目录 flock 的 IPAM。**  
-对本 conf：从 `10.0.0.0/12` 跳过 `.1` round-robin 分配，结果带 `Gateway=10.0.0.1` 与默认路由；占位在 `/var/lib/cni/networks/mynet/`。自动分配时 **`Get` → `GetByID` 全目录读文件查重**，复杂度随已占用文件数增长且占满 flock，是火焰图上 host-local/bridge 路径常见热点；它不创建网络设备，高并发下与 RTNL 并列构成 CNI 串行来源。
+对本 conf：从 `10.0.0.0/12` 跳过 `.1` round-robin 分配，结果带 `Gateway=10.0.0.1` 与默认路由；占位在 `/var/lib/cni/networks/mynet/`。自动分配时 **`Get` → `GetByID` 全目录读文件查重**，复杂度随已占用文件数增长且占满 flock，是火焰图上 host-local/bridge 路径常见热点；它不创建网络设备，高并发下与 RTNL 并列构成 CNI 串行来源。目录脏时 Walk 成本可主导 CNI；**旁路索引试改在干净目录工作点下未体现端到端收益**。
 
 ---
 
@@ -1249,3 +1250,4 @@ Stop：`CNI DEL` → host-local 删 IP 文件释放地址；`ipMasq:true` 时 Te
 | 2026-07-17 | 加深 §9 host-local：二次 exec、flock/O_EXCL、Reserve/Release/CHECK、round-robin、泄漏与并发串行 |
 | 2026-07-17 | 新增 §10 loopback：WithLoNetwork、插件 LinkSetUp、并行 Setup、internal 对照、RTNL/性能 |
 | 2026-07-17 | §9 加深 `GetByID`：自动分配必经、Walk+ReadFile、持锁 O(N)、火焰图热点与孤儿文件放大 |
+| 2026-07-17 | §9.9.3：记录 host-local `by_id.idx` 旁路索引试改——相对干净目录基线端到端未见效果 |
