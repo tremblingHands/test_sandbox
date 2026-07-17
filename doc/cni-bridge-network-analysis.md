@@ -744,17 +744,21 @@ result.Routes = ipamConf.Routes
 return PrintResult(result)
 ```
 
-`IPAllocator.Get`（持锁全程）：
+`IPAllocator.Get`（持锁全程；本机 `requestedIP == nil`）：
 
 ```go
 a.store.Lock()   // → /var/lib/cni/networks/mynet/lock 上 flock
 defer a.store.Unlock()
 
-// 1) 禁止重复：同一 (id, ifname) 已在本 range 有 IP → error（CNI SPEC）
+// ★ 1) GetByID：防重复分配（CNI SPEC）—— 火焰图常见热点，见 §9.4 / §9.9
 allocatedIPs := a.store.GetByID(id, ifname)
-...
+for _, allocatedIP := range allocatedIPs {
+    if _, err := a.rangeset.RangeFor(allocatedIP); err == nil {
+        return nil, fmt.Errorf("%s has been allocated to %s, duplicate allocation ...", ...)
+    }
+}
 
-// 2) round-robin 迭代
+// 2) round-robin 迭代 + Reserve
 iter, _ := a.GetIter()  // 从 last_reserved_ip.0 + 1 开始
 for {
     reservedIP, gw = iter.Next()  // 跳过 Gateway；扫完一圈 → nil
@@ -764,6 +768,11 @@ for {
     }
 }
 ```
+
+| 分支 | 条件 | 是否调 `GetByID` |
+|------|------|------------------|
+| **自动分配（本机）** | `requestedIP == nil` | **是**，每次 Get 一次 |
+| 指定 IP | `CNI_ARGS` / IPArgs 有请求 | **否**，直接 `Reserve` |
 
 成功返回：
 
@@ -793,7 +802,38 @@ IPConfig{ Address: <ip>/12, Gateway: 10.0.0.1 }
 l.f.Lock()   // 排他 flock；跨 host-local 进程
 ```
 
-所有 `Get` / `Release` / `FindByID` 在业务逻辑外包一层 `store.Lock()`，故 **同一 network name 上 ADD/DEL 全局串行**。
+所有 `Get` / `Release` / `FindByID` 在业务逻辑外包一层 `store.Lock()`，故 **同一 network name 上 ADD/DEL 全局串行**。  
+注意：`GetByID` 本身在 `Get` 的 `Lock` **之内**调用，扫盘时间全部算进持锁窗口。
+
+**`GetByID`（读路径，火焰图热点）**：
+
+```go
+// disk.Store.GetByID — 无按 ID 的索引，只能全目录扫描
+func (s *Store) GetByID(id string, ifname string) []net.IP {
+    match := id + "\r\n" + ifname   // 另兼容旧格式：仅 id
+    filepath.Walk(s.dataDir, func(path string, info os.FileInfo, err error) error {
+        if info.IsDir() { return nil }
+        data, _ := os.ReadFile(path)          // ★ 每个 IP 占位文件都读
+        if trim(data) == match || trim(data) == id {
+            // 文件名 ParseIP → 加入结果
+        }
+        return nil
+    })
+    return ips
+}
+```
+
+语义与成本：
+
+| 项 | 说明 |
+|----|------|
+| **目的** | 同一 `(ContainerID, ifname)` 若已有落在本 range 的 IP → 拒绝再分配（SPEC 禁止 duplicate） |
+| **索引** | **无**；文件名是 IP，内容才是 id/ifname → 只能 Walk + 读内容匹配 |
+| **复杂度** | 对 dataDir 内 **每个** 非目录文件 `ReadFile` → **O(已占用 IP 数)** |
+| **持锁** | 发生在 flock 临界区内 → 拉长其它沙箱等锁时间 |
+| **冷/热** | 池空时几乎只碰到 `lock`/`last_reserved_ip.*`；池内文件上千时，**每次 ADD 先扫一遍全目录** |
+
+`FindByID`（CHECK 用）同样 Walk+读内容，逻辑类似。
 
 **Reserve（占 IP）**：
 
@@ -804,18 +844,19 @@ f.WriteString(id + "\r\n" + ifname)
 WriteFile("last_reserved_ip."+rangeID, ip.String())
 ```
 
-双重保险：flock 串行化进程；`O_EXCL` 防止异常并发下同 IP 双开。
+双重保险：flock 串行化进程；`O_EXCL` 防止异常并发下同 IP 双开。  
+相对 `GetByID`：成功路径通常 **一次** create+write；失败换 IP 时才多次 `OpenFile`（一般远少于全目录 ReadFile）。
 
 **ReleaseByID（DEL）**：
 
 ```go
-// Walk 目录，内容匹配 "id\r\nifname" 则 os.Remove
+// 同样 Walk 目录，内容匹配 "id\r\nifname" 则 os.Remove
 // 兼容旧格式：仅匹配 id
 ```
 
+DEL 也是 **O(已占用 IP 数)** 的 Walk；与 ADD 侧 `GetByID` 同类磁盘模式。  
 注意：DEL **不**回退 `last_reserved_ip`（游标只前进），符合「尽量不立刻复用刚释放 IP」的 round-robin 意图。
 
-**GetByID**：Walk 收集属于该 `(id, ifname)` 的所有 IP 文件名。  
 **CHECK**：`FindByID` 只要该容器还有任一占位文件即成功（不校验地址是否仍在网卡上）。
 
 ### 9.5 Round-robin 细节
@@ -875,11 +916,17 @@ isGateway      → cni0 上 Gateway + ip_forward
 ipMasq         → 出网 SNAT（本机 false）
 ```
 
-### 9.9 高并发与性能
+### 9.9 高并发与性能（含火焰图：`GetByID`）
+
+#### 9.9.1 串行拓扑
 
 ```
-沙箱1 bridge ──► host-local ──► flock(mynet/lock) ──► Reserve ──► unlock
-沙箱2 bridge ──► host-local ──► 等待 flock ………………… ──► Reserve ──► unlock
+沙箱1 bridge ──► host-local ──► flock(mynet/lock)
+                                    │
+                                    ├─ GetByID: Walk + ReadFile × N   ← 持锁读盘
+                                    ├─ GetIter / Reserve               ← 通常很快
+                                    └─ unlock
+沙箱2 bridge ──► host-local ──► 等待 flock ……………………………
 沙箱N …
 ```
 
@@ -889,24 +936,68 @@ ipMasq         → 出网 SNAT（本机 false）
 | **与 RTNL** | 不同锁；但都在 `cni.plugin.bridge` 墙钟内串起来 |
 | **与 xtables** | ipMasq 关闭后主剩 RTNL + 本锁 |
 | **进程成本** | 每沙箱额外 fork/exec 一次 `host-local` |
-| **磁盘** | 每 IP create/unlink 小文件；池极大且很满时 `Next` 扫描变长 |
-| **观测** | `ls /var/lib/cni/networks/mynet/`；perf/off-CPU 上可见等锁；profile 无单独 host-local span（叠在 bridge 下） |
+| **观测** | profile 通常 **无** 独立 `host-local` span，叠在 `cni.plugin.bridge` / `ipam.ExecAdd` 下 |
 
-调试命令：
+#### 9.9.2 为何火焰图里 `GetByID` / 读文件偏高
+
+对照源码，自动分配路径上 **每次** `IPAllocator.Get` 固定先调 `store.GetByID`（§9.3），实现是 **全目录 Walk + 逐文件 `os.ReadFile`**（§9.4），且在 **flock 内**。
+
+因此火焰图里常见：
+
+| 符号 / 模式 | 对应代码 | 为何占比高 |
+|-------------|----------|------------|
+| `(*Store).GetByID` | `disk/backend.go` | 每沙箱 ADD 必经（无 requestedIP 时） |
+| `filepath.Walk` / `os.ReadFile` / `syscall.read` | Walk 回调 | 对 dataDir 下 **每个** IP 文件读一遍内容 |
+| 等锁 / `flock` off-CPU | `store.Lock` | 前一沙箱的 GetByID 扫盘拖长临界区 → 后人阻塞 |
+
+关键放大因子：**目录里已有的 IP 占位文件数量 N**（含活跃沙箱 + **孤儿文件**）。
+
+```
+单次 ADD 持锁成本 ≈
+    O(N) × (stat + open + read + 内容比较)   // GetByID
+  + O(1)~O(k) × O_EXCL create                // Reserve，k 为碰撞次数，通常很小
+```
+
+对比：
+
+| 操作 | 随 N 增长 | 持锁？ |
+|------|-----------|--------|
+| **GetByID** | **线性** | 是 |
+| Reserve 成功 | 近似常数 | 是 |
+| round-robin Next | 池很满且碎片时变长，一般次于全目录读 | 是 |
+
+所以：**不是「分配算法本身很复杂」，而是「无 ID→IP 索引，用全表扫描做重复分配检查」**；N 大或并发高时，火焰图上读盘 / GetByID / 等锁会一起抬高，并拖慢整条 bridge ADD。
+
+额外注意：
+
+1. **DEL 的 `ReleaseByID` 同样 Walk** → 删沙箱高峰时也会扫盘，与 ADD 抢同一把 flock。  
+2. **孤儿文件**（未走 CNI DEL）只增不减 → N 单调上升，GetByID 越来越贵，且假「池满」。  
+3. `/12` 可分配空间极大，但 **真正贵的是磁盘上已有文件数**，不是理论地址空间。  
+4. 指定 IP 的 ADD **跳过** GetByID，本机 CRI 路径用不到。
+
+#### 9.9.3 对照与缓解（运维侧）
 
 ```bash
-ls /var/lib/cni/networks/mynet/ | head
+# 占位规模（N 的代理）
+ls /var/lib/cni/networks/mynet/ | wc -l
 cat /var/lib/cni/networks/mynet/last_reserved_ip.0
-# 查看某 IP 归属：
+# 某 IP 归属：
 cat /var/lib/cni/networks/mynet/10.0.0.2
 # 强制回收孤儿（慎用，确认无对应沙箱后）：
 # rm /var/lib/cni/networks/mynet/<orphan-ip>
 ```
 
+| 手段 | 作用 |
+|------|------|
+| 保证 Stop/Remove 走完整 CNI DEL | 控制 N，直接缩短 GetByID |
+| 定期清理确认无主的孤儿 IP 文件 | 同上 |
+| 火焰图对上 `GetByID`/`ReadFile` | 与「纯 flock 空转」区分：是 **持锁读盘** 而非仅排队 |
+| 换带索引/集中式的 IPAM | 避开 host-local 这种「文件名=IP、内容=ID」模型（超出本 conf） |
+
 ### 9.10 小结
 
 **host-local = 本机、基于磁盘文件与目录 flock 的 IPAM。**  
-对本 conf：从 `10.0.0.0/12` 跳过 `.1` round-robin 分配，结果带 `Gateway=10.0.0.1` 与默认路由；占位在 `/var/lib/cni/networks/mynet/`。它不创建网络设备；高并发下其目录锁是 CNI 路径上与 RTNL 并列的重要串行来源。
+对本 conf：从 `10.0.0.0/12` 跳过 `.1` round-robin 分配，结果带 `Gateway=10.0.0.1` 与默认路由；占位在 `/var/lib/cni/networks/mynet/`。自动分配时 **`Get` → `GetByID` 全目录读文件查重**，复杂度随已占用文件数增长且占满 flock，是火焰图上 host-local/bridge 路径常见热点；它不创建网络设备，高并发下与 RTNL 并列构成 CNI 串行来源。
 
 ---
 
@@ -1122,7 +1213,7 @@ Stop：`CNI DEL` → host-local 删 IP 文件释放地址；`ipMasq:true` 时 Te
 | 高并发下 bridge 时延膨胀 | 多沙箱争用内核 **`rtnl_mutex`** |
 | `isGateway` | 幂等配 cni0 IP + sysctl；通常非主瓶颈（§7） |
 | `ipMasq: true` | 每沙箱 xtables/nft；本机 **false**（§8） |
-| **host-local IPAM** | 目录 **flock** 串行分配 + 每 IP 一文件（§9） |
+| **host-local IPAM** | 目录 **flock** 串行；自动分配时 **`GetByID` 全目录 ReadFile**（O(已占文件数)，§9.9） |
 | **loopback** | 每沙箱 `LinkSetUp(lo)` + 插件进程；可与 bridge 并行，仍争 RTNL（§10） |
 
 详见 `sandbox-cold-start-bottleneck-analysis.md`；本文件 §7–§10 为代码语义。
@@ -1157,3 +1248,4 @@ Stop：`CNI DEL` → host-local 删 IP 文件释放地址；`ipMasq:true` 时 Te
 | 2026-07-17 | 新增 §9 IPAM host-local 初稿 |
 | 2026-07-17 | 加深 §9 host-local：二次 exec、flock/O_EXCL、Reserve/Release/CHECK、round-robin、泄漏与并发串行 |
 | 2026-07-17 | 新增 §10 loopback：WithLoNetwork、插件 LinkSetUp、并行 Setup、internal 对照、RTNL/性能 |
+| 2026-07-17 | §9 加深 `GetByID`：自动分配必经、Walk+ReadFile、持锁 O(N)、火焰图热点与孤儿文件放大 |
