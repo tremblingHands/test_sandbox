@@ -6,7 +6,7 @@
 
 用 `crictl` / CRI 创建 Pod 沙箱时，非 hostNetwork 路径会走 CNI。本环境业务网配置为 **bridge + host-local**，配置文件为 `/etc/cni/net.d/10-mynet.conf`。
 
-本文说明：**containerd 如何加载该配置、在 RunPodSandbox 中何时调用 CNI、bridge/host-local 插件实际做了什么、结果如何回写到沙箱状态**。containerd **不实现** bridge 语义，只负责建 netns、按 CNI 规范 exec 插件、消费 Result。
+本文说明：**containerd 如何加载该配置、在 RunPodSandbox 中何时调用 CNI、bridge/host-local 插件实际做了什么、`isGateway` / `ipMasq` / **host-local** / **loopback** 的完整代码路径、结果如何回写到沙箱状态**。containerd **不实现** bridge / IPAM / 网关 / MASQUERADE 语义（loopback 默认也走 CNI 插件；可选内部 `bringUpLoopback`），只负责建 netns、按 CNI 规范 exec 插件、消费 Result。
 
 ### 1.2 相关路径
 
@@ -273,14 +273,809 @@ r, err := n.cni.AddNetworkList(ctx, n.config, ns.config(n.ifName))
                               无 CNI 自带 NAT（ipMasq:false）
 ```
 
-### 6.4 `ipMasq: false` 的影响
+### 6.4 与 loopback / IPAM / 网关 / NAT 的衔接
 
-- Pod → 同节点其它网段 / 外网：依赖宿主机已有转发与 NAT，**本 CNI 配置不提供 MASQUERADE**。
-- 若需要 CNI 自动 NAT，需改 `ipMasq: true`（会引入 xtables/nft 写规则，高并发下另有锁竞争；见冷启动分析）。
+| 字段 / 能力 | 本机 | 作用摘要 | 详节 |
+|-------------|------|----------|------|
+| CNI **loopback** | ✓（`use_internal_loopback=false`） | 把 Pod netns 内 `lo` 设为 UP | **§10** |
+| `ipam.type: host-local` | ✓ | 本机分配 Pod IP、默认 Gateway、落盘占位 | **§9** |
+| `isGateway` | **true** | 在 `cni0` 上配网关 IP + 开 IP forwarding | **§7** |
+| `ipMasq` | **false** | 是否每沙箱写 MASQUERADE | **§8** |
+
+分工：loopback 管 **本 netns 的 lo**；host-local **选出** eth0 地址；isGateway 把网关 **落到 cni0**；ipMasq 管出网 SNAT。
 
 ---
 
-## 7. Result 如何回到 CRI
+## 7. `isGateway` 行为深入分析
+
+### 7.1 谁管、字段含义
+
+| 组件 | 是否解析 |
+|------|----------|
+| containerd / go-cni | **否** |
+| bridge 插件 | **是** |
+
+```go
+IsGW        bool `json:"isGateway"`
+IsDefaultGW bool `json:"isDefaultGateway"`  // 为 true 时会强制 IsGW=true
+ForceAddress bool `json:"forceAddress"`     // cni0 已有不同地址时是否强制替换
+```
+
+本机 conf：**`"isGateway": true`**，未写 `isDefaultGateway`（默认 false）。
+
+`cmdAdd` 开头：
+
+```go
+if n.IsDefaultGW {
+    n.IsGW = true
+}
+```
+
+### 7.2 在 ADD 路径中的位置
+
+```
+bridge cmdAdd
+  ├─ setupBridge(cni0)
+  ├─ setupVeth → eth0
+  ├─ ipam.ExecAdd(host-local)     ← 得到 Pod IP；Gateway 常由 IPAM 填 .1
+  ├─ calcGateways(result, n)      ← ★ 若 IsGW：补全/收集网关
+  ├─ netns 内 ConfigureIface      ← 给 eth0 设 IP；按 Routes 加路由（含默认路由）
+  ├─ if n.IsGW:                   ← ★ 本节主体
+  │     ensureAddr(cni0, gateway) ← 把网关 IP 配到 bridge
+  │     enableIPForward()         ← 写 /proc/sys/.../ip_forward=1
+  └─ if n.IPMasq: ...             ← 与网关无关，见 §8
+```
+
+`isGateway` **不参与** DEL 的专门 teardown：bridge 上的网关地址通常 **跨沙箱复用**，删一个 Pod 不会清掉 `cni0` 的 IP。
+
+### 7.3 网关地址从哪来：`calcGateways` + host-local
+
+#### 7.3.1 host-local（IPAM）
+
+本机未在 conf 里写 `"gateway"`。`host-local` 的 `Range.Canonicalize()`：
+
+```go
+// gateway 为空时默认用子网网络地址的下一个 IP → 即 .1
+if r.Gateway == nil {
+    r.Gateway = ip.NextIP(r.Subnet.IP)
+}
+```
+
+对 `10.0.0.0/12` → 网关 **`10.0.0.1`**。  
+分配结果里 `IPConfig.Gateway = 10.0.0.1`，且 conf 的 `routes: [{dst: 0.0.0.0/0}]` 进入 `result.Routes`（GW 可在 ConfigureIface 时用 `ipc.Gateway` 补全）。
+
+#### 7.3.2 bridge 的 `calcGateways`
+
+```go
+// IPAM 未给 Gateway 且 IsGW：用 Pod 地址所在子网算 .1
+if ipc.Gateway == nil && n.IsGW {
+    ipc.Gateway = calcGatewayIP(&ipc.Address)  // nid = IP.Mask(mask); return NextIP(nid)
+}
+
+// IsDefaultGW：若还没有默认路由，则追加 0.0.0.0/0 via Gateway
+if n.IsDefaultGW && !gws.defaultRouteFound { ... }
+
+// IsGW：把 Gateway/Mask 记入 gws.gws，供后面 ensureAddr(cni0)
+if n.IsGW {
+    gws.gws = append(gws.gws, net.IPNet{IP: ipc.Gateway, Mask: ipc.Address.Mask})
+}
+```
+
+`calcGatewayIP`：`子网网络地址 + 1`，与 host-local 默认一致。
+
+对本机：
+
+| 项 | 值 |
+|----|-----|
+| Pod 例 | `10.a.b.c/12` |
+| Gateway | `10.0.0.1`（host-local 已提供；即使为空也会被 IsGW 算出） |
+| 默认路由 | conf 已有 `0.0.0.0/0`；**不依赖** `isDefaultGateway` |
+| `gws.gws` | `{10.0.0.1, mask /12}` → 随后 `ensureAddr(cni0, ...)` |
+
+若 **`isGateway: false`**：
+
+- 仍可给 eth0 配 IP、装 conf 里的 routes（若 IPAM 提供了 Gateway）  
+- **不会**把地址配到 `cni0`，**不会**由 bridge 强制 `ip_forward=1`  
+- 容器默认路由若指向 `.1`，但 `cni0` 无该地址 → 出网/跨网不通（除非别处配了网关）
+
+### 7.4 容器内：`ConfigureIface`（与 IsGW 间接相关）
+
+在 `IsGW` 块 **之前**执行，使用 `calcGateways` 可能改过的 `result`：
+
+1. `AddrAdd(eth0, podIP/mask)`  
+2. `LinkSetUp(eth0)`  
+3. 遍历 `result.Routes`：`RouteAdd`；若 route.GW 为空，用 `ipc.Gateway`（即 `.1`）
+
+因此：**Pod 里的「下一跳是 10.0.0.1」** 来自 IPAM/routes + ConfigureIface；  
+**宿主机上「10.0.0.1 落在 cni0」** 来自后面的 `IsGW` → `ensureAddr`。
+
+### 7.5 `ensureAddr`：把网关配到 bridge
+
+```go
+func ensureAddr(br, family, ipn *net.IPNet, forceAddress bool) error {
+    // 已有完全相同地址 → 直接返回（多沙箱复用，幂等）
+    // IPv4 或重叠的 IPv6：已有不同地址
+    //   forceAddress=true  → 删旧加新
+    //   false              → 报错
+    netlink.AddrAdd(br, addr)
+    // 固定 bridge MAC，避免随 veth 加入而漂移
+    netlink.LinkSetHardwareAddr(br, br.HardwareAddr)
+}
+```
+
+含义：
+
+- **第一个**需要网关的沙箱：给 `cni0` 加上 `10.0.0.1/12`  
+- **后续**沙箱：地址已存在 → no-op（仍走这段逻辑，但很快返回）  
+- 与 vlan 配置时：地址加在 vlan 子接口而非裸 bridge（本机未配 vlan）
+
+这是 **RTNL / netlink** 路径（`AddrAdd`、`LinkSetHardwareAddr`），和 `ipMasq` 的 xtables **不是同一把锁**，但同属 bridge ADD 墙钟时间。
+
+### 7.6 `enableIPForward`：打开转发
+
+```go
+func enableIPForward(family int) error {
+    if family == FAMILY_V4 {
+        return echo1("/proc/sys/net/ipv4/ip_forward")  // 已是 1 则跳过
+    }
+    return echo1("/proc/sys/net/ipv6/conf/all/forwarding")
+}
+```
+
+- 节点级 sysctl，**不是** per-sandbox 状态  
+- 多沙箱并发 ADD 时反复写同一文件（已为 1 则快速返回）  
+- **只解决「内核是否转发」**；不解决「外网是否认 Pod IP」→ 那是 `ipMasq` / 节点级 MASQUERADE
+
+### 7.7 `isGateway` vs `isDefaultGateway` vs conf `routes`
+
+| 能力 | `isGateway` | `isDefaultGateway` | conf `routes: 0.0.0.0/0` |
+|------|-------------|--------------------|-------------------------|
+| 补全 `ipc.Gateway`（若空） | ✓ | （隐含 IsGW） | — |
+| 把 Gateway 配到 cni0 | ✓ | ✓ | — |
+| 开 ip_forward | ✓ | ✓ | — |
+| 向 result **追加**默认路由 | — | ✓（若尚无） | 已在 IPAM routes 里则 ConfigureIface 会装 |
+
+本机：**`isGateway: true` + routes 已含默认路由** → 不需要 `isDefaultGateway` 也能在 Pod 内装上 `default via 10.0.0.1`。
+
+### 7.8 拓扑与数据包路径（本机）
+
+```
+Pod netns                          Host
+  eth0 10.x.y.z/12
+  default via 10.0.0.1
+         │
+         │ veth
+         ▼
+      cni0 10.0.0.1/12     ← isGateway: ensureAddr
+         │
+         │ ip_forward=1    ← isGateway: enableIPForward
+         ▼
+    其它网段 / 外网出口
+         │
+         └─ SNAT？ 本机 ipMasq:false → 靠节点级 MASQUERADE（§8）
+```
+
+### 7.9 若关闭 `isGateway` 会怎样
+
+| 现象 | 原因 |
+|------|------|
+| `cni0` 可能无 `10.0.0.1` | 不再 `ensureAddr` |
+| Pod 仍可能有 default via `.1` | routes / IPAM Gateway 仍在 |
+| 出 Pod 网段失败（ARP 无应答等） | 网关地址不在 bridge 上 |
+| 跨接口转发可能失败 | 未由插件置 `ip_forward`（若主机原先为 0） |
+
+### 7.10 与性能的关系
+
+- **不是**每沙箱新建一套 iptables；网关 IP 与 forwarding 多为 **幂等复用**。  
+- 仍有每沙箱一次 `calcGateways` +（多数情况下快速）`ensureAddr`/`enableIPForward` 调用；相对 veth/RTNL/masq，通常不是主瓶颈。  
+- 真正贵的仍是：建 veth、挂 bridge、IPAM、以及（若开启）ipMasq。
+
+---
+
+## 8. `ipMasq` 行为深入分析
+
+### 8.1 谁管 `ipMasq`
+
+| 组件 | 是否解析 `ipMasq` |
+|------|-------------------|
+| containerd CRI / go-cni | **否**，只把 conf stdin 交给 `/opt/cni/bin/bridge` |
+| bridge 插件 | **是**，`NetConf.IPMasq` / `IPMasqBackend` |
+| `pkg/ip`（plugins 库） | **是**，真正写 iptables / nftables |
+
+配置字段（`bridge.go`）：
+
+```go
+IPMasq        bool    `json:"ipMasq"`
+IPMasqBackend *string `json:"ipMasqBackend,omitempty"` // "iptables" | "nftables"；nil 则自动选
+```
+
+前置条件：仅在 **L3**（配置了 `ipam`）且 `IPMasq==true` 时执行。本机有 `host-local`，属于 L3。
+
+### 8.2 在 bridge ADD / DEL 中的位置
+
+**ADD**（`cmdAdd`，在 IPAM + 配 eth0 + `isGateway` 之后）：
+
+```go
+if n.IPMasq {
+    ipns := []*net.IPNet{}
+    for _, ipc := range result.IPs {
+        ipns = append(ipns, &ipc.Address)  // 例如 10.x.y.z/12
+    }
+    ip.SetupIPMasqForNetworks(n.IPMasqBackend, ipns, n.Name, args.IfName, args.ContainerID)
+}
+```
+
+注意：传入的是 **带掩码的 Pod 地址**（`ipc.Address`，如 `10.1.2.3/12`），不是整池网段字面量；后续规则里「同网段不伪装」用的是该 IP 所在子网。
+
+**DEL**（`cmdDel`，在删容器侧接口、IPAM DEL 之后）：
+
+```go
+if isLayer3 && n.IPMasq {
+    ip.TeardownIPMasqForNetworks(ipnets, n.Name, args.IfName, args.ContainerID)
+}
+```
+
+`ipMasq: false` 时上述两段 **整段跳过**，冷启动路径不碰 nat 表。
+
+### 8.3 后端选择：`SetupIPMasqForNetworks`
+
+代码：`plugins/pkg/ip/ipmasq_linux.go`。
+
+```go
+if backend == nil {
+    defaultBackend := "iptables"
+    if !SupportsIPTables() && SupportsNFTables() {
+        defaultBackend = "nftables"
+    }
+    backend = &defaultBackend
+}
+switch *backend {
+case "iptables":  setupIPMasqIPTables(...)
+case "nftables":  setupIPMasqNFTables(...)
+}
+```
+
+| 条件 | 默认后端 |
+|------|----------|
+| 未写 `ipMasqBackend`，且主机支持 iptables | **iptables**（优先） |
+| 仅有 nftables | nftables |
+| 显式 `"ipMasqBackend": "nftables"` | nftables |
+
+DEL 时 `TeardownIPMasqForNetworks` 会 **同时尝试** iptables 与 nftables 清理（兼容配置/版本切换残留）。
+
+### 8.4 iptables 后端：每沙箱一套链
+
+代码：`plugins/pkg/ip/ipmasq_iptables_linux.go`。
+
+链名：`FormatChainName(network, containerID)` → 形如 `CNI-<hash>`（最长 28 字符，前缀 `CNI-`）。  
+comment：`name: "<network>" id: "<containerID>"`。  
+历史原因：**忽略 ifName**。
+
+对每个 Pod IP（`SetupIPMasq`）执行：
+
+```text
+# 1) 若无则 NewChain
+iptables -t nat -N CNI-<hash>
+
+# 2) 目的在「该 IP 所在子网」内 → 不伪装（池内/同网段直达）
+-A CNI-<hash> -d <ipn>/mask -m comment --comment "..." -j ACCEPT
+
+# 3) 目的不是组播 → MASQUERADE（出网 SNAT）
+-A CNI-<hash> ! -d 224.0.0.0/4 -m comment --comment "..." -j MASQUERADE
+# IPv6: ! -d ff00::/8
+
+# 4) POSTROUTING：源为该 Pod IP → 跳进专用链
+-A POSTROUTING -s <pod-ip> -m comment --comment "..." -j CNI-<hash>
+```
+
+语义：
+
+```
+Pod 发出的包（源 = pod IP）
+  → POSTROUTING 命中 -s podIP → CNI-<hash>
+       ├─ 目的在同 subnet → ACCEPT（不改源地址）
+       └─ 目的非组播     → MASQUERADE（改成宿主机出口地址）
+```
+
+**N 个沙箱 → N 条 POSTROUTING 跳转 + N 条 `CNI-*` 链 + 每链至少 2 条规则。**  
+每次 ADD 都要：`ListChains`、可能 `NewChain`、多次 `AppendUnique`——走 xtables 用户态/内核路径，高并发下与全局锁争用，成为 CNI 桶内叠加成本。
+
+DEL：`Delete` POSTROUTING 跳转 → `ClearChain` → `DeleteChain`。
+
+### 8.5 nftables 后端（对照）
+
+代码：`plugins/pkg/ip/ipmasq_nftables_linux.go`。
+
+- 表：`cni_plugins_masquerade`（inet family）
+- 链：`masq_checks`；`postrouting` hook（SNAT priority）
+- 每条映射一条 rule，comment 含 `network+ifname+containerID` 的 hash（修了 iptables 忽略 ifname 的问题，并便于 GC）
+- 规则语义等价：`saddr == podIP && daddr != subnet → masquerade`；组播在 postrouting 里先 return
+
+本机默认未指定 backend 时优先 iptables；压测火焰图里常见 `iptables` / `xtables-nft-multi`。
+
+### 8.6 `ipMasq: false` 时的行为
+
+| 步骤 | `ipMasq: true` | `ipMasq: false`（本机） |
+|------|----------------|-------------------------|
+| bridge ADD 末尾 | `SetupIPMasqForNetworks` | **跳过** |
+| bridge DEL | `TeardownIPMasqForNetworks` | **跳过** |
+| 冷启动写 nat | 每沙箱 | **不写** |
+| Pod 出网 SNAT | CNI 提供 | **需其它规则**，否则仅靠路由/转发可能无法访问外网 |
+
+`isGateway: true` **只负责**：
+
+- 给 `cni0` 配网关 IP  
+- `enableIPForward`  
+
+**不负责** SNAT。因此：
+
+```
+转发（isGateway）≠ 出网伪装（ipMasq）
+```
+
+关 `ipMasq` 后若仍要出网，本仓库用 **节点级一条** 规则替代 per-sandbox 链（`scripts/setup.sh --ip-masq false`）：
+
+```text
+-A POSTROUTING -s 10.0.0.0/12 ! -o cni0 -j MASQUERADE
+```
+
+| | CNI per-sandbox（ipMasq true） | 节点级一条（ipMasq false + setup.sh） |
+|--|--|--|
+| 粒度 | 每沙箱 `/32` + `CNI-*` 链 | 整池 `10.0.0.0/12` |
+| 谁写 | bridge ADD/DEL | `setup.sh` 一次 ensure |
+| 冷启动 | 每次改 nat | **不碰** |
+| 出网 SNAT | 有 | 有（本场景对齐） |
+| 池内互访 | 链内 `-d 子网 ACCEPT` | 走 `cni0`，不命中 `! -o cni0` |
+| 组播 | `! -d 224/4` 才 MASQ | 节点级规则未单独排除组播（若需可再收紧） |
+
+### 8.7 与 containerd 路径的关系
+
+```
+setupPodNetwork
+  └─ bridge ADD
+       ├─ RTNL：cni0 / veth / IP …     ← rtnl_mutex
+       ├─ isGateway：ensureAddr(cni0) + ip_forward   ← §7
+       └─ ipMasq? ──true──► iptables/nft 写 nat       ← 本节
+                  └─false─► 无
+```
+
+containerd 侧 **看不到** `ipMasq` 开关；trace 上只表现为 `cni.plugin.bridge` / `cni.setup_pod_network` 变长。要确认是否在做 masq：查 conf、或 `iptables -t nat -L -n` / perf 是否出现 `iptables`。
+
+### 8.8 性能含义（本仓库对照摘要）
+
+在关 printk 之上，仅切 `ipMasq: true → false`（详见 `sandbox-cold-start-bottleneck-analysis.md`）：
+
+| 指标 | ipMasq true | ipMasq false |
+|------|-------------|--------------|
+| `cni.setup` Avg | ~1.21s | **~386ms** |
+| on-CPU `iptables` | ~25% | **~0%** |
+| 吞吐 | ~15.1/s | **~17.3/s（+14%）** |
+| `loopback` span | 几乎不变 | 几乎不变（无 masq） |
+
+结论：
+
+1. **`ipMasq` 是 CNI 桶内、与 bridge 主路径（RTNL）及 `isGateway` 独立的叠加项。**  
+2. 关 masq **不消除** `rtnl_mutex`，也不取消网关/转发。  
+3. 出网可用节点级 MASQUERADE 在冷启动外一次性配置。
+
+复现：
+
+```bash
+bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
+# 或改回 per-sandbox：
+bash scripts/setup.sh --cni-type bridge --ip-masq true
+```
+
+---
+
+
+## 9. host-local 行为深入分析
+
+> 本机 `ipam.type` 就是 **host-local**。本节在 §6 总览之上，按插件源码拆开：**谁调用它、如何解析 conf、如何加锁/落盘、如何 round-robin 分配与释放、和 bridge/isGateway 的边界、高并发含义**。
+
+### 9.1 定位：独立二进制，由 bridge 二次 exec
+
+| 角色 | 做什么 |
+|------|--------|
+| containerd | 不认识 host-local |
+| go-cni | `AddNetworkList` → exec **bridge** |
+| bridge | `ipam.ExecAdd("host-local", stdin)` → `invoke.DelegateAdd` → 再 exec **`/opt/cni/bin/host-local`** |
+| host-local | 只负责 IP 逻辑与磁盘占位，**不**建 veth、**不**改 cni0 |
+
+stdin 仍是 **整份** bridge 网络 JSON（含 `"name":"mynet"`、`"type":"bridge"`、`"ipam":{...}`），host-local 用 `LoadIPAMConfig` 只取 `ipam` + 顶层 `name`。
+
+环境变量（CNI 惯例）：
+
+| 变量 | 沙箱场景典型值 |
+|------|----------------|
+| `CNI_COMMAND` | `ADD` / `DEL` / `CHECK` |
+| `CNI_CONTAINERID` | sandbox ID（= PodSandboxId） |
+| `CNI_IFNAME` | `eth0`（go-cni 默认前缀） |
+| `CNI_NETNS` | `/var/run/netns/...`（host-local **几乎不用** netns，只做分配） |
+| `CNI_PATH` | `/opt/cni/bin` |
+
+代码入口：`plugins/ipam/host-local/main.go` → `cmdAdd` / `cmdDel` / `cmdCheck`。
+
+### 9.2 本机配置如何被理解
+
+```json
+"ipam": {
+  "type": "host-local",
+  "subnet": "10.0.0.0/12",
+  "routes": [{ "dst": "0.0.0.0/0" }]
+}
+```
+
+`LoadIPAMConfig`（`backend/allocator/config.go`）：
+
+1. 反序列化整网 conf → 取 `ipam`。  
+2. 旧式单字段 `subnet`（嵌在 `IPAMConfig` 匿名 `*Range`）→ **prepend** 成 `Ranges: []RangeSet{{one Range}}`。  
+3. `Ranges[i].Canonicalize()`。  
+4. `IPAM.Name = Net.Name` → **`mynet`**（决定数据目录子路径）。  
+5. `routes` 原样保留到 ADD 结果。
+
+`Canonicalize` 默认值（subnet = `10.0.0.0/12`）：
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| Gateway | **`10.0.0.1`** | `NextIP(网络地址)`；conf 未写 gateway |
+| RangeStart | `10.0.0.1` | 与 Gateway 相同，但迭代会 **跳过** Gateway |
+| RangeEnd | 子网 last usable | `lastIP(subnet)` |
+| 过小网段 | `/31` `/32` | 直接 error |
+
+可分配集合：约 **`10.0.0.2` … 广播前**，**永不分配** `10.0.0.1`。
+
+可选但本机未用的字段：`dataDir`、`rangeStart`/`rangeEnd`、`gateway`、`resolvConf`、`ranges`（多段）、CNI_ARGS 请求固定 IP。
+
+### 9.3 ADD：完整步骤
+
+```go
+// cmdAdd 摘要
+ipamConf, _ := LoadIPAMConfig(stdin, args)
+store, _ := disk.New(ipamConf.Name, ipamConf.DataDir)  // mynet + 默认 dataDir
+defer store.Close()
+
+for idx, rangeset := range ipamConf.Ranges {
+    alloc := NewIPAllocator(&rangeset, store, idx)
+    ipConf, err := alloc.Get(ContainerID, IfName, requestedIP) // 本机 requestedIP=nil
+    result.IPs = append(result.IPs, ipConf)
+}
+result.Routes = ipamConf.Routes
+return PrintResult(result)
+```
+
+`IPAllocator.Get`（持锁全程）：
+
+```go
+a.store.Lock()   // → /var/lib/cni/networks/mynet/lock 上 flock
+defer a.store.Unlock()
+
+// 1) 禁止重复：同一 (id, ifname) 已在本 range 有 IP → error（CNI SPEC）
+allocatedIPs := a.store.GetByID(id, ifname)
+...
+
+// 2) round-robin 迭代
+iter, _ := a.GetIter()  // 从 last_reserved_ip.0 + 1 开始
+for {
+    reservedIP, gw = iter.Next()  // 跳过 Gateway；扫完一圈 → nil
+    if reservedIP == nil { break }
+    if a.store.Reserve(id, ifname, reservedIP.IP, rangeID) {
+        break  // O_EXCL 创建成功
+    }
+}
+```
+
+成功返回：
+
+```go
+IPConfig{ Address: <ip>/12, Gateway: 10.0.0.1 }
+```
+
+### 9.4 磁盘后端：目录、锁、文件语义
+
+代码：`backend/disk/backend.go`、`lock.go`。
+
+**默认路径**（`dataDir` 空）：
+
+```
+/var/lib/cni/networks/mynet/
+├── lock                 # FileLock → flock 互斥
+├── last_reserved_ip.0   # rangeID=0 的游标（纯 IP 字符串）
+├── 10.0.0.2             # 文件名=IP；内容见下
+├── 10.0.0.3
+└── ...
+```
+
+**锁**：
+
+```go
+// NewFileLock：若 path 是目录，锁文件为 path+"/lock"
+l.f.Lock()   // 排他 flock；跨 host-local 进程
+```
+
+所有 `Get` / `Release` / `FindByID` 在业务逻辑外包一层 `store.Lock()`，故 **同一 network name 上 ADD/DEL 全局串行**。
+
+**Reserve（占 IP）**：
+
+```go
+f, err := os.OpenFile(fname, os.O_RDWR|os.O_EXCL|os.O_CREATE, 0600)
+// 已存在 → return false, nil（换下一个 IP）
+f.WriteString(id + "\r\n" + ifname)
+WriteFile("last_reserved_ip."+rangeID, ip.String())
+```
+
+双重保险：flock 串行化进程；`O_EXCL` 防止异常并发下同 IP 双开。
+
+**ReleaseByID（DEL）**：
+
+```go
+// Walk 目录，内容匹配 "id\r\nifname" 则 os.Remove
+// 兼容旧格式：仅匹配 id
+```
+
+注意：DEL **不**回退 `last_reserved_ip`（游标只前进），符合「尽量不立刻复用刚释放 IP」的 round-robin 意图。
+
+**GetByID**：Walk 收集属于该 `(id, ifname)` 的所有 IP 文件名。  
+**CHECK**：`FindByID` 只要该容器还有任一占位文件即成功（不校验地址是否仍在网卡上）。
+
+### 9.5 Round-robin 细节
+
+`GetIter`：
+
+- 读 `last_reserved_ip.<rangeID>`  
+- 若该 IP 仍落在当前 Ranges 内 → 从它开始（`Next` 先 +1）  
+- 否则从 `RangeStart` 起  
+
+`Next`：
+
+- 跳过 `Gateway`  
+- 到 `RangeEnd` 后切到下一 Range（本机只有一段）并绕回  
+- `cur == startIP` → 池耗尽，返回 nil  
+
+设计意图（代码注释）：崩溃循环的容器不会一直拿到同一 IP，直到扫过整池。
+
+### 9.6 DEL 与 bridge 的配合
+
+```
+bridge cmdDel
+  ├─ 在 netns 内 DelLinkByName(eth0)  （可能已空）
+  ├─ ipam.ExecDel("host-local")       ← host-local cmdDel
+  │     └─ 对每个 rangeset：Release(containerID, ifName)
+  └─ （若 ipMasq）TeardownIPMasq …
+```
+
+host-local `cmdDel`：即使某 range Release 失败也继续其它 range，最后汇总 error。  
+**泄漏场景**：进程被 kill、磁盘满、手动删 netns 但未走 CNI DEL → IP 文件残留 → 地址无法再分配，需删文件或重建 dataDir。  
+源码对 **GC** 标注 `FIXME`（无自动回收孤儿文件）。
+
+### 9.7 分配结果如何进入 Pod（非 host-local 职责，但闭环）
+
+host-local **只 PrintResult**；真正配网卡的是 bridge：
+
+1. `calcGateways`（§7）：若 Gateway 空且 isGateway，再算 `.1`（本机 IPAM 已填）  
+2. `ConfigureIface(eth0)`：`AddrAdd` + `RouteAdd(0.0.0.0/0 via Gateway)`  
+3. `ensureAddr(cni0, 10.0.0.1)`：宿主机侧网关  
+
+故：host-local 决定 **「谁拿到哪个 IP」**；bridge+isGateway 决定 **「IP/路由是否生效、网关是否在 cni0」**。
+
+### 9.8 边界与常见故障
+
+| 现象 | 机制 |
+|------|------|
+| `duplicate allocation is not allowed` | 同一 sandboxID+eth0 再次 ADD 且旧文件仍在 |
+| `no IP addresses available` | 池满或大量孤儿文件占满 |
+| `requested ip is subnet's gateway` | 显式请求 `.1` |
+| 多节点 IP 冲突 | host-local **仅本机**；不能靠共享 NFS dataDir 当集群 IPAM（锁非集群锁） |
+| CHECK 过但 Pod 无 IP | CHECK 只看磁盘文件，不看 netns |
+
+```
+host-local     → PodIP + Gateway + Routes + 磁盘占位
+ConfigureIface → eth0 配置
+isGateway      → cni0 上 Gateway + ip_forward
+ipMasq         → 出网 SNAT（本机 false）
+```
+
+### 9.9 高并发与性能
+
+```
+沙箱1 bridge ──► host-local ──► flock(mynet/lock) ──► Reserve ──► unlock
+沙箱2 bridge ──► host-local ──► 等待 flock ………………… ──► Reserve ──► unlock
+沙箱N …
+```
+
+| 点 | 说明 |
+|----|------|
+| **串行点** | `/var/lib/cni/networks/mynet/lock`（用户态 flock） |
+| **与 RTNL** | 不同锁；但都在 `cni.plugin.bridge` 墙钟内串起来 |
+| **与 xtables** | ipMasq 关闭后主剩 RTNL + 本锁 |
+| **进程成本** | 每沙箱额外 fork/exec 一次 `host-local` |
+| **磁盘** | 每 IP create/unlink 小文件；池极大且很满时 `Next` 扫描变长 |
+| **观测** | `ls /var/lib/cni/networks/mynet/`；perf/off-CPU 上可见等锁；profile 无单独 host-local span（叠在 bridge 下） |
+
+调试命令：
+
+```bash
+ls /var/lib/cni/networks/mynet/ | head
+cat /var/lib/cni/networks/mynet/last_reserved_ip.0
+# 查看某 IP 归属：
+cat /var/lib/cni/networks/mynet/10.0.0.2
+# 强制回收孤儿（慎用，确认无对应沙箱后）：
+# rm /var/lib/cni/networks/mynet/<orphan-ip>
+```
+
+### 9.10 小结
+
+**host-local = 本机、基于磁盘文件与目录 flock 的 IPAM。**  
+对本 conf：从 `10.0.0.0/12` 跳过 `.1` round-robin 分配，结果带 `Gateway=10.0.0.1` 与默认路由；占位在 `/var/lib/cni/networks/mynet/`。它不创建网络设备；高并发下其目录锁是 CNI 路径上与 RTNL 并列的重要串行来源。
+
+---
+
+
+## 10. loopback 行为深入分析
+
+### 10.1 为什么每个沙箱都要弄 lo
+
+Linux `CLONE_NEWNET` 新建的 netns 里会有 **`lo` 接口，默认常为 DOWN**。  
+若不 UP：
+
+- 进程无法用 `127.0.0.1` / `::1`
+- 依赖 localhost 的健康检查、DNS stub、部分 runtime 逻辑会失败
+
+CRI 约定：非 hostNetwork 沙箱必须有可用 loopback。containerd 提供两条路（互斥）：
+
+| 配置 `use_internal_loopback` | 本机 | 行为 |
+|------------------------------|------|------|
+| **`false`（默认）** | ✓ | Load 时 `WithLoNetwork` → Setup 时 exec `/opt/cni/bin/loopback` |
+| `true` | — | `setupPodNetwork` 开头直接 `bringUpLoopback(netns)`，**不**加载 CNI loopback |
+
+`config.toml`：`use_internal_loopback = false`。
+
+### 10.2 containerd 如何挂上 loopback 网络
+
+`service_linux.go`：
+
+```go
+networkAttachCount := 2                    // lo + 业务网；内部 lo 时为 1
+cni.New(..., WithMinNetworkCount(2), ...)
+
+cniLoadOptions():
+  return []cni.Opt{cni.WithLoNetwork, cni.WithDefaultConf}
+```
+
+`WithLoNetwork`（go-cni）**不读磁盘**，注入内嵌 conflist：
+
+```json
+{
+  "cniVersion": "0.3.1",
+  "name": "cni-loopback",
+  "plugins": [{ "type": "loopback" }]
+}
+```
+
+内存中 networks 顺序：
+
+```
+[0] cni-loopback  ifName="lo"
+[1] mynet/bridge  ifName="eth0"   ← 10-mynet.conf
+```
+
+**不是** `/etc/cni/net.d` 里的文件；与 `max_conf_num` 无关。
+
+### 10.3 Setup 时如何调用（与 bridge 并行）
+
+本机 `setup_serially = false` → `attachNetworks` **并行**：
+
+```
+go-cni Setup
+  ├─ goroutine: Network[cni-loopback].Attach
+  │     └─ AddNetworkList → exec /opt/cni/bin/loopback ADD
+  │           CNI_IFNAME=lo, CNI_NETNS=/var/run/netns/...
+  └─ goroutine: Network[mynet].Attach
+        └─ exec bridge ADD → host-local …
+```
+
+注释（CRI config）：lo 在创建 netns 时已存在，与 eth0 **并行安全**。  
+失败任一网络 → Setup 失败（firstError）。
+
+Remove/Stop：`netPlugin.Remove` 会对 **每个** network 调 DEL（含 loopback `LinkSetDown`）。
+
+### 10.4 插件 ADD：几乎只做一件事
+
+代码：`plugins/main/loopback/loopback.go`。
+
+```go
+func cmdAdd(args *skel.CmdArgs) error {
+    args.IfName = "lo"   // 强制 lo，忽略 CNI_IFNAME 其它值
+    ns.WithNetNSPath(args.Netns, func(...) {
+        link, _ := LinkByName("lo")
+        netlink.LinkSetUp(link)          // ★ 唯一关键副作用
+
+        // 读已有 IPv4/IPv6 地址（内核通常已有 127.0.0.1、::1）
+        // 若存在非 loopback 地址 → error
+        ...
+    })
+    // 构造 Result 并 PrintResult（或透传 PrevResult）
+}
+```
+
+要点：
+
+| 行为 | 说明 |
+|------|------|
+| **不创建** `lo` | 内核随 netns 已创建 |
+| **不分配** IP | 不跑 IPAM；沿用内核 loopback 地址 |
+| **只 UP** | `LinkSetUp(lo)` |
+| **强制 ifName=lo** | 配置里写别的接口名也无效 |
+| Result | 报告 `lo` + 已有 127.0.0.1/`::1`（若有）；CRI **不用** 这些 IP 当 Pod IP |
+
+### 10.5 DEL / CHECK
+
+**DEL**：
+
+```go
+LinkSetDown(lo)   // 在 netns 内
+// netns 路径已不存在 → 视为成功（幂等）
+```
+
+随后 containerd 还会 `NetNS.Remove()` 拆掉整个命名空间；DEL 里 Down 更多是 CNI 语义完整。
+
+**CHECK**：`lo` 必须存在且 `FlagUp`，否则 `"loopback interface is down"`。
+
+### 10.6 内部路径：`bringUpLoopback`（对照）
+
+`use_internal_loopback=true` 时（本机未开）：
+
+```go
+// sandbox_run_linux.go
+ns.WithNetNSPath(netns, func() {
+    link, _ := LinkByName("lo")
+    return LinkSetUp(link)
+})
+```
+
+语义与插件 ADD **等价**（只 UP），但：
+
+- **少一次** fork/exec `loopback`  
+- Load 时 **不** `WithLoNetwork`；`networkAttachCount=1`  
+- Setup **之前**同步调用，不进 go-cni 并行 Attach  
+
+压测若 loopback span 可观，可对照开内部路径（换的是插件进程开销，不是 RTNL 本身）。
+
+### 10.7 与 RTNL / 性能
+
+| 点 | 说明 |
+|----|------|
+| netlink | `LinkSetUp(lo)` / DEL 时 `LinkSetDown` 走内核，可能触及 **`rtnl_mutex`** |
+| 每沙箱一次 | 与 bridge 并行时仍占一次插件进程 + 一次（或几次）netlink |
+| profile | 常见独立 span `cni.plugin.loopback`（冷启动分析里曾有 ~1s / 百毫秒级 Avg，视争用而定） |
+| 关 ipMasq/printk 后 | loopback span **几乎不变**（无 masq 路径）→ 说明成本在 lo 自身/RTNL，不在 NAT |
+| 与 bridge | **不同插件、可并行**；但抢同一把（或相关）内核锁时仍互相拖慢 |
+
+```
+新建 netns → lo 存在且 DOWN
+     │
+     ├─（默认）CNI loopback ADD → LinkSetUp(lo) → 127.0.0.1 可用
+     └─（可选）bringUpLoopback → 同上，无额外进程
+     │
+     └─ 并行/先后：bridge + host-local → eth0
+```
+
+### 10.8 边界与注意
+
+1. **Pod IP 不是 lo 上的 127.0.0.1**；CRI 看 `eth0`。  
+2. hostNetwork 沙箱 **不跑** 本段 CNI（用宿主机 lo）。  
+3. loopback 插件 **不管** eth0 / cni0 / IPAM。  
+4. 若只关 bridge、误删 WithLoNetwork 且未开 internal → netns 内 lo 可能一直 DOWN。  
+5. 调试：`nsenter --net=/var/run/netns/<x> ip link show lo`。
+
+### 10.9 小结
+
+**loopback = 把新 netns 里已存在的 `lo` 设为 UP。**  
+本机通过 go-cni 内嵌 `cni-loopback` 配置，在 Setup 时与 bridge **并行** exec `/opt/cni/bin/loopback`；不做 IPAM、不创建接口。成本主要是每沙箱一次插件进程 + `LinkSetUp` 的 netlink；高并发下会体现在 `cni.plugin.loopback` span，并与其它配网操作争用 RTNL。
+
+---
+
+## 11. Result 如何回到 CRI
 
 1. go-cni 合并各 network 的 Result。  
 2. CRI 检查 **`eth0`**（默认前缀 `eth` + index 0）是否有 IP。  
@@ -292,58 +1087,63 @@ r, err := n.cni.AddNetworkList(ctx, n.config, ns.config(n.ifName))
 
 ---
 
-## 8. 端到端时序（本机 bridge 配置）
+## 12. 端到端时序（本机 bridge 配置）
 
 ```
 crictl runp / RunPodSandbox
   │
   ├─ 创建 netns @ /var/run/netns/...
   │
-  ├─ go-cni Setup（并行）
-  │    ├─ loopback ADD  →  lo up
+  ├─ go-cni Setup（并行；use_internal_loopback=false）
+  │    ├─ loopback ADD  →  LinkSetUp(lo)，无 IPAM
   │    └─ bridge ADD
   │         ├─ 确保 / 复用 cni0
   │         ├─ 建 veth，容器端为 eth0
   │         ├─ host-local 分配 10.0.0.0/12 地址
-  │         ├─ eth0 配 IP + 默认路由；cni0 作网关
-  │         └─ 不开 ipMasq
+  │         ├─ host-local ADD：锁 mynet/、分配 10.x/12、写 IP 文件（Gateway=10.0.0.1）
+  │         ├─ ConfigureIface：eth0 IP + default via 10.0.0.1
+  │         ├─ isGateway:true → ensureAddr(cni0, 10.0.0.1) + ip_forward=1
+  │         └─ ipMasq:false → 不写 MASQUERADE
   │
   ├─ 缓存 sandbox.IP = eth0 地址
   ├─ NewTask / Start pause（加入该 netns）
   └─ SANDBOX_READY
 ```
 
-Stop：`CNI DEL`（bridge + loopback + 释放 host-local IP）→ 删 netns。
+Stop：`CNI DEL` → host-local 删 IP 文件释放地址；`ipMasq:true` 时 Teardown masq；**不会**清掉 cni0 网关地址 → 删 netns。
 
 ---
 
-## 9. 与性能/瓶颈的关系（摘要）
+## 13. 与性能/瓶颈的关系（摘要）
 
 | 现象 | 机制 |
 |------|------|
-| profile 中 `cni.setup_pod_network` 占比高 | 每沙箱一次（或并行两次）插件 exec + 大量 netlink |
-| 高并发下 bridge 时延膨胀 | 多沙箱争用内核 **`rtnl_mutex`**（建 veth、挂 bridge、设地址等） |
-| `ipMasq: true` 时额外开销 | xtables/nft 全局锁（本机当前为 **false**，无此项） |
-| loopback 不可忽视 | 默认每个沙箱仍跑 loopback ADD，与 bridge 共用 RTNL |
+| profile 中 `cni.setup_pod_network` 占比高 | 每沙箱插件 exec + 大量 netlink |
+| 高并发下 bridge 时延膨胀 | 多沙箱争用内核 **`rtnl_mutex`** |
+| `isGateway` | 幂等配 cni0 IP + sysctl；通常非主瓶颈（§7） |
+| `ipMasq: true` | 每沙箱 xtables/nft；本机 **false**（§8） |
+| **host-local IPAM** | 目录 **flock** 串行分配 + 每 IP 一文件（§9） |
+| **loopback** | 每沙箱 `LinkSetUp(lo)` + 插件进程；可与 bridge 并行，仍争 RTNL（§10） |
 
-更细的 RTNL / printk / 对照实验见 `sandbox-cold-start-bottleneck-analysis.md`。
+详见 `sandbox-cold-start-bottleneck-analysis.md`；本文件 §7–§10 为代码语义。
 
 ---
 
-## 10. 常见注意点
+## 14. 常见注意点
 
 1. **containerd 不解析 `bridge`/`isGateway`/`ipMasq`**，只把 JSON 交给插件。  
-2. **`max_conf_num=1`** 时，目录里多个 conf 只认字典序第一个；改网时注意文件名排序。  
-3. **hostNetwork** 沙箱完全跳过 CNI。  
-4. **业务容器**不重新跑 CNI；共享沙箱 netns。  
-5. 出网失败时先查：`ipMasq`、宿主机转发、路由、firewall，再查 CNI Result / `cni0` / veth。  
-6. 调试可看：containerd 日志中的 CNI result、`ip link`/`bridge link`、`/var/lib/cni/networks/mynet/`、插件 stderr。
+2. **`isGateway` ≠ `ipMasq`**：前者转发/网关，后者出网 SNAT。  
+3. **`max_conf_num=1`** 时只认字典序第一个 conf。  
+4. **hostNetwork** 沙箱完全跳过 CNI（也就没有 masq）。  
+5. **业务容器**不重新跑 CNI；共享沙箱 netns。  
+6. 出网失败时区分：无转发（isGateway/sysctl）、无 SNAT（ipMasq/节点级规则）、路由/firewall。  
+7. 调试：`iptables -t nat -L -n -v`、`nft list table inet cni_plugins_masquerade`、CNI result、`/var/lib/cni/networks/mynet/`。
 
 ---
 
-## 11. 一句话总结
+## 15. 一句话总结
 
-配置 `/etc/cni/net.d/10-mynet.conf` 且 `max_conf_num=1` 时，containerd 对每个非 hostNetwork 沙箱：先建 netns，再经 go-cni **并行**执行 loopback + bridge；bridge 负责 `cni0`、veth、`host-local` 分配 `10.0.0.0/12`、网关与转发，**不做 MASQUERADE**；containerd 只缓存 `eth0` IP，并把该 netns 交给后续 pause/容器使用。
+本机配置下，containerd 建 netns 后 **并行**跑 **loopback**（`lo` UP）与 **bridge**；bridge 内 **host-local** 分配 `10.0.0.0/12`；**isGateway** 把 `10.0.0.1` 落到 `cni0` 并开转发；**ipMasq:false** 不做 per-sandbox MASQUERADE。loopback / IPAM / 网关 / SNAT 职责分离。
 
 ---
 
@@ -352,3 +1152,8 @@ Stop：`CNI DEL`（bridge + loopback + 释放 host-local IP）→ 删 netns。
 | 日期 | 说明 |
 |------|------|
 | 2026-07-17 | 初稿：基于本机 `10-mynet.conf` 与 containerd/go-cni/bridge 代码路径的 CNI 行为分析 |
+| 2026-07-17 | 新增 `ipMasq` 代码路径（现 §8） |
+| 2026-07-17 | 新增 §7 `isGateway`（calcGateways / ensureAddr / ip_forward / 与 IPAM、isDefaultGateway、ipMasq 关系） |
+| 2026-07-17 | 新增 §9 IPAM host-local 初稿 |
+| 2026-07-17 | 加深 §9 host-local：二次 exec、flock/O_EXCL、Reserve/Release/CHECK、round-robin、泄漏与并发串行 |
+| 2026-07-17 | 新增 §10 loopback：WithLoNetwork、插件 LinkSetUp、并行 Setup、internal 对照、RTNL/性能 |
