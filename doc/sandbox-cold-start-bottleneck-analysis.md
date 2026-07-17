@@ -388,6 +388,33 @@ sudo dmesg -n 4
 sudo dmesg -n 7
 ```
 
+#### 对照实验：内核去掉 netlink/`br_info` 路径上的 `printk`（已完成）
+
+内核 commit **`0d91342dba12`**（`disable netlink printk`）：注释 `br_stp.c` 中 `br_set_state` 成功路径的 `br_info`，并一并关掉 `net/core/dev.c`、`net/ipv6/addrconf.c` 等配网热路径上的相关 `printk`。数据目录：
+
+| 场景 | 路径 |
+|------|------|
+| 基线（含 printk） | `profile/containerd-0-127_workers-cores-128-255_workers-nums-127_sandbox-0-255` |
+| 关 printk | `profile/..._disable-printk` |
+
+同配置：128 workers、containerd 绑核 1–4、`--duration 60`。
+
+| 指标 | 基线 | 关 printk | 变化 |
+|------|------|-----------|------|
+| 吞吐（沙箱/s，总沙箱÷采样窗） | **~12.8**（747 / 58.4s） | **~15.1**（895 / 59.1s） | **+18%**（约 11→15 量级） |
+| 端到端 P50 / P95 / P99 | 11.2 / **15.6** / 17.1 s | 9.5 / **13.1** / 14.3 s | P95 **−16%** |
+| `cni.setup_pod_network` Avg / P95 | **5.15s** / 6.77s | **1.21s** / 2.41s | Avg **约 −77%** |
+| `cri.sandbox.run` Avg / P95 | 13.1s / 19.4s | 8.9s / 12.2s | 明显下降 |
+| on-CPU `printk` / `pl011_console_write` | 有（约 1.8%） | **消失** | 串口路径被打掉 |
+| on-CPU `rtnl_setlink` / `br_add_if` | **~7.3%** | **~0.4%** | 持锁临界区 CPU 占比大降 |
+
+**解读**：
+
+1. 关 `printk` 后 **CNI 不再是第一大阶段**；剩余时间更多落在 `client.NewContainer` / snapshotter、`container.NewTask` / cgroup（`runc.cgroup.apply`）等。
+2. 这直接验证了 §7.5 的因果：`br_info`→串口不是旁路噪音，而是 **RTNL 持锁放大器**；去掉后配网墙钟与 `rtnl_setlink` 帧同步下降。
+3. 吞吐仍受 `rtnl_mutex`、shim/cgroup、4 核漏斗等约束，故不是线性翻倍；但 **~+18% 吞吐、CNI Avg 降到约 1/4** 已说明串口日志是高杠杆项。
+4. 生产侧更稳妥的等价手段仍是 **`dmesg -n 4` / 调低 console_loglevel** 或不用串口 console；内核注释 `br_info` 适合对照实验，不宜长期作为唯一修复。
+
 ### 7.6 火焰图中与 RTNL 相关的量化线索
 
 | 符号 | 约占比（on-CPU 核 1–4） | 含义 |
@@ -416,7 +443,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 7.8 小结（瓶颈 A）
 
-**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）。本配置下的 masquerade/iptables 是同桶内的额外开销，应与 RTNL / 日志开销分开评估。
+**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）；**内核对照关掉该 `printk` 后，`cni.setup` Avg 从 ~5.2s 降到 ~1.2s、吞吐约 +18%**，印证其为高杠杆放大器。本配置下的 masquerade/iptables 是同桶内的额外开销，应与 RTNL / 日志开销分开评估。
 ---
 
 ## 8. 瓶颈 B：shim / NewTask 创建慢
@@ -507,6 +534,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | B. CNI 改为 ipvlan | 减少 veth/bridge 类链路操作 | `cni.setup` 与 `rtnl_*` 帧下降 |
 | C. 仅关 `ipMasq` | 去掉本配置的 xtables 叠加 | `cni.setup` 可能下降；**`rtnl_*` / loopback 仍在** |
 | C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
+| C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
@@ -791,15 +819,17 @@ ls "$RESULT/perf"/*.svg
 
 | 层次 | 结论 |
 |------|------|
-| 端到端 | 128 并发 P95 ≈ **15.6s** |
-| 最大阶段（profile） | **CNI 配网 ~49%**，**shim/NewTask ~41%** |
+| 端到端（基线） | 128 并发 P95 ≈ **15.6s**，吞吐约 **12.8** 沙箱/s |
+| 端到端（关 printk，`0d91342dba12`） | P95 ≈ **13.1s**，吞吐约 **15.1** 沙箱/s；`cni.setup` Avg **5.15→1.21s** |
+| 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
+| 关 printk 后主阶段 | CNI 大幅下降；**NewContainer / NewTask / cgroup** 相对更突出 |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
-| 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（~6.7%，见 §7.5） |
+| 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
 | 瓶颈 A 配置叠加 | 本环境 `ipMasq` 额外引入 xtables（与 RTNL 分开看） |
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：先由 profile 看到 CNI 配网最重，再由 perf 下钻到 **`rtnl_mutex` 全局串行**（含 loopback）；持锁路径上还有 bridge STP 日志打到串口的 **`printk` 放大**；shim、metadata DB 与 4 核漏斗是并列的其它瓶颈；iptables/masquerade 只是当前 CNI 配置下的叠加项，不是整篇分析的主线。带 TRACE / debug 符号的 containerd、shim、runc、CNI 编译安装见 **§13**。
+**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（内核关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4）。之后剩余瓶颈转向 shim/cgroup、metadata 与 4 核漏斗；iptables/masquerade 仍是配置叠加项。带 TRACE / debug 符号的编译安装见 **§13**。
 
 ---
 
@@ -816,3 +846,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-16 | **§13**：补充 containerd / shim / runc 带 TRACE 的编译安装与验证 |
 | 2026-07-16 | **§13**：补充 debug 符号构建（`GODEBUG=1` / `-N -l`、禁 `-s -w`）及 CNI（`/home/nathan/plugins` → `/opt/cni/bin`），便于 perf 解析符号 |
 | 2026-07-16 | **§13**：按本机实测改写：显式 `go build` + `-N -l`；`CGO_ENABLED=0` / runc `netgo`；注明 Makefile `GODEBUG` 对 containerd/shim 的坑 |
+| 2026-07-17 | §7.5：写入内核 `0d91342dba12` 关 printk 对照（吞吐 ~12.8→15.1/s，`cni.setup` 5.15→1.21s） |
