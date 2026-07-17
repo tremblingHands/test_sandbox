@@ -21,6 +21,7 @@
 #                     采样时长默认与 --duration 保持一致
 #         --perf-frequency HZ        采样频率（默认: 99）
 #         --perf-duration SEC        采样时长（默认: 与 duration 相同）
+#         --perf-call-graph MODE     仅 on-CPU 回溯（默认: fp；Go 符号用 dwarf,65528）
 #     --resources  采集系统资源时序（CPU/内存/磁盘/沙箱数/containerd/cgroup）
 #         --resource-interval SEC    采样间隔（默认: 0.1）
 #
@@ -33,6 +34,7 @@
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --pprof -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --pprof --perf -- --duration 60
+#     ./multi_single_cold_start.sh 0-7 4 0 --perf --perf-call-graph dwarf,65528 -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --resources -- --duration 60
 #
 # 前置条件:
@@ -78,6 +80,7 @@ PPROF_SERIES_INTERVAL=1
 PERF=false
 PERF_FREQUENCY=99
 PERF_DURATION=""               # 空 = 自动与 duration 对齐
+PERF_CALL_GRAPH="fp"           # 仅 on-CPU；默认 fp（与历史 -g 一致）
 PERF_SANDBOX=false
 RESOURCES=false
 RESOURCE_INTERVAL=0.1
@@ -117,13 +120,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --perf)
             PERF=true; shift
-            # 可选: --perf 后跟子选项 (--perf-frequency HZ --perf-duration SEC)
+            # 可选: --perf 后跟子选项 (--perf-frequency / --perf-duration / --perf-call-graph)
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --perf-frequency)
                         PERF_FREQUENCY="$2"; shift 2 ;;
                     --perf-duration)
                         PERF_DURATION="$2"; shift 2 ;;
+                    --perf-call-graph)
+                        PERF_CALL_GRAPH="$2"; shift 2 ;;
                     --)
                         shift; PASSTHRU_ARGS=("$@"); break 2 ;;
                     *)
@@ -305,11 +310,11 @@ if $PPROF; then
 fi
 if $PERF; then
     echo "perf:      已开启 (on/off CPU 火焰图)"
-    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz, on-CPU call-graph: ${PERF_CALL_GRAPH}"
 fi
 	if $PERF_SANDBOX; then
 	    echo "perf_sbox: 已开启 (沙箱火焰图, CPUs: ${SANDBOX_CPUS})"
-	    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+	    echo "           采样时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz, on-CPU call-graph: ${PERF_CALL_GRAPH}"
 	fi
 if $RESOURCES; then
     echo "resources: 已开启 (系统资源时序)"
@@ -422,24 +427,26 @@ fi
 
 if $PERF; then
     echo "[perf] 启动 perf 火焰图抓取..."
-    echo "[perf]   时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+    echo "[perf]   时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz, call-graph: ${PERF_CALL_GRAPH}"
 
     sudo "${PERF_SCRIPT}" capture \
         --output-dir "${PERF_OUTPUT_DIR}" \
         --duration "${PERF_DURATION}" \
-        --frequency "${PERF_FREQUENCY}" &
+        --frequency "${PERF_FREQUENCY}" \
+        --call-graph "${PERF_CALL_GRAPH}" &
     PERF_PID=$!
     echo "[perf] perf 抓取进程 PID: $PERF_PID"
 fi
 if $PERF_SANDBOX; then
     echo "[perf_sbox] 启动沙箱火焰图抓取..."
-    echo "[perf_sbox]   CPUs: ${SANDBOX_CPUS}, 时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz"
+    echo "[perf_sbox]   CPUs: ${SANDBOX_CPUS}, 时长: ${PERF_DURATION}s, 频率: ${PERF_FREQUENCY}Hz, call-graph: ${PERF_CALL_GRAPH}"
 
     sudo "${PERF_SANDBOX_SCRIPT}" capture \
         --cpus "${SANDBOX_CPUS}" \
         --output-dir "${PERF_SANDBOX_OUTPUT_DIR}" \
         --duration "${PERF_DURATION}" \
-        --frequency "${PERF_FREQUENCY}" &
+        --frequency "${PERF_FREQUENCY}" \
+        --call-graph "${PERF_CALL_GRAPH}" &
     PERF_SANDBOX_PID=$!
     echo "[perf_sbox] 抓取进程 PID: $PERF_SANDBOX_PID"
 fi

@@ -11,12 +11,16 @@
 #     --output-dir DIR          输出目录（默认: results/perf）
 #     --duration SEC            采样时长（默认: 30）
 #     --frequency HZ            on-CPU 采样频率 Hz（默认: 99）
+#     --call-graph MODE         仅 on-CPU 回溯方式（默认: fp）
+#                              fp | dwarf | dwarf,SIZE | fp,dwarf | lbr
+#                              Go/aarch64 用户态符号不全时用 dwarf（如 dwarf,65528；SIZE 上限 65528）
 #     --offcpu-method METHOD    off-CPU 抓取方式: perf（默认）| ebpf
 #                              perf: perf record -C <CPUS> (指定 core + sched 事件 + inject)
 #                              ebpf: offcputime -p <PID> (eBPF 内核态聚合，轻量无大文件)
 #
 # 示例:
 #     sudo ./containerd_perf.sh capture --output-dir results/multi/perf
+#     sudo ./containerd_perf.sh capture --output-dir /tmp/perf --duration 60 --call-graph dwarf,65528
 #     sudo ./containerd_perf.sh capture --output-dir /tmp/perf --duration 60 --offcpu-method perf
 #     ./containerd_perf.sh analyze results/multi/perf
 #
@@ -26,9 +30,10 @@
 #     perf_on_cpu.data          on-CPU 原始 perf 数据
 #     off_cpu.folded | perf_off_cpu.data   off-CPU 折叠栈或原始 perf 数据
 #
-# On-CPU 方法:  perf record -F 99 -g -C <CPUS> → stackcollapse-perf.pl → flamegraph.pl
+# On-CPU 方法:  perf record -F 99 --call-graph <MODE> -C <CPUS> → stackcollapse-perf.pl → flamegraph.pl
+#              （默认 MODE=fp，等价于历史 -g；--call-graph 不影响 off-CPU）
 # Off-CPU ebpf: /usr/share/bcc/tools/offcputime -f -d -p <PID> → flamegraph.pl --colors=io
-# Off-CPU perf: perf record -C <CPUS> sched events + inject -s → awk → stackcollapse.pl → flamegraph.pl
+# Off-CPU perf: perf record -C <CPUS> -g (fp) sched events + inject -s → awk → stackcollapse.pl → flamegraph.pl
 #
 
 set -euo pipefail
@@ -42,6 +47,47 @@ DEFAULT_FREQUENCY=99
 DEFAULT_DURATION=30
 DEFAULT_OUTPUT_DIR="results/perf"
 DEFAULT_OFFCPU_METHOD="perf"
+DEFAULT_CALL_GRAPH="fp"   # 仅 on-CPU；off-CPU 仍用 -g (fp)
+# perf dwarf 栈拷贝上限（本机报错: Incorrect stack dump size (max 65528)）
+DWARF_STACK_SIZE_MAX=65528
+
+# 将 dwarf[,SIZE] / fp,dwarf[,SIZE] 中的 SIZE 钳到 DWARF_STACK_SIZE_MAX
+normalize_call_graph() {
+    local mode="$1"
+    local size
+    case "$mode" in
+        dwarf)
+            echo "dwarf,${DWARF_STACK_SIZE_MAX}"
+            return
+            ;;
+        dwarf,*)
+            size="${mode#dwarf,}"
+            if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt "$DWARF_STACK_SIZE_MAX" ]; then
+                echo "[perf] 警告: dwarf 栈大小 $size 超过上限 ${DWARF_STACK_SIZE_MAX}，已钳制" >&2
+                size="$DWARF_STACK_SIZE_MAX"
+            fi
+            echo "dwarf,${size}"
+            return
+            ;;
+        fp,dwarf)
+            echo "fp,dwarf,${DWARF_STACK_SIZE_MAX}"
+            return
+            ;;
+        fp,dwarf,*)
+            size="${mode#fp,dwarf,}"
+            if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt "$DWARF_STACK_SIZE_MAX" ]; then
+                echo "[perf] 警告: dwarf 栈大小 $size 超过上限 ${DWARF_STACK_SIZE_MAX}，已钳制" >&2
+                size="$DWARF_STACK_SIZE_MAX"
+            fi
+            echo "fp,dwarf,${size}"
+            return
+            ;;
+        *)
+            echo "$mode"
+            return
+            ;;
+    esac
+}
 
 # ============================================================
 # 工具函数
@@ -237,6 +283,7 @@ cmd_capture() {
     local DURATION="$DEFAULT_DURATION"
     local FREQUENCY="$DEFAULT_FREQUENCY"
     local OFFCPU_METHOD="$DEFAULT_OFFCPU_METHOD"
+    local CALL_GRAPH="$DEFAULT_CALL_GRAPH"
     local CPUS=""          # 空 = 自动从 containerd.service 解析
 
     while [[ $# -gt 0 ]]; do
@@ -244,11 +291,12 @@ cmd_capture() {
             --output-dir)      OUTPUT_DIR="$2";    shift 2 ;;
             --duration)        DURATION="$2";       shift 2 ;;
             --frequency)       FREQUENCY="$2";      shift 2 ;;
+            --call-graph)      CALL_GRAPH="$2";     shift 2 ;;
             --offcpu-method)   OFFCPU_METHOD="$2";  shift 2 ;;
             --cpus)            CPUS="$2";           shift 2 ;;
             *)
                 echo "错误: 未知参数: $1"
-                echo "用法: $0 capture --output-dir DIR [...]"
+                echo "用法: $0 capture --output-dir DIR [--call-graph fp|dwarf|...] [...]"
                 exit 1
                 ;;
         esac
@@ -262,6 +310,16 @@ cmd_capture() {
         echo "错误: --offcpu-method 必须是 ebpf 或 perf，当前值: $OFFCPU_METHOD"
         exit 1
     fi
+
+    case "$CALL_GRAPH" in
+        fp|lbr|dwarf|dwarf,*|fp,dwarf|fp,dwarf,*) ;;
+        *)
+            echo "错误: --call-graph 无效: $CALL_GRAPH"
+            echo "支持: fp | dwarf | dwarf,SIZE | fp,dwarf | lbr（dwarf SIZE 上限 ${DWARF_STACK_SIZE_MAX}）"
+            exit 1
+            ;;
+    esac
+    CALL_GRAPH=$(normalize_call_graph "$CALL_GRAPH")
 
     check_prereqs "$OFFCPU_METHOD" || exit 1
 
@@ -279,7 +337,14 @@ cmd_capture() {
     if [ "$OFFCPU_METHOD" = "ebpf" ]; then
         offcpu_desc="/usr/share/bcc/tools/offcputime -f -d -p <PID>"
     else
-        offcpu_desc="perf record -C ${CONTAINERD_CPUS} sched events + inject -s"
+        offcpu_desc="perf record -C ${CONTAINERD_CPUS} -g (fp) sched events + inject -s"
+    fi
+
+    local oncpu_cg_desc
+    if [ "$CALL_GRAPH" = "fp" ]; then
+        oncpu_cg_desc="-g (fp)"
+    else
+        oncpu_cg_desc="--call-graph ${CALL_GRAPH}"
     fi
 
     local METADATA="${OUTPUT_DIR}/metadata.txt"
@@ -288,7 +353,8 @@ cmd_capture() {
 Containerd CPUs: $CONTAINERD_CPUS
 采样时长: ${DURATION}s
 采样频率: ${FREQUENCY} Hz
-On-CPU 方法:  perf record -F ${FREQUENCY} -g -C ${CONTAINERD_CPUS}
+On-CPU call-graph: ${CALL_GRAPH}
+On-CPU 方法:  perf record -F ${FREQUENCY} ${oncpu_cg_desc} -C ${CONTAINERD_CPUS}
 Off-CPU 方法: $offcpu_desc
 内核版本: $(uname -r)
 架构: $(uname -m)
@@ -299,19 +365,25 @@ EOF
     echo "[perf] 抓取 containerd 火焰图"
     echo "[perf] CPUs:      $CONTAINERD_CPUS"
     echo "[perf] 时长:      ${DURATION}s, 频率: ${FREQUENCY} Hz"
-    echo "[perf] on-CPU:    perf record"
-    echo "[perf] off-CPU:   $OFFCPU_METHOD"
+    echo "[perf] on-CPU:    perf record ${oncpu_cg_desc}"
+    echo "[perf] off-CPU:   $OFFCPU_METHOD (call-graph 固定 fp/-g)"
     echo "[perf] 输出:      $OUTPUT_DIR"
     echo "[perf] ================================================"
     echo ""
 
     # ============================================================
-    # on-CPU: perf record (始终相同)
+    # on-CPU: perf record（仅此处使用 --call-graph）
     # ============================================================
-    echo "[perf] 启动 on-CPU perf record (${DURATION}s 采样, ${FREQUENCY}Hz)..."
+    echo "[perf] 启动 on-CPU perf record (${DURATION}s 采样, ${FREQUENCY}Hz, call-graph=${CALL_GRAPH})..."
+    local -a oncpu_cg_args
+    if [ "$CALL_GRAPH" = "fp" ]; then
+        oncpu_cg_args=(-g)
+    else
+        oncpu_cg_args=(--call-graph "$CALL_GRAPH")
+    fi
     perf record \
         -F "$FREQUENCY" \
-        -g \
+        "${oncpu_cg_args[@]}" \
         -C "$CONTAINERD_CPUS" \
         -o "${OUTPUT_DIR}/perf_on_cpu.data" \
         -- sleep "$DURATION" &

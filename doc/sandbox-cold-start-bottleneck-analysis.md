@@ -866,16 +866,23 @@ cd /home/nathan/sandbox-tests
 
 **perf 符号：**
 
+二进制需保留 DWARF（§13.0，勿 `-s -w`）。抓取默认仍是 **fp**（`-g`）；Go/aarch64 用户态若大量 `[unknown]`，对 **on-CPU** 改用 dwarf（off-CPU 仍为 fp）：
+
 ```bash
-# containerd 绑核 + sandbox 侧（shim / runc / CNI 进程常在 worker 核上）
+# 直接抓取
+sudo ./scripts/containerd_perf.sh capture \
+  --output-dir /tmp/perf-dwarf --duration 30 --call-graph dwarf,65528
+
+# 压测入口
 ./scripts/multi_single_cold_start.sh 128-131 4 1 \
-  --profile --perf --perf_sandbox -- \
+  --profile --perf --perf-call-graph dwarf,65528 --perf_sandbox -- \
   --duration 30 --cpuset-cpus 128-131 --cleanup
 ```
 
+（本机 `perf` 的 dwarf `record_size` **上限为 65528**；写 `65536` 会直接失败。脚本会对超限 SIZE 自动钳制。）
 打开 `RESULT/perf/*.svg` 或 `perf report`：应能看到  
 `github.com/containernetworking/plugins/...`、`github.com/opencontainers/runc/...`、  
-`github.com/containerd/containerd/...` 等符号，而不是大量无名 `elf`。
+`github.com/containerd/containerd/...` 等符号，而不是大量 `[unknown]` / 无名 `elf`。
 
 若仍无符号：确认安装的是刚编的二进制（`file` 显示 not stripped）、`readlink /proc/<pid>/exe` 指向该路径、且 perf 能读该文件。
 
@@ -952,3 +959,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §7.5：补充关 printk 后阶段换位（NewContainer 成头号）、NewTask/cgroup 连带变快、metadata/snapshotter 变慢、iptables 相对更显眼 |
 | 2026-07-17 | §7.5：写入 `ipMasq: false` 对照（吞吐 15.1→17.3/s，`cni.setup` 1.21s→386ms，iptables on-CPU ~25%→0%；NewTask 成新头号） |
 | 2026-07-17 | §7.5：补充原 CNI per-sandbox 规则 vs 节点级 MASQ；`setup.sh --ip-masq false` 自动 ensure 出网规则 |
+| 2026-07-17 | §13：补充 on-CPU `--call-graph dwarf`（默认仍 fp；仅影响 on-CPU）以减少 Go `[unknown]` |
