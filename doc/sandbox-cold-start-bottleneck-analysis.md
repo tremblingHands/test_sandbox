@@ -407,13 +407,32 @@ sudo dmesg -n 7
 | `cri.sandbox.run` Avg / P95 | 13.1s / 19.4s | 8.9s / 12.2s | 明显下降 |
 | on-CPU `printk` / `pl011_console_write` | 有（约 1.8%） | **消失** | 串口路径被打掉 |
 | on-CPU `rtnl_setlink` / `br_add_if` | **~7.3%** | **~0.4%** | 持锁临界区 CPU 占比大降 |
+| containerd 核 mpstat **idle**（mean / p50） | **12.0% / 5.9%** | **1.1% / 0.8%** | idle 几乎被吃光 |
+| containerd 核 mpstat **usr**（mean） | 22.6% | **32.6%** | 用户态更忙；sys ≈65% 两边相近 |
+| 在飞沙箱数 mean / 上下文切换 | 356 / ~4.1M/s | **491** / **~6.0M/s** | 并发态与调度更密 |
+| containerd RSS mean | 369 MB | **501 MB** | 更多并发态占用 |
+
+**阶段占比变化**（相对 `cri.sandbox.run` Avg；同窗口 profile）：
+
+| 阶段 | 基线 Avg（约占 run） | 关 printk Avg（约占 run） |
+|------|----------------------|---------------------------|
+| `cni.setup_pod_network` | 5.15s（~39%） | 1.21s（~14%） |
+| `container.NewTask` | 6.32s（~48%） | 1.71s（~19%） |
+| `client.NewContainer` | 0.53s（~4%） | **2.69s（~30%）← 新的第一大项** |
+| `client.snapshotter.Prepare` | 0.23s | **1.06s（约 +3.5×）** |
+| `metadata.sandbox.Update` | 0.15s | **0.63s（约 +3.3×）** |
+| `runc.cgroup.apply` | 3.09s | **0.32s（约 −90%）** |
 
 **解读**：
 
-1. 关 `printk` 后 **CNI 不再是第一大阶段**；剩余时间更多落在 `client.NewContainer` / snapshotter、`container.NewTask` / cgroup（`runc.cgroup.apply`）等。
+1. 关 `printk` 后 **CNI 不再是第一大阶段**；按占比 **`client.NewContainer`（含 snapshotter / metadata）成为新的头号阶段**。
 2. 这直接验证了 §7.5 的因果：`br_info`→串口不是旁路噪音，而是 **RTNL 持锁放大器**；去掉后配网墙钟与 `rtnl_setlink` 帧同步下降。
-3. 吞吐仍受 `rtnl_mutex`、shim/cgroup、4 核漏斗等约束，故不是线性翻倍；但 **~+18% 吞吐、CNI Avg 降到约 1/4** 已说明串口日志是高杠杆项。
-4. 生产侧更稳妥的等价手段仍是 **`dmesg -n 4` / 调低 console_loglevel** 或不用串口 console；内核注释 `br_info` 适合对照实验，不宜长期作为唯一修复。
+3. **CPU 利用率上升、idle 下降是预期现象，不是回退**：基线里大量线程堵在 `rtnl_lock*` 上等锁睡觉（§7.3），holder 在串口上慢慢打日志，4 个 containerd 核上仍能看到可观 idle；关 `printk` 后持锁变短、排队变短，同一批核更多地在跑有效工作（usr↑），idle 从 ~12% 降到 ~1%。**更高利用率对应更高吞吐**，原先 idle 是「等锁空转」。
+4. **连带变快：NewTask / cgroup**：`container.NewTask`、`runc.cgroup.apply` 也大幅下降。串口不再占满 4 核持锁路径后，shim/runc 少受队头阻塞，属于共享核上的「松绑」，不只是 CNI 自己变快。
+5. **连带变慢并被暴露：NewContainer / metadata / snapshotter**：在飞沙箱更多，工作更早堆到 bbolt 与 snapshot 路径，Avg 升约 3–4×。关 printk 等于把下一层瓶颈推到台前（与瓶颈 C 一致）。
+6. **火焰图相对结构变化**：bridge on-CPU 份额下降（~19%→~11%），**iptables / xtables 相对更显眼**（~21%→~25%）——配网主路径轻了之后，本配置 `ipMasq` 的成本更容易看见。
+7. 吞吐仍受 `rtnl_mutex`、metadata、4 核漏斗等约束，故不是线性翻倍；但 **~+18% 吞吐、CNI Avg 降到约 1/4** 已说明串口日志是高杠杆项。下一轮对照宜优先：**bbolt/snapshot 争用**、以及 **关 `ipMasq`**。
+8. 生产侧更稳妥的等价手段仍是 **`dmesg -n 4` / 调低 console_loglevel** 或不用串口 console；内核注释 `br_info` 适合对照实验，不宜长期作为唯一修复。
 
 ### 7.6 火焰图中与 RTNL 相关的量化线索
 
@@ -539,7 +558,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；shim 路径优化；压测加 `--perf_sandbox`。
+中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；shim 路径优化；压测加 `--perf_sandbox`。关 printk 对照后，**NewContainer/metadata/snapshotter** 与 **关 `ipMasq`** 应优先做下一轮量化。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）。
 
@@ -822,14 +841,15 @@ ls "$RESULT/perf"/*.svg
 | 端到端（基线） | 128 并发 P95 ≈ **15.6s**，吞吐约 **12.8** 沙箱/s |
 | 端到端（关 printk，`0d91342dba12`） | P95 ≈ **13.1s**，吞吐约 **15.1** 沙箱/s；`cni.setup` Avg **5.15→1.21s** |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
-| 关 printk 后主阶段 | CNI 大幅下降；**NewContainer / NewTask / cgroup** 相对更突出 |
+| 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
+| 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
 | 瓶颈 A 配置叠加 | 本环境 `ipMasq` 额外引入 xtables（与 RTNL 分开看） |
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（内核关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4）。之后剩余瓶颈转向 shim/cgroup、metadata 与 4 核漏斗；iptables/masquerade 仍是配置叠加项。带 TRACE / debug 符号的编译安装见 **§13**。
+**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4，idle 被有效工作吃掉）。关 printk 后瓶颈换位到 **NewContainer/metadata/snapshotter**，NewTask/cgroup 连带变快，iptables 相对更显眼。带 TRACE / debug 符号的编译安装见 **§13**。
 
 ---
 
@@ -847,3 +867,5 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-16 | **§13**：补充 debug 符号构建（`GODEBUG=1` / `-N -l`、禁 `-s -w`）及 CNI（`/home/nathan/plugins` → `/opt/cni/bin`），便于 perf 解析符号 |
 | 2026-07-16 | **§13**：按本机实测改写：显式 `go build` + `-N -l`；`CGO_ENABLED=0` / runc `netgo`；注明 Makefile `GODEBUG` 对 containerd/shim 的坑 |
 | 2026-07-17 | §7.5：写入内核 `0d91342dba12` 关 printk 对照（吞吐 ~12.8→15.1/s，`cni.setup` 5.15→1.21s） |
+| 2026-07-17 | §7.5：补充关 printk 后 containerd 核 idle ~12%→1%、usr↑——等锁空闲被有效工作吃掉 |
+| 2026-07-17 | §7.5：补充关 printk 后阶段换位（NewContainer 成头号）、NewTask/cgroup 连带变快、metadata/snapshotter 变慢、iptables 相对更显眼 |
