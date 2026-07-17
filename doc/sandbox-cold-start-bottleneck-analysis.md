@@ -431,8 +431,53 @@ sudo dmesg -n 7
 4. **连带变快：NewTask / cgroup**：`container.NewTask`、`runc.cgroup.apply` 也大幅下降。串口不再占满 4 核持锁路径后，shim/runc 少受队头阻塞，属于共享核上的「松绑」，不只是 CNI 自己变快。
 5. **连带变慢并被暴露：NewContainer / metadata / snapshotter**：在飞沙箱更多，工作更早堆到 bbolt 与 snapshot 路径，Avg 升约 3–4×。关 printk 等于把下一层瓶颈推到台前（与瓶颈 C 一致）。
 6. **火焰图相对结构变化**：bridge on-CPU 份额下降（~19%→~11%），**iptables / xtables 相对更显眼**（~21%→~25%）——配网主路径轻了之后，本配置 `ipMasq` 的成本更容易看见。
-7. 吞吐仍受 `rtnl_mutex`、metadata、4 核漏斗等约束，故不是线性翻倍；但 **~+18% 吞吐、CNI Avg 降到约 1/4** 已说明串口日志是高杠杆项。下一轮对照宜优先：**bbolt/snapshot 争用**、以及 **关 `ipMasq`**。
+7. 吞吐仍受 `rtnl_mutex`、metadata、4 核漏斗等约束，故不是线性翻倍；但 **~+18% 吞吐、CNI Avg 降到约 1/4** 已说明串口日志是高杠杆项。下一轮对照宜优先：**bbolt/snapshot 争用**、以及 **关 `ipMasq`**（见下节，已完成）。
 8. 生产侧更稳妥的等价手段仍是 **`dmesg -n 4` / 调低 console_loglevel** 或不用串口 console；内核注释 `br_info` 适合对照实验，不宜长期作为唯一修复。
+
+#### 对照实验：`ipMasq: false`（关 printk 之上，已完成）
+
+在 **`0d91342dba12` 关 printk** 不变的前提下，仅将 CNI 配置改为 `"ipMasq": false`（`scripts/setup.sh --cni-type bridge --ip-masq false`），去掉每沙箱 `SetupIPMasq` → `iptables`/`nft` 写 NAT。数据目录：
+
+| 场景 | 路径 |
+|------|------|
+| 关 printk + `ipMasq: true` | `profile/..._disable-printk` |
+| 关 printk + `ipMasq: false` | `profile/..._disable-printk_ip-masq-false` |
+
+同配置：128 workers、containerd 绑核 1–4、`--duration 60`。
+
+| 指标 | 关 printk（ipMasq true） | + ipMasq false | 变化 |
+|------|-------------------------|----------------|------|
+| 吞吐（沙箱/s） | **~15.1**（895 / 59.1s） | **~17.3**（1023 / 59.1s） | **+14%** |
+| 端到端 P50 / P95 / P99 | 9.5 / **13.1** / 14.3 s | 7.7 / **10.7** / 11.8 s | P95 **−18%** |
+| `cni.setup_pod_network` Avg / P95 | **1.21s** / 2.41s | **386ms** / 835ms | Avg **约 −68%** |
+| `cni.plugin.bridge` Avg | 1.20s | **381ms** | 与 setup 同步下降 |
+| `cni.plugin.loopback` Avg | 174ms | 166ms | **基本不变**（无 masq 路径） |
+| `cri.sandbox.run` Avg / P95 | 8.86s / 12.2s | 6.92s / 10.3s | 明显下降 |
+| on-CPU **`iptables`**（核 1–4） | **~24.9%** | **消失（~0%）** | 直接验证去掉 masq |
+| on-CPU `bridge` | ~11.5% | ~8.3% | 略降 |
+| on-CPU `runc` / `containerd` / shim | 19% / 18% / 16% | **31% / 23% / 22%** | 配网变轻后份额上移 |
+| containerd 核 idle（mean） | 1.1% | 7.3% | 去掉 iptables 占核后略有空闲；报告另标 `disk_saturation` |
+| 在飞沙箱 mean | 491 | **598** | 并发态更高 |
+
+**阶段占比变化**（相对 `cri.sandbox.run` Avg）：
+
+| 阶段 | 关 printk Avg（约占 run） | + ipMasq false Avg（约占 run） |
+|------|---------------------------|--------------------------------|
+| `cni.setup_pod_network` | 1.21s（~14%） | **386ms（~6%）** |
+| `client.NewContainer` | 2.69s（~30%） | 1.95s（~28%） |
+| `container.NewTask` | 1.71s（~19%） | **2.48s（~36%）← 新的第一大项** |
+| `client.snapshotter.Prepare` | 1.06s | 764ms |
+| `metadata.sandbox.Update` | 630ms | 459ms |
+| `runc.cgroup.apply` | 321ms | 420ms |
+
+**解读**：
+
+1. **关 `ipMasq` 在关 printk 之上仍有可观收益**：吞吐再 **+14%**，`cni.setup` Avg 再降到约 **1/3**（1.21s→386ms），说明关 printk 后露出的 **xtables/`iptables` 开销是真实墙钟成本**，不是火焰图错觉。
+2. **因果干净**：`loopback` span 几乎不动；`bridge` span 与 `cni.setup` 同幅度下降；perf 上 **`iptables` 从 ~25% 归零**——对准的就是 masq 写 NAT，而不是 RTNL 主路径被误伤。
+3. **阶段再次换位**：CNI 只剩 ~6%；**`container.NewTask` / shim / runc 成为新的头号阶段**（Avg 1.71s→2.48s，占比 ~36%）。配网更快后，更多工作更早堆到 task 创建与 cgroup，与关 printk 后 NewContainer 被暴露是同一类「松绑→下一层冒头」。
+4. **NewContainer / metadata / snapshotter 这次变快**（与关 printk 对照时它们变慢不同）：去掉占满 4 核的 iptables 后，bbolt/snapshot 路径少受队头阻塞，Avg 下降。说明这些阶段对「谁在占核」敏感，对照之间不可只看绝对毫秒、还要看争用对象。
+5. **RTNL 仍在**：`bridge`/`loopback`/`host-local` 仍有可观 on-CPU；关 masq **不取消** `rtnl_mutex`。若要继续压 CNI，需换形态（ipvlan / hostNetwork）或接受 bridge+veth 的结构性串行。
+6. 生产侧等价手段：节点级一条（或少量）MASQUERADE 覆盖子网（如 `10.0.0.0/12`），CNI 保持 `ipMasq: false`，避免每沙箱调 iptables。下一轮优先：**NewTask / shim / runc.cgroup** 与 **bbolt/snapshot**。
 
 ### 7.6 火焰图中与 RTNL 相关的量化线索
 
@@ -448,21 +493,21 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 7.7 同属 CNI 桶内的其它开销（次要、与配置相关）
 
-本次 CNI 配置开启了 `ipMasq: true`，perf 中还能看到 `xtables-nft-multi` / `iptables`：每沙箱写 `CNI-*` MASQUERADE 链会额外引入 **xtables 全局锁**。
+本次 CNI 配置曾开启 `ipMasq: true`，perf 中能看到 `xtables-nft-multi` / `iptables`：每沙箱写 `CNI-*` MASQUERADE 链会额外引入 **xtables 全局锁**与大量 nft dump/validate 开销。
 
-这是 **CNI 桶内、与当前配置相关的叠加因素**，不是「配网慢」的唯一定义，也与 `rtnl_mutex` 不是同一把锁：
+**关 `ipMasq` 对照已完成**（§7.5 末）：on-CPU `iptables` **~25%→0%**，`cni.setup` Avg **1.21s→386ms**，吞吐 **15.1→17.3/s**。这是 **CNI 桶内、与配置相关的叠加因素**，不是「配网慢」的唯一定义，也与 `rtnl_mutex` 不是同一把锁：
 
 | 机制 | 触发 | 与「CNI 时延」关系 |
 |------|------|-------------------|
 | **`rtnl_mutex`** | 链路/netdev 配置（bridge、loopback、netns lo） | **配网主路径上的结构性串行**；换 CNI 形态也常仍存在 |
-| **串口 `printk`**（本机） | bridge `br_set_state` → `br_info` | 拉长 RTNL 持锁；调低 console_loglevel 可验证 |
-| **xtables**（本配置） | `ipMasq` 写 nat | 可叠加恶化；`ipMasq: false` 可去掉，**但不取消 RTNL** |
+| **串口 `printk`**（本机） | bridge `br_set_state` → `br_info` | 拉长 RTNL 持锁；对照已验证（§7.5） |
+| **xtables**（本配置） | `ipMasq` 写 nat | 对照已验证：`ipMasq: false` 可去掉（§7.5），**但不取消 RTNL** |
 
-对照实验时需分开看：关 masquerade 主要验证 xtables；`dmesg -n 4` 验证串口日志；减 veth/bridge 或跳过 CNI（如 ipvlan / hostNetwork）才更直接打到 RTNL 竞争。
+对照实验时需分开看：关 masquerade 验证 xtables；`dmesg -n 4` / 关 printk 验证串口日志；减 veth/bridge 或跳过 CNI（如 ipvlan / hostNetwork）才更直接打到 RTNL 竞争。
 
 ### 7.8 小结（瓶颈 A）
 
-**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）；**内核对照关掉该 `printk` 后，`cni.setup` Avg 从 ~5.2s 降到 ~1.2s、吞吐约 +18%**，印证其为高杠杆放大器。本配置下的 masquerade/iptables 是同桶内的额外开销，应与 RTNL / 日志开销分开评估。
+**CNI 配网是最大时间阶段；下钻后主因是全局 `rtnl_mutex` 把 netns/lo/bridge/veth 等操作串行化。** 等锁者会让出 CPU，持锁者主要在占核做临界区工作（亦可在持锁期间 sleep，但锁不释放）。持锁路径上 bridge STP 的 **`br_info`→串口 `printk`** 会额外占 CPU 并拉长持锁（§7.5）；**关掉该 `printk` 后，`cni.setup` Avg 从 ~5.2s 降到 ~1.2s、吞吐约 +18%**。其上再关 **`ipMasq`**，`cni.setup` 再降到 **~386ms**、吞吐约 **+14%**，perf 上 iptables 归零——验证 xtables 为同桶叠加项。关 masq 后阶段换位到 **NewTask/shim/runc**；RTNL 与 loopback 仍在。
 ---
 
 ## 8. 瓶颈 B：shim / NewTask 创建慢
@@ -551,14 +596,14 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 |------|------|------|
 | A. hostNetwork 对照 | 整段跳过 CNI | `cni.setup` 接近消失 → 量化配网（含 RTNL）上限 |
 | B. CNI 改为 ipvlan | 减少 veth/bridge 类链路操作 | `cni.setup` 与 `rtnl_*` 帧下降 |
-| C. 仅关 `ipMasq` | 去掉本配置的 xtables 叠加 | `cni.setup` 可能下降；**`rtnl_*` / loopback 仍在** |
+| C. **仅关 `ipMasq`**（已做） | 去掉本配置的 xtables 叠加 | 在关 printk 上：吞吐 **15.1→17.3/s**；`cni.setup` **1.21s→386ms**；iptables on-CPU **~25%→0%**（见 §7.5） |
 | C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；shim 路径优化；压测加 `--perf_sandbox`。关 printk 对照后，**NewContainer/metadata/snapshotter** 与 **关 `ipMasq`** 应优先做下一轮量化。
+中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；shim 路径优化；压测加 `--perf_sandbox`。关 printk + 关 `ipMasq` 后，**NewTask / shim / runc.cgroup** 与 **bbolt/snapshot** 应优先做下一轮量化。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）。
 
@@ -840,16 +885,18 @@ ls "$RESULT/perf"/*.svg
 |------|------|
 | 端到端（基线） | 128 并发 P95 ≈ **15.6s**，吞吐约 **12.8** 沙箱/s |
 | 端到端（关 printk，`0d91342dba12`） | P95 ≈ **13.1s**，吞吐约 **15.1** 沙箱/s；`cni.setup` Avg **5.15→1.21s** |
+| 端到端（关 printk + `ipMasq: false`） | P95 ≈ **10.7s**，吞吐约 **17.3** 沙箱/s；`cni.setup` Avg **1.21s→386ms**；iptables on-CPU **~25%→0%** |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
 | 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
+| 再关 ipMasq 后主阶段 | **`container.NewTask` ~36%**；CNI 仅 ~6%；iptables 消失 |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
-| 瓶颈 A 配置叠加 | 本环境 `ipMasq` 额外引入 xtables（与 RTNL 分开看） |
+| 瓶颈 A 配置叠加 | **`ipMasq`→xtables**（对照已验证，见 §7.5）；与 RTNL 分开看 |
 | 瓶颈 B / C / D | shim 创建；metadata DB；containerd 4 核放大 |
 | 非主因 | 磁盘、内存 |
 
-**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4，idle 被有效工作吃掉）。关 printk 后瓶颈换位到 **NewContainer/metadata/snapshotter**，NewTask/cgroup 连带变快，iptables 相对更显眼。带 TRACE / debug 符号的编译安装见 **§13**。
+**一句话**：基线下 CNI 配网最重，perf 下钻到 **`rtnl_mutex` 串行**；持锁路径上 **`br_info`→串口 `printk` 是高杠杆放大器**（关掉后吞吐约 12.8→15.1/s、`cni.setup` 约降到 1/4）。其上再关 **`ipMasq`**，吞吐约 15.1→17.3/s、`cni.setup` 再降到约 386ms，iptables on-CPU 归零。关 masq 后瓶颈换位到 **NewTask/shim/runc**；RTNL 仍在。带 TRACE / debug 符号的编译安装见 **§13**。
 
 ---
 
@@ -869,3 +916,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §7.5：写入内核 `0d91342dba12` 关 printk 对照（吞吐 ~12.8→15.1/s，`cni.setup` 5.15→1.21s） |
 | 2026-07-17 | §7.5：补充关 printk 后 containerd 核 idle ~12%→1%、usr↑——等锁空闲被有效工作吃掉 |
 | 2026-07-17 | §7.5：补充关 printk 后阶段换位（NewContainer 成头号）、NewTask/cgroup 连带变快、metadata/snapshotter 变慢、iptables 相对更显眼 |
+| 2026-07-17 | §7.5：写入 `ipMasq: false` 对照（吞吐 15.1→17.3/s，`cni.setup` 1.21s→386ms，iptables on-CPU ~25%→0%；NewTask 成新头号） |

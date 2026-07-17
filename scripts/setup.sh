@@ -8,6 +8,7 @@
 #   ./setup.sh --runtime kata                # kata + dragonball（默认）
 #   ./setup.sh --runtime kata --hypervisor qemu  # kata + QEMU
 #   ./setup.sh --cni-type bridge             # 使用 bridge CNI
+#   ./setup.sh --cni-type bridge --ip-masq false  # bridge 且关闭 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --check-only                   # 仅检查，不安装
 # ============================================================
@@ -20,6 +21,7 @@ CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 br
 CONTAINERD_RUNTIME="runc"       # 默认: runc
 SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs）
 KATA_VERSION="3.22.0"           # kata containers 版本
+IP_MASQ="true"                  # bridge 专用: CNI ipMasq（默认 true；false 则不做 per-sandbox iptables）
 
 # 自动检测架构
 detect_arch() {
@@ -64,9 +66,16 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: --snapshotter 必须是 overlayfs | erofs"; exit 1 ;;
             esac
             shift 2 ;;
+        --ip-masq)
+            IP_MASQ="$2"
+            case "$IP_MASQ" in
+                true|false) ;;
+                *) echo "ERROR: --ip-masq 必须是 true | false"; exit 1 ;;
+            esac
+            shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--runtime runc|kata] [--snapshotter overlayfs|erofs] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--snapshotter overlayfs|erofs] [--check-only]"
             exit 1 ;;
     esac
 done
@@ -426,7 +435,7 @@ check_cni_network() {
 
         case "$CNI_TYPE" in
             bridge)
-                printf '{\n  "cniVersion": "0.3.1",\n  "name": "mynet",\n  "type": "bridge",\n  "bridge": "cni0",\n  "isGateway": true,\n  "ipMasq": true,\n  "ipam": {\n    "type": "host-local",\n    "subnet": "%s",\n    "routes": [\n      { "dst": "0.0.0.0/0" }\n    ]\n  }\n}\n' "$CNI_SUBNET" | sudo tee "$CNI_CONF_FILE" > /dev/null
+                printf '{\n  "cniVersion": "0.3.1",\n  "name": "mynet",\n  "type": "bridge",\n  "bridge": "cni0",\n  "isGateway": true,\n  "ipMasq": %s,\n  "ipam": {\n    "type": "host-local",\n    "subnet": "%s",\n    "routes": [\n      { "dst": "0.0.0.0/0" }\n    ]\n  }\n}\n' "$IP_MASQ" "$CNI_SUBNET" | sudo tee "$CNI_CONF_FILE" > /dev/null
                 ;;
             ipvlan-l2)
                 local master
@@ -476,6 +485,41 @@ check_cni_network() {
         pass "CNI subnet 已更新为: $CNI_SUBNET"
         sudo systemctl restart containerd
         sleep 2
+    fi
+
+    # ---- bridge 专属：ipMasq ---- #
+    if [ "$CNI_TYPE" = "bridge" ]; then
+        local current_ip_masq
+        current_ip_masq=$(grep -oE '"ipMasq"[[:space:]]*:[[:space:]]*(true|false)' "$CNI_CONF_FILE" 2>/dev/null | head -1 | grep -oE 'true|false' || true)
+        if [ -z "$current_ip_masq" ]; then
+            current_ip_masq="(未设置)"
+        fi
+        if [ "$current_ip_masq" = "$IP_MASQ" ]; then
+            pass "CNI ipMasq 已匹配: $IP_MASQ"
+        else
+            if $CHECK_ONLY; then
+                warn "CNI ipMasq 不匹配: 当前=$current_ip_masq, 需要=$IP_MASQ"
+                return 1
+            fi
+            echo "  更新 CNI ipMasq: $current_ip_masq → $IP_MASQ ..."
+            # 注意：勿用 | 作 sed 分隔符，会与正则 (true|false) 冲突导致替换失败
+            if grep -qE '"ipMasq"[[:space:]]*:' "$CNI_CONF_FILE"; then
+                sudo sed -i -E "s#\"ipMasq\"[[:space:]]*:[[:space:]]*(true|false)#\"ipMasq\": $IP_MASQ#" "$CNI_CONF_FILE"
+            else
+                # 在 isGateway 行后插入（兼容旧配置缺字段）
+                sudo sed -i -E "s#(\"isGateway\"[[:space:]]*:[[:space:]]*true)#\1,\n  \"ipMasq\": $IP_MASQ#" "$CNI_CONF_FILE"
+            fi
+            local updated_ip_masq
+            updated_ip_masq=$(grep -oE '"ipMasq"[[:space:]]*:[[:space:]]*(true|false)' "$CNI_CONF_FILE" 2>/dev/null | head -1 | grep -oE 'true|false' || true)
+            if [ "$updated_ip_masq" != "$IP_MASQ" ]; then
+                fail "CNI ipMasq 更新失败: 期望=$IP_MASQ, 实际=${updated_ip_masq:-(未设置)}"
+                return 1
+            fi
+            pass "CNI ipMasq 已更新为: $IP_MASQ"
+            if [ "$IP_MASQ" = "false" ]; then
+                warn "ipMasq=false 时 CNI 不再为每沙箱调用 iptables；若需出网请自行配置节点级 MASQUERADE（如 -s $CNI_SUBNET ! -o cni0）"
+            fi
+        fi
     fi
 
     # ---- bridge 专属：hash_max ---- #
@@ -790,6 +834,9 @@ main() {
     echo "  检测架构: $(uname -m) → $ARCH"
     echo "  Runtime:     $CONTAINERD_RUNTIME"
     echo "  CNI 类型:    $CNI_TYPE"
+    if [ "$CNI_TYPE" = "bridge" ]; then
+        echo "  CNI ipMasq:  $IP_MASQ"
+    fi
     echo "  Snapshotter: $SNAPSHOTTER"
     echo "  pause 镜像:  $PAUSE_IMAGE"
     echo "=============================================="
@@ -824,6 +871,12 @@ main() {
     echo "  # 并发冷启动测试"
     echo "  ./scripts/concurrent_cold_start.sh 10 3"
     echo ""
+    if [ "$CNI_TYPE" = "bridge" ] && [ "$IP_MASQ" = "false" ]; then
+        echo "提示: bridge + ipMasq=false 时，若沙箱需访问外网，请配置节点级 MASQUERADE，例如:"
+        echo "  iptables -t nat -C POSTROUTING -s $CNI_SUBNET ! -o cni0 -j MASQUERADE 2>/dev/null || \\"
+        echo "    iptables -t nat -A POSTROUTING -s $CNI_SUBNET ! -o cni0 -j MASQUERADE"
+        echo ""
+    fi
 
     return $errors
 }
