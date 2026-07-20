@@ -1258,7 +1258,152 @@ ls "$RESULT/perf"/*.svg
 | 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95。下一刀优先 cgroup 路径与 sync 子进程侧。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95。下一刀优先 cgroup 路径与 sync 子进程侧。**换内核（5.10→7.0）的预期收益见 §16**——不能指望单独解决秒级 NewTask。
+
+---
+
+## 16. 换新内核（5.10.229 → 7.0）对本场景冷启动的预期收益
+
+对照源码树：
+
+| 树 | 路径 | 版本 |
+|----|------|------|
+| 现网 / 分析用 | `/home/nathan/linux` | **v5.10.229**（含关 netlink printk：`0d91342dba12`） |
+| 上游对照 | `/home/nathan/linux-upstream-v1` | **v7.0** |
+
+前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析只回答：**换到 v7.0 能砍哪几段墙钟、砍不动哪几段**。
+
+公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）。
+
+### 16.1 收益总表（按对本场景墙钟的相关度）
+
+| 档位 | 主题 | 映射 TRACE | 换到 v7.0 预期 | 依赖条件 |
+|------|------|------------|----------------|----------|
+| **基本无收益** | bbolt 写锁 | `*.tx.wait`、lease/snapshot | **不动** | — |
+| **基本无收益** | containerd 绑 4 核 | 端到端 P95 放大器 | **不动**（调度略有间接） | — |
+| **基本无收益** | misc mountinfo | `subsys.misc` | 已用户态修；v7.0 若误开 `CONFIG_CGROUP_MISC` 反可能多成本 | 保持 misc 关或保留短路 |
+| **低 / 条件** | per-netns RTNL | `cni.plugin.*` ~300ms | **默认构建几乎无并行收益**；转换未完成 | 见 §16.5 |
+| **低** | STP `br_info` printk | 历史 CNI 持锁放大 | **上游仍在**；本机补丁仍有价值 | 需继续关 printk 或上游安静化 |
+| **中等（读侧）** | kernfs 全局锁→per-root rwsem | `exists_check.stat`、部分 cgroup 读 | 减轻与 **sysfs 等其它 kernfs 根** 的交叉争用；**同层级 mkdir 仍串行** | 见 §16.3 |
+| **中等（条件）** | favordynmods / 更细 threadgroup 锁 | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 偏 cgroup v2 + 配置 |
+| **中等** | mount ns RB 树等 | `runc.init.mounts` / `wait.for_hooks` | 大 ns 内查找/簿记更好；**全局 `namespace_sem` 仍在** | 见 §16.4 |
+| **中等（放大器）** | EEVDF 调度 | `exec.wait`、等锁 sleep 尾延迟 | 可能改善唤醒尾延迟，**不砍秒级 apply** | 见 §16.6 |
+| **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **v7.0 仍是全局 `cgroup_mutex`**；无 cgroup pool | 真要大降：减 controller / 切 v2 / 用户态策略 |
+| **待验证** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能**显著降 apply（非「默默升内核」） | CRI/runc/systemd 全路径验证 |
+
+### 16.2 L0 — 换核几乎帮不上的边界
+
+1. **`metadata.*.tx.wait` / lease / snapshot Prepare**：containerd 进程内 bbolt 可写事务排队（§9），与内核版本无关。  
+2. **containerd CPU 1–4**：绑核与并发度问题（§10）；新调度器最多略改尾延迟形态。  
+3. **misc 扫 mountinfo**：本机 5.10 无 `CONFIG_CGROUP_MISC`；已在 runc 用 `/proc/cgroups` 短路（§8.4）。v7.0 提供可选 `CONFIG_CGROUP_MISC`（`init/Kconfig`，default **n**）——若误开且用户态未短路，mkdir 可能**多付** CSS 成本。
+
+### 16.3 L1 — cgroup / kernfs（对准 NewTask 最大头）
+
+**映射**：`runc.cgroup.apply` ~1.03s（cpuset/devices/memory）、`shim.cgroup.load` ~734ms、`exists_check.stat`（Avg 高 / P50 低）。
+
+#### 16.3.1 `cgroup_mutex`：两边仍是全局主锁
+
+| | 5.10.229 | 7.0 |
+|--|----------|-----|
+| 定义 | `kernel/cgroup/cgroup.c`：`DEFINE_MUTEX(cgroup_mutex)` | 同左（约 L89）；封装为 `cgroup_lock()` |
+| mkdir | `cgroup_mkdir` → `cgroup_kn_lock_live` → 持 `cgroup_mutex` | 同模式 |
+| 写 `cgroup.procs` | attach 路径同样持 `cgroup_mutex` | 同模式 |
+| cgroup pool / mkdir 快路径 | 无 | **无**（LKML 上 v1 pool RFC 未合入；社区倾向用 v2） |
+
+**对本场景**：高并发下每个沙箱对 **多个 v1 子系统** 做 mkdir + 写 procs，全部挤在同一把全局锁上——这与 TRACE 里 `apply.*` 的争用形态一致。**升到 7.0 若不改用户态路径，无法指望 apply 从 ~1s 掉一个数量级。**
+
+近期 LKML 上 `cgroup_file_notify` 细锁化（全局 `cgroup_file_kn_lock` → per-file）主要服务 **memory 事件通知 / reclaim**，不是 mkdir 冷启动热路径。
+
+#### 16.3.2 kernfs：全局 mutex → per-root rwsem（读侧有帮助）
+
+| | 5.10.229 | 7.0 |
+|--|----------|-----|
+| 锁 | **全局** `DEFINE_MUTEX(kernfs_mutex)`（`fs/kernfs/dir.c:20`） | **每 kernfs_root** `struct rw_semaphore kernfs_rwsem`（`fs/kernfs/kernfs-internal.h`） |
+| 演进 | — | v5.15 改 rwsem；v5.17 改为 per-fs/per-root |
+
+**对本场景**：
+
+- **`exists_check.stat` / 部分 cgroup 读**：可与 sysfs 等其它 kernfs 根解耦，读侧可共享持锁 → **中等、偏尾延迟**收益。  
+- **`runc.cgroup.apply` mkdir**：同一 cgroup 层级上仍要过 **`cgroup_mutex`**；per-root kernfs **不能**让同层级并发 mkdir 真正并行。
+
+#### 16.3.3 cgroup v2 / favordynmods（条件收益，不是默认白嫖）
+
+7.0 仍默认 default hierarchy 为 cgroup2 根，但控制器不自动全开。新增/强化：
+
+- mount 选项 **`favordynmods`** / `CONFIG_CGROUP_FAVOR_DYNMODS`：减轻 **attach 与无关 threadgroup 的 fork/exit** 对全局 `cgroup_threadgroup_rwsem` 的争用。  
+- 文档亦注明：纯「建 cgroup + enable + `CLONE_INTO_CGROUP`」模式未必吃到 favordynmods。
+
+**对本场景（当前 cgroup v1 + 多子系统 apply）**：
+
+- **原地升内核、继续 v1**：apply 大头仍在。  
+- **顺带切 unified cgroup v2**：单层级、更少「每 controller 一次 mkdir」，**才是**可能显著砍 `apply` 的方向——属产品/CRI 变更，需单独对照压测，不能算进「只换内核包」。
+
+#### 16.3.4 `shim.cgroup.load`
+
+主要走 `/proc` + css 查找，不是 mkdir 临界区。换核可能因 kernfs/调度略好而间接下降，**不宜预期从 ~700ms 主因级消失**；优先仍应用户态/调用次数下钻。
+
+### 16.4 L2 — mount / namespace（对准 `init.sync` wait）
+
+**映射**：父 `wait.for_hooks` ~336ms + `wait.for_ready` ~339ms；子 `runc.init.mounts` ~152ms、`prepareRoot` ~59ms（跨进程林，§8.5.4）。
+
+| | 5.10.229 | 7.0 |
+|--|----------|-----|
+| 命名空间写锁 | 全局 `DECLARE_RWSEM(namespace_sem)`（`fs/namespace.c`） | **仍全局** |
+| mount 集合 | 链表 | **RB 树**等（大 ns 查找/迭代更好） |
+| 其它 | — | 空 mount ns、`OPEN_TREE_NAMESPACE` 等 API 演进 |
+
+**对本场景**：并发沙箱的子进程同时 `CLONE_NEWNS` + 多 mount，仍抢 **同一把 `namespace_sem`**。7.0 的数据结构改进可能略减单次 mounts 成本，从而略缩父 wait，但 **不是**「多容器 mount 完全并行」。优化 sync 仍应优先打用户态 mount 集合/次数（§8.5.7）。
+
+### 16.5 L3 — 网络 / RTNL（对准剩余 CNI ~300ms）
+
+**映射**：`cni.setup` ~303ms（bridge/loopback）；历史 RTNL + printk（§7）。
+
+| | 5.10.229 | 7.0 |
+|--|----------|-----|
+| 全局 `rtnl_mutex` | 唯一主锁（`net/core/rtnetlink.c`） | **仍在** |
+| `rtnl_net_lock` / per-netns | 无 | 有 API + `net->rtnl_mutex`，但挂在 **`CONFIG_DEBUG_NET_SMALL_RTNL`（default n）** |
+| 默认行为 | 全局锁 | **默认 `rtnl_net_lock` ≡ `rtnl_lock()`**；debug 开启时是 **全局 + 每 netns 嵌套**（转换期更慢） |
+| 真实进展 | — | `RTNL_FLAG_DUMP_UNLOCKED`、`exit_rtnl` 批量拆 netns、部分 dump/地址路径减压 |
+| bridge STP `br_info` | 本机 **已注释**（`0d91342dba12`） | **上游仍 printk**（`net/bridge/br_stp.c` `br_set_state`） |
+
+LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全局锁仍在进行中**（Kconfig 帮助文本写明转换完成后才有真正 per-netns 可扩展性）。
+
+**对本场景（已关 printk、已关 ipMasq）**：
+
+1. CNI 只剩 ~5% 端到端 → 即便将来 per-netns 完成，端到端也多半是 **几十～一百多 ms** 量级，不是 NewTask 秒级。  
+2. **当前 v7.0 默认构建**：veth/bridge/`RTM_NEWLINK` 仍实质全局串行 → **不要预期 CNI 再腰斩**。  
+3. 换上游内核时 **务必保留** 关 STP/`br_info` printk（或等价），否则可能部分回到 §7.5 的持锁放大。
+
+### 16.6 L4 — 调度 / 进程创建（放大器）
+
+| | 5.10 | 7.0 |
+|--|------|-----|
+| fair 类调度 | CFS | **EEVDF**（自 6.6） |
+
+**映射**：`shim.binary.exec.wait`、等 `cgroup_mutex`/`rtnl` sleep 后的唤醒尾延迟、P95。
+
+公开评价不一：部分延迟敏感负载尾延迟改善，也有回归报告。对本场景应视为 **放大器微调**，验证时看 P95/P99，不把它当成砍掉 `cgroup.apply` 的手段。
+
+### 16.7 换内核后仍在的用户态主因（提醒）
+
+升到 7.0 之后，若配置与今日相同（cgroup v1、关 masq、关 printk），预期仍看到：
+
+1. **`runc.cgroup.apply` 量级争用**（全局 `cgroup_mutex`）  
+2. **`shim.cgroup.load` / `init.sync` wait**（mount `namespace_sem` + 子进程工作量）  
+3. **bbolt `.tx.wait`**  
+4. 残余 **CNI ~百毫秒级**（全局 RTNL 未真正拆完）
+
+### 16.8 建议验证矩阵
+
+| 实验 | 目的 | 盯的 span / 指标 |
+|------|------|------------------|
+| A. 同配置仅换 v7.0（保留关 printk） | 量化「纯换核」 | `cri.sandbox.run`、`cgroup.apply`、`exists_check.stat`、`cni.setup`、P95 |
+| B. v7.0 + 确认 `CONFIG_CGROUP_MISC=n` | 避免 misc 回退 | `manager.new.subsys.misc` |
+| C. v7.0 + cgroup v2（单独变量） | 验证 apply 是否大降 | `runc.cgroup.apply.*` Cnt/Avg |
+| D. v7.0 默认 vs 开 `DEBUG_NET_SMALL_RTNL` | 证明转换期 debug 无生产收益 | `cni.setup`（预期持平或变差） |
+| E. `--perf_sandbox` 对比 `cgroup_mutex` / `kernfs_rwsem` / `rtnl_lock` | 锁符号是否从全局 kernfs_mutex 变为 per-root | 火焰图 |
+
+**一句话（§16）**：从 **5.10.229 升到 7.0**，对本冷启动场景的**确定收益偏「旁路」**（kernfs 读侧、dump/拆 netns、可能的调度尾延迟）；**NewTask 秒级主因（`cgroup_mutex` 串行的多子系统 apply、全局 `namespace_sem`、未完成的全局 RTNL）不会因换核自动消失**。若目标是砍 `cgroup.apply`，应把 **cgroup v2 / 减少 controller 操作** 与换核分开立项验证；网络侧则继续保留 **关 printk**，并等待 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
 
 ---
 
@@ -1286,3 +1431,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-20 | §13.3：补充 `manager.new.initPaths` / `init.sync.wait|hooks|…` / 子进程 `prepareRootfs` 等细粒度 TRACE |
 | 2026-07-20 | §2.3 / §8.4 / §12 / §15：记录 cgroup `misc` 扫 mountinfo 根因、内核确认、`/proc/cgroups` 短路优化与对照数据 |
 | 2026-07-21 | §2.3 / §8.3 / **§8.5** / §9 / §12 / §15：写入细粒度 TRACE 复测——NewTask 再成头号；拆解 `cgroup.apply` / `shim.cgroup.load`；说明 `runc.init.sync` 在等子进程及与 `mounts` 的对应关系 |
+| 2026-07-21 | **§16**：对照 `/home/nathan/linux`（5.10.229）与 `/home/nathan/linux-upstream-v1`（7.0），按 TRACE 桶评估换核对冷启动的收益与边界 |
