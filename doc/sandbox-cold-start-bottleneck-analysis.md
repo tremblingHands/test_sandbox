@@ -934,8 +934,9 @@ container.NewTask                 ~3.77s
 | H. **换内核 5.10→7.0（同用户态配置）** | 量化纯换核 | 见 §16.8；预期 apply/CNI 不会数量级下降 |
 | I. **bbolt：`no_sync` / 合并 sandbox Update** | 瓶颈 C | 见 §17.7；盯 `.tx.wait` / Update Cnt |
 | J. **仅切 cgroup v2** | 瓶颈 B / `cgroup.apply` | 见 §16.3.3 / §16.8；盯 `runc.cgroup.apply.*` Cnt/Avg |
+| K. **runc 试 `CLONE_EMPTY_MNTNS`** | `init.sync` / mounts | 见 §16.4.3；盯 `wait.for_hooks`、`runc.init.mounts` |
 
-中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`（评估 cgroup v2，§16.3.3）、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游内核的预期与边界见 §16**（含 `cgroup_mutex` 机制 §16.3.1；7.2-rc 增量 §16.9；不能替代 cgroup 路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
+中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`（评估 cgroup v2，§16.3.3）、`shim.cgroup.load`、子进程 mounts / 空 mntns（§16.4）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游内核的预期与边界见 §16**（含 `cgroup_mutex` §16.3.1、kernfs §16.3.2、`favordynmods` §16.3.5、mount/ns §16.4；7.2-rc 增量 §16.9；不能替代用户态路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
@@ -1261,7 +1262,7 @@ ls "$RESULT/perf"/*.svg
 | 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 **评估 cgroup v2**（§16.3.3）与 sync 子进程侧；bbolt 可并行试 `no_sync` / 减 Update。**换内核收益见 §16**（`cgroup_mutex` 机制 §16.3.1；相对 7.0 的 7.2-rc 增量 §16.9）——不能指望单独解决秒级 NewTask。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 **评估 cgroup v2**（§16.3.3）与 **mounts / 空 mntns**（§16.4）；bbolt 可并行试 `no_sync` / 减 Update。**换内核收益见 §16**（含 `favordynmods` §16.3.5）——不能指望单独解决秒级 NewTask。
 
 ---
 
@@ -1275,7 +1276,7 @@ ls "$RESULT/perf"/*.svg
 | 上游对照（§16 主文） | `/home/nathan/linux-upstream-v1` @ **v7.0** | 换核收益基线 |
 | 上游最新（§16.9） | 同树 HEAD ≈ **v7.2-rc4**（`b95f03f04d47`） | 相对 v7.0 的增量 |
 
-前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex` 内核侧「优化」实质**（§16.3.1）与 **切 cgroup v2 的收益**（§16.3.3）。
+前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）**。
 
 公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）；`favordynmods` / per-threadgroup rwsem（`6a010a49b63a`、`0568f89d4fb8`）。
 
@@ -1289,8 +1290,8 @@ ls "$RESULT/perf"/*.svg
 | **低 / 条件** | per-netns RTNL | `cni.plugin.*` ~300ms | **默认构建几乎无并行收益**；转换未完成 | 见 §16.5 |
 | **低** | STP `br_info` printk | 历史 CNI 持锁放大 | **上游仍在**；本机补丁仍有价值 | 需继续关 printk 或上游安静化 |
 | **中等（读侧）** | kernfs 全局锁→per-root rwsem | `exists_check.stat`、部分 cgroup 读 | 减轻与 **sysfs 等其它 kernfs 根** 的交叉争用；**同层级 mkdir 仍串行** | 见 **§16.3.2** |
-| **中等（条件）** | favordynmods / 更细 threadgroup 锁 | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 偏 cgroup v2 + 配置 |
-| **中等** | mount ns RB 树等 | `runc.init.mounts` / `wait.for_hooks` | 大 ns 内查找/簿记更好；**全局 `namespace_sem` 仍在** | 见 §16.4 |
+| **中等（条件）** | favordynmods / per-tg rwsem | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 见 **§16.3.5** |
+| **中等 / 条件高** | mount ns RB 树；`CLONE_EMPTY_MNTNS` 等 | `runc.init.mounts` / `wait.for_hooks` | 换核默认旁路；**空 mntns 需改 runc** 才可能显著 | 见 **§16.4** |
 | **中等（放大器）** | EEVDF 调度 | `exec.wait`、等锁 sleep 尾延迟 | 可能改善唤醒尾延迟，**不砍秒级 apply** | 见 §16.6 |
 | **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **仍是全局主锁**；旁路优化见 §16.3.1 | 真要大降：减 controller / **切 v2**（§16.3.3） |
 | **待验证 / 高相关** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能显著降 apply**（少 N 次抢 `cgroup_mutex`） | 见 §16.3.3；CRI/runc 全路径 |
@@ -1349,11 +1350,7 @@ cgroup_mkdir
 1. **锁拆分（老基础）**  
    RCU 读（如 `cgroup_get_e_css`）、`css_set_lock`、`cgroup_idr_lock`：能不拿 mutex 就不拿。利于读路径与 ID 回收，**不让并发 mkdir 并行**。
 
-2. **`favordynmods` / `cgroup_threadgroup_rwsem`（动的是旁路锁）**  
-   - `CGRP_ROOT_FAVOR_DYNMODS`：降低动态 migrate 延迟时关掉 threadgroup rwsem 的 percpu 写路径（fork/exit 变慢）；默认恢复 percpu 后，需要者显式开 mount 选项 / `CONFIG_CGROUP_FAVOR_DYNMODS`（`6a010a49b63a`）。  
-   - 较新：`favordynmods` 时写 `cgroup.procs` 用 **per-threadgroup** `signal->cgroup_threadgroup_rwsem`（`0568f89d4fb8`），减轻与**其它线程组** fork 的争用。  
-   - 调用顺序仍是 **`cgroup_mutex` →（可选）threadgroup 写锁**。迁 `current` 单线程可 `CGRP_ATTACH_LOCK_NONE` 跳过 threadgroup 写锁。  
-   - 文档注明：`CLONE_INTO_CGROUP` 建组再 seed **不写锁 threadgroup**，因而**未必吃到** favordynmods。
+2. **`favordynmods` / `cgroup_threadgroup_rwsem`（动的是旁路锁）** — 详见 **§16.3.5**。不消掉 `cgroup_mutex`；对准 attach↔fork 争用。
 
 3. **销毁路径**  
    独立 `cgroup_offline_wq` 等；defer `kill_css_finish`（rmdir / disable controller）。改善销毁与 drain，**非**冷启动 create 主因。
@@ -1527,17 +1524,201 @@ cgroups.WriteCgroupProc(m.dirPath, pid)  // 一次挂进程
 
 主要走 `/proc` + css 查找，不是 mkdir 临界区。换核可能因 kernfs/调度略好而间接下降，**不宜预期从 ~700ms 主因级消失**；优先仍应用户态/调用次数下钻。
 
+#### 16.3.5 `favordynmods`：优化的是 `cgroup_threadgroup_rwsem`，不是 `cgroup_mutex`
+
+对照：upstream `include/linux/cgroup-defs.h`、`kernel/cgroup/cgroup.c`；**5.10 无此选项**。
+
+##### 意图（`CGRP_ROOT_FAVOR_DYNMODS` 注释）
+
+1. 关 threadgroup rwsem 的 **percpu 读快路径** → 动态 migrate / controller on-off **写延迟下降**，代价是 fork/exit 变慢。  
+2. （较新）写 `cgroup.procs` 时用 **per-threadgroup** rwsem，减轻与**其它线程组** fork/exec/exit 的争用。  
+3. 「建 cgroup + enable + `CLONE_INTO_CGROUP`」常不写锁 threadgroup → **未必吃到** favor。
+
+##### 演进两层
+
+| 阶段 | commit | 含义 |
+|------|--------|------|
+| 第一层 | `6a010a49b63a` | 默认恢复 percpu；需要低 migrate 延迟者显式开 `favordynmods` / `CONFIG_CGROUP_FAVOR_DYNMODS` |
+| 第二层 | `0568f89d4fb8` | 开 favor 时 procs 写锁改为 `signal->cgroup_threadgroup_rwsem`（per-tg） |
+| cmdline | `9b81d3a5be05` | `cgroup_favordynmods=`，v1/v2 均可选 |
+
+##### 如何打开
+
+| 方式 | 效果 |
+|------|------|
+| `CONFIG_CGROUP_FAVOR_DYNMODS` | 编译默认 `have_favordynmods` |
+| `cgroup_favordynmods=` | 启动覆盖 |
+| mount `favordynmods` / `nofavordynmods` | v1/v2 fs 参数 → `cgroup_favor_dynmods()` |
+
+```c
+void cgroup_favor_dynmods(struct cgroup_root *root, bool favor)
+{
+	percpu_down_write(&cgroup_threadgroup_rwsem);
+	if (favor && !favoring) {
+		cgroup_enable_per_threadgroup_rwsem = true;
+		rcu_sync_enter(&cgroup_threadgroup_rwsem.rss); /* 非 percpu 模式 */
+		root->flags |= CGRP_ROOT_FAVOR_DYNMODS;
+	} else if (!favor && favoring) {
+		/* per-tg 一旦启用，不宜再关（pr_warn_once） */
+		rcu_sync_exit(...);
+		root->flags &= ~CGRP_ROOT_FAVOR_DYNMODS;
+	}
+	percpu_up_write(&cgroup_threadgroup_rwsem);
+}
+```
+
+每进程组一把锁：`signal_struct.cgroup_threadgroup_rwsem`（`fork` 里 `init_rwsem`）。
+
+##### 热路径代码
+
+**fork/exec/exit（读者）**：
+
+```c
+/* cgroup_threadgroup_change_begin */
+percpu_down_read(&cgroup_threadgroup_rwsem);
+if (cgroup_enable_per_threadgroup_rwsem)
+	down_read(&tsk->signal->cgroup_threadgroup_rwsem);
+```
+
+**写 `cgroup.procs`（写者）——仍先持 `cgroup_mutex`**：
+
+```c
+/* cgroup_procs_write_start — lockdep_assert_held(&cgroup_mutex) */
+if (pid || threadgroup) {
+	if (cgroup_enable_per_threadgroup_rwsem)
+		*lock_mode = CGRP_ATTACH_LOCK_PER_THREADGROUP;
+	else
+		*lock_mode = CGRP_ATTACH_LOCK_GLOBAL;
+} else
+	*lock_mode = CGRP_ATTACH_LOCK_NONE; /* 迁 current 单线程可跳过 */
+
+cgroup_attach_lock(*lock_mode, tsk);
+/* GLOBAL → percpu_down_write(g_rwsem)
+ * PER_THREADGROUP → down_write(tsk->signal->cgroup_threadgroup_rwsem) */
+```
+
+| | 写 `cgroup.procs` | 其它进程 fork | 进程组级 migrate |
+|--|-------------------|---------------|------------------|
+| 关 favor | mutex + **全局** write `g_rwsem` | 全局 read | 全局 write |
+| 开 favor | mutex + **该 tg** write `p_rwsem` | 全局 read + 本 tg read | 仍全局 write |
+
+##### 对本场景
+
+| 点 | 说明 |
+|----|------|
+| **不砍 `cgroup_mutex`** | mkdir/apply 主串行轴不变；`runc.cgroup.apply ~1s` **不会**因 favor 腰斩 |
+| **对准 attach↔fork** | 高并发写 procs + 满机 spawn 时降 migrate 尾延迟 |
+| **代价** | fork/exit 变贵；per-tg 开启后难关 |
+| **相对切 v2** | v2 减 mutex 抢锁次数；favor 是旁路锁细粒度 — **附加项，不是替代品**（§16.3.3） |
+
 ### 16.4 L2 — mount / namespace（对准 `init.sync` wait）
 
 **映射**：父 `wait.for_hooks` ~336ms + `wait.for_ready` ~339ms；子 `runc.init.mounts` ~152ms、`prepareRoot` ~59ms（跨进程林，§8.5.4）。
 
-| | 5.10.229 | 7.0 |
-|--|----------|-----|
-| 命名空间写锁 | 全局 `DECLARE_RWSEM(namespace_sem)`（`fs/namespace.c`） | **仍全局** |
-| mount 集合 | 链表 | **RB 树**等（大 ns 查找/迭代更好） |
-| 其它 | — | 空 mount ns、`OPEN_TREE_NAMESPACE` 等 API 演进 |
+对照：`/home/nathan/linux` vs `/home/nathan/linux-upstream-v1` 的 `fs/namespace.c`、`fs/mount.h`。
 
-**对本场景**：并发沙箱的子进程同时 `CLONE_NEWNS` + 多 mount，仍抢 **同一把 `namespace_sem`**。7.0 的数据结构改进可能略减单次 mounts 成本，从而略缩父 wait，但 **不是**「多容器 mount 完全并行」。优化 sync 仍应优先打用户态 mount 集合/次数（§8.5.7）。
+#### 16.4.1 锁模型：`namespace_sem` 仍全局
+
+```c
+/* fs/namespace.c — 5.10 与上游相同 */
+static DECLARE_RWSEM(namespace_sem);
+```
+
+另有 `mount_lock`（seqlock）：保护 mount 哈希表查找/行走。
+
+| 锁 | 保护什么 | 高并发沙箱含义 |
+|----|----------|----------------|
+| **`namespace_sem`** | 跨 ns 创建/拷贝/挂卸载簿记 | **仍全局**：多路 `CLONE_NEWNS` + 大量 mount **写锁互斥** |
+| **`mount_lock`** | `mount_hashtable` 等 | 读多写少；与 sem 配合 |
+
+**没有**「per-mount-ns 的 namespace_sem」；换核默认 **不能**让多容器 mount 完全并行。
+
+#### 16.4.2 ns 内挂载集合：链表 → 红黑树
+
+**5.10**（`fs/mount.h`）：
+
+```c
+struct mnt_namespace {
+	struct mount *root;
+	struct list_head list;   /* 线性链表 */
+	spinlock_t ns_lock;
+	unsigned int mounts;
+	...
+};
+```
+
+**上游**：
+
+```c
+struct mnt_namespace {
+	struct mount *root;
+	struct {
+		struct rb_root mounts;           /* Protected by namespace_sem */
+		struct rb_node *mnt_last_node;
+		struct rb_node *mnt_first_node;
+	};
+	unsigned int nr_mounts;
+	...
+};
+```
+
+收益：大 ns 内查找/迭代（`listmount`/`statmount`）更快 → **单次持 `namespace_sem` 更短**。  
+另有全局 mntns 索引的 **lockless RB 查找**（`5dcbd85d3551`）：偏跨 ns 查询（systemd 列容器挂载），非 runc 建沙箱热路径。
+
+#### 16.4.3 条件高杠杆：少拷整棵挂载树
+
+容器常见浪费（`OPEN_TREE_NAMESPACE` 动机）：
+
+1. `CLONE_NEWNS` → **`copy_tree()` 拷贝调用者全部挂载**  
+2. 组装 rootfs → `pivot_root`  
+3. 再递归 umount 丢掉刚拷来的树  
+
+高并发：拷贝量 × 沙箱数 → 拉长 `namespace_sem` 持锁 → 与父等 `init.sync` / 子 `runc.init.mounts` 一致。
+
+##### `CLONE_EMPTY_MNTNS`（≈7.1+，`9d4e752a24f7`）
+
+```c
+#define CLONE_EMPTY_MNTNS (1ULL << 37)  /* 暗示 CLONE_NEWNS */
+```
+
+`copy_mnt_ns()`：
+
+```c
+guard(namespace_excl)();  /* down_write(namespace_sem) */
+if (flags & CLONE_EMPTY_MNTNS)
+	new = clone_mnt(old, old->mnt.mnt_root, ...);  /* 只拷根 */
+else
+	new = copy_tree(old, old->mnt.mnt_root, ...); /* 整树 */
+/* EMPTY：root/pwd 指新根；mnt_add_to_ns 只登记一棵 */
+```
+
+沙箱从「只有一份 root」起步再自行 mount。**需 runc/containerd 改 clone3**；当前用户态一般未用。
+
+##### `OPEN_TREE_NAMESPACE` / `FSMOUNT_NAMESPACE`
+
+- `open_tree(..., OPEN_TREE_NAMESPACE)`：只拷指定子树进新 mntns，返回 ns fd（近似 unshare+pivot，少拷无关挂载）。  
+- `fsmount(..., FSMOUNT_NAMESPACE)`：新建 fs 并直接放进新 mntns。
+
+内核有、热路径未接则 **零收益**。
+
+#### 16.4.4 与冷启动路径叠层
+
+```
+runc 子进程 CLONE_NEWNS (+ 可能 EMPTY)
+  → copy_mnt_ns → 【全局 namespace_sem 写锁】→ copy_tree 或 clone_mnt
+  → 多次 mount / pivot → 仍常拿 namespace_sem / mount_lock
+父 init.sync.wait.for_hooks|ready → 等子进程 prepareRoot + mounts（§8.5）
+```
+
+| 优化 | 是否拆掉全局 `namespace_sem` | 对本场景 |
+|------|------------------------------|----------|
+| mounts：list → RB 树 | 否 | 略缩持锁；默认仍 `copy_tree` |
+| lockless 查 mntns | 否 | 偏跨 ns 查询 |
+| `CLONE_EMPTY_MNTNS` | 否，但 **少持锁工作量** | **条件收益最大**（需改 runc） |
+| `OPEN_TREE_NAMESPACE` / `FSMOUNT_NAMESPACE` | 同上 | 条件 |
+| 换核默认行为 | — | 不接新 API ≈ **旁路级** |
+
+**一句话（mount/ns）**：数据结构与查询变轻；**真正可能砍 `init.sync` 的是空 mntns / open_tree-ns（需用户态）**，不是默默升内核。优化 sync 仍应优先减 mount 次数（§8.5.7）。
 
 ### 16.5 L3 — 网络 / RTNL（对准剩余 CNI ~300ms）
 
