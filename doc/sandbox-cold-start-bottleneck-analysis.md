@@ -933,8 +933,9 @@ container.NewTask                 ~3.77s
 | G. **`--perf_sandbox` 打 `shim.cgroup.load` / `cgroup.apply`** | 瓶颈 B 下一刀 | 确认 cgroupfs / kernfs 争用符号 |
 | H. **换内核 5.10→7.0（同用户态配置）** | 量化纯换核 | 见 §16.8；预期 apply/CNI 不会数量级下降 |
 | I. **bbolt：`no_sync` / 合并 sandbox Update** | 瓶颈 C | 见 §17.7；盯 `.tx.wait` / Update Cnt |
+| J. **仅切 cgroup v2** | 瓶颈 B / `cgroup.apply` | 见 §16.3.3 / §16.8；盯 `runc.cgroup.apply.*` Cnt/Avg |
 
-中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游 7.0 内核的预期与边界见 §16**（不能替代 cgroup 路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
+中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`（评估 cgroup v2，§16.3.3）、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游内核的预期与边界见 §16**（含 `cgroup_mutex` 机制 §16.3.1；7.2-rc 增量 §16.9；不能替代 cgroup 路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
@@ -1260,7 +1261,7 @@ ls "$RESULT/perf"/*.svg
 | 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 cgroup 路径与 sync 子进程侧；bbolt 可并行试 `no_sync` / 减 Update。**换内核（5.10→7.0）的预期收益见 §16**——不能指望单独解决秒级 NewTask。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 **评估 cgroup v2**（§16.3.3）与 sync 子进程侧；bbolt 可并行试 `no_sync` / 减 Update。**换内核收益见 §16**（`cgroup_mutex` 机制 §16.3.1；相对 7.0 的 7.2-rc 增量 §16.9）——不能指望单独解决秒级 NewTask。
 
 ---
 
@@ -1271,11 +1272,12 @@ ls "$RESULT/perf"/*.svg
 | 树 | 路径 | 版本 |
 |----|------|------|
 | 现网 / 分析用 | `/home/nathan/linux` | **v5.10.229**（含关 netlink printk：`0d91342dba12`） |
-| 上游对照 | `/home/nathan/linux-upstream-v1` | **v7.0** |
+| 上游对照（§16 主文） | `/home/nathan/linux-upstream-v1` @ **v7.0** | 换核收益基线 |
+| 上游最新（§16.9） | 同树 HEAD ≈ **v7.2-rc4**（`b95f03f04d47`） | 相对 v7.0 的增量 |
 
-前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析只回答：**换到 v7.0 能砍哪几段墙钟、砍不动哪几段**。
+前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex` 内核侧「优化」实质**（§16.3.1）与 **切 cgroup v2 的收益**（§16.3.3）。
 
-公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）。
+公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）；`favordynmods` / per-threadgroup rwsem（`6a010a49b63a`、`0568f89d4fb8`）。
 
 ### 16.1 收益总表（按对本场景墙钟的相关度）
 
@@ -1291,7 +1293,7 @@ ls "$RESULT/perf"/*.svg
 | **中等** | mount ns RB 树等 | `runc.init.mounts` / `wait.for_hooks` | 大 ns 内查找/簿记更好；**全局 `namespace_sem` 仍在** | 见 §16.4 |
 | **中等（放大器）** | EEVDF 调度 | `exec.wait`、等锁 sleep 尾延迟 | 可能改善唤醒尾延迟，**不砍秒级 apply** | 见 §16.6 |
 | **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **v7.0 仍是全局 `cgroup_mutex`**；无 cgroup pool | 真要大降：减 controller / 切 v2 / 用户态策略 |
-| **待验证** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能**显著降 apply（非「默默升内核」） | CRI/runc/systemd 全路径验证 |
+| **待验证 / 高相关** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能显著降 apply**（少 N 次抢 `cgroup_mutex`） | 见 §16.3.3；CRI/runc 全路径 |
 
 ### 16.2 L0 — 换核几乎帮不上的边界
 
@@ -1303,18 +1305,70 @@ ls "$RESULT/perf"/*.svg
 
 **映射**：`runc.cgroup.apply` ~1.03s（cpuset/devices/memory）、`shim.cgroup.load` ~734ms、`exists_check.stat`（Avg 高 / P50 低）。
 
-#### 16.3.1 `cgroup_mutex`：两边仍是全局主锁
+#### 16.3.1 `cgroup_mutex`：仍是全局主锁；内核「优化」多是旁路锁
 
-| | 5.10.229 | 7.0 |
-|--|----------|-----|
-| 定义 | `kernel/cgroup/cgroup.c`：`DEFINE_MUTEX(cgroup_mutex)` | 同左（约 L89）；封装为 `cgroup_lock()` |
-| mkdir | `cgroup_mkdir` → `cgroup_kn_lock_live` → 持 `cgroup_mutex` | 同模式 |
-| 写 `cgroup.procs` | attach 路径同样持 `cgroup_mutex` | 同模式 |
-| cgroup pool / mkdir 快路径 | 无 | **无**（LKML 上 v1 pool RFC 未合入；社区倾向用 v2） |
+| | 5.10.229 | 7.0 / 最新主线（§16.9） |
+|--|----------|-------------------------|
+| 定义 | `DEFINE_MUTEX(cgroup_mutex)` | 同左；`cgroup_lock()` ≡ `mutex_lock(&cgroup_mutex)` |
+| mkdir | `cgroup_mkdir` → `cgroup_kn_lock_live` → 持锁 | **同模式** |
+| 写 `cgroup.procs` | attach 路径持 `cgroup_mutex` | **同模式** |
+| cgroup pool / 拆 mutex | 无 | **仍无**（LKML v1 pool RFC 未合入；社区倾向用 v2） |
 
-**对本场景**：高并发下每个沙箱对 **多个 v1 子系统** 做 mkdir + 写 procs，全部挤在同一把全局锁上——这与 TRACE 里 `apply.*` 的争用形态一致。**升到 7.0 若不改用户态路径，无法指望 apply 从 ~1s 掉一个数量级。**
+源码注释（upstream `kernel/cgroup/cgroup.c`）：
 
-近期 LKML 上 `cgroup_file_notify` 细锁化（全局 `cgroup_file_kn_lock` → per-file）主要服务 **memory 事件通知 / reclaim**，不是 mkdir 冷启动热路径。
+> `cgroup_mutex` is the master lock. Any modification to cgroup or its hierarchy must be performed while holding it.
+
+同文件旁路锁：
+
+| 锁 | 职责 | 与 mutex 关系 |
+|----|------|----------------|
+| `css_set_lock` | task↔css_set 链表 | 细粒度 spinlock；读路径可不拿 mutex |
+| `cgroup_idr_lock` | css/cgroup ID 释放 | **可不拿** `cgroup_mutex` |
+| `cgroup_threadgroup_rwsem` | 与 fork/exit 互斥 | **另一把锁**；attach 时 **叠在** mutex 之上 |
+| `cgroup_file` 内 `spinlock`（原全局 `cgroup_file_kn_lock`） | `cgroup_file_notify` | **不是** mutex；偏 memory.events / reclaim |
+
+**冷启动热路径（mkdir）仍整段持 mutex**（5.10 与最新主线相同）：
+
+```
+cgroup_mkdir
+  → cgroup_kn_lock_live(parent)   // cgroup_tryget + break kernfs active_ref + cgroup_lock()
+  → cgroup_create / css_populate_dir / cgroup_apply_control_enable
+  → cgroup_kn_unlock              // cgroup_unlock()
+```
+
+`cgroup_kn_lock_live` 的目的是 **解开与 kernfs active_ref 的嵌套锁序**（避免死锁、允许自删除），**不缩短** mkdir 持锁工作量。
+
+写 `cgroup.procs`：`__cgroup_procs_write` → **先** `cgroup_kn_lock_live`（mutex）→ **再** `cgroup_attach_lock`（可选 threadgroup 写锁）→ `cgroup_attach_task`。
+
+**对本场景**：高并发下每个沙箱对 **多个 v1 子系统** 做 mkdir + 写 procs，全部挤在同一把全局锁上——与 TRACE `apply.*` 一致。**升内核若不改用户态路径，无法指望 apply 从 ~1s 掉一个数量级。**
+
+##### 内核围绕 `cgroup_mutex` 实际做了哪些「优化」
+
+结论先说：**从未把 `cgroup_mutex` 拆成 per-cgroup / per-hierarchy 主锁**；优化是缩小职责、减轻与 fork 的交叉争用、异步化销毁。
+
+1. **锁拆分（老基础）**  
+   RCU 读（如 `cgroup_get_e_css`）、`css_set_lock`、`cgroup_idr_lock`：能不拿 mutex 就不拿。利于读路径与 ID 回收，**不让并发 mkdir 并行**。
+
+2. **`favordynmods` / `cgroup_threadgroup_rwsem`（动的是旁路锁）**  
+   - `CGRP_ROOT_FAVOR_DYNMODS`：降低动态 migrate 延迟时关掉 threadgroup rwsem 的 percpu 写路径（fork/exit 变慢）；默认恢复 percpu 后，需要者显式开 mount 选项 / `CONFIG_CGROUP_FAVOR_DYNMODS`（`6a010a49b63a`）。  
+   - 较新：`favordynmods` 时写 `cgroup.procs` 用 **per-threadgroup** `signal->cgroup_threadgroup_rwsem`（`0568f89d4fb8`），减轻与**其它线程组** fork 的争用。  
+   - 调用顺序仍是 **`cgroup_mutex` →（可选）threadgroup 写锁**。迁 `current` 单线程可 `CGRP_ATTACH_LOCK_NONE` 跳过 threadgroup 写锁。  
+   - 文档注明：`CLONE_INTO_CGROUP` 建组再 seed **不写锁 threadgroup**，因而**未必吃到** favordynmods。
+
+3. **销毁路径**  
+   独立 `cgroup_offline_wq` 等；defer `kill_css_finish`（rmdir / disable controller）。改善销毁与 drain，**非**冷启动 create 主因。
+
+4. **`cgroup_file_notify` 细锁化（7.1）**  
+   全局 `cgroup_file_kn_lock` → per-`cgroup_file` spinlock + lockless 快路径。服务通知路径，**对本场景 `cgroup.apply` 几乎无关**。
+
+| 手段 | 是否拆掉 `cgroup_mutex` | 对本冷启动（v1 多子系统 apply） |
+|------|-------------------------|--------------------------------|
+| `css_set_lock` / RCU / `idr_lock` | 否 | 读路径有益；mkdir 仍串行 |
+| `cgroup_kn_lock_live` | 否 | 锁序正确性；持锁工作量不变 |
+| `favordynmods` + per-tg rwsem | 否 | 略减 attach↔fork 尾延迟；**不砍**多沙箱抢 mutex |
+| defer css kill / 独立 wq | 否 | 偏销毁 |
+| `cgroup_file_notify` 细锁 | 无关 | 基本无感 |
+| 拆 mutex / cgroup pool | — | **未合入** |
 
 #### 16.3.2 kernfs：全局 mutex → per-root rwsem（读侧有帮助）
 
@@ -1328,17 +1382,56 @@ ls "$RESULT/perf"/*.svg
 - **`exists_check.stat` / 部分 cgroup 读**：可与 sysfs 等其它 kernfs 根解耦，读侧可共享持锁 → **中等、偏尾延迟**收益。  
 - **`runc.cgroup.apply` mkdir**：同一 cgroup 层级上仍要过 **`cgroup_mutex`**；per-root kernfs **不能**让同层级并发 mkdir 真正并行。
 
-#### 16.3.3 cgroup v2 / favordynmods（条件收益，不是默认白嫖）
+#### 16.3.3 切 cgroup v2（unified）的好处（对本场景）
 
-7.0 仍默认 default hierarchy 为 cgroup2 根，但控制器不自动全开。新增/强化：
+这是相对「只换内核、继续 v1」**最可能显著砍 `runc.cgroup.apply`** 的用户态/节点配置变更，需 CRI/runc/systemd 全路径切换并单独压测（§16.8 实验 C），**不能算进「默默升内核包」**。
 
-- mount 选项 **`favordynmods`** / `CONFIG_CGROUP_FAVOR_DYNMODS`：减轻 **attach 与无关 threadgroup 的 fork/exit** 对全局 `cgroup_threadgroup_rwsem` 的争用。  
-- 文档亦注明：纯「建 cgroup + enable + `CLONE_INTO_CGROUP`」模式未必吃到 favordynmods。
+##### 机制：少抢几次全局 `cgroup_mutex`
 
-**对本场景（当前 cgroup v1 + 多子系统 apply）**：
+当前 TRACE：`runc.cgroup.apply ~1s`，拆成 cpuset / devices / memory 等。v1 下 runc（`opencontainers/cgroups/fs`）**按子系统循环**——每个控制器各自路径 mkdir + 写 `cgroup.procs`：
 
-- **原地升内核、继续 v1**：apply 大头仍在。  
-- **顺带切 unified cgroup v2**：单层级、更少「每 controller 一次 mkdir」，**才是**可能显著砍 `apply` 的方向——属产品/CRI 变更，需单独对照压测，不能算进「只换内核包」。
+```go
+// vendor/.../cgroups/fs/fs.go — Manager.Apply
+for _, sys := range subsystems {
+    err = sys.Apply(p, c.Resources, pid)  // 每子系统一次
+}
+```
+
+v2（`cgroups/fs2`）变成 **一条统一路径**：建目录 + 写父级 `cgroup.subtree_control`，再 **只写一次** `cgroup.procs`：
+
+```go
+// vendor/.../cgroups/fs2/fs2.go — Manager.Apply
+CreateCgroupPath(m.dirPath, m.config)
+cgroups.WriteCgroupProc(m.dirPath, pid)  // 一次挂进程
+```
+
+| 对比 | cgroup v1（现状） | cgroup v2 |
+|------|-------------------|-----------|
+| 层级 | 每 controller 一棵树 | **单棵** `/sys/fs/cgroup/...` |
+| 建组 | N 次 mkdir（N≈启用子系统） | 路径上 **一层一次** mkdir |
+| 挂进程 | N 次写 `cgroup.procs` | **1 次** |
+| 与 `cgroup_mutex` | N 次串行排队 | 次数 ≈ **O(路径深度)**，不再 ×N |
+
+高并发下：同样 128 路沙箱，对全局锁的抢锁次数少一个数量级量级 → **`runc.cgroup.apply` / NewTask 才有机会从秒级明显下降**。
+
+##### 其它收益（对本场景次要或间接）
+
+1. **模型统一**：`memory.max` / `cpu.max` / `io.max` 同目录，少跨 mount 对齐。  
+2. **委托 / 生态**：`nsdelegate`、K8s/containerd/systemd 默认路线。  
+3. **新特性面向 v2**：PSI、memory 事件、threaded 模式；`favordynmods` 也主要服务动态 migrate。  
+4. **可配合 `CLONE_INTO_CGROUP`**：建好再 clone 进组，少「事后写 procs」与 threadgroup 写锁（需用户态改创建路径）。
+
+##### 边界（别高估）
+
+- **`cgroup_mutex` 仍在**：v2 是 **少拿**，不是无锁；同层级并发 mkdir 仍串行。  
+- **`CreateCgroupPath` 仍可能多层 mkdir + 写 `subtree_control`**：路径深或 enable 很多 controller 仍有成本，通常仍远好于 v1「每子系统一整套」。  
+- **不管**：`shim.cgroup.load`、`init.sync`、bbolt、RTNL。  
+- **兼容**：v1-only 行为（旧 devices 等）要迁到 v2 等价物。
+
+##### 与 favordynmods 的关系
+
+- **原地升内核、继续 v1**：apply 大头仍在；favordynmods 最多略减 attach↔fork 尾延迟。  
+- **切 unified v2**：才是可能显著砍 apply 的方向；favordynmods 是附加项，不是替代品。
 
 #### 16.3.4 `shim.cgroup.load`
 
@@ -1401,11 +1494,28 @@ LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全
 |------|------|------------------|
 | A. 同配置仅换 v7.0（保留关 printk） | 量化「纯换核」 | `cri.sandbox.run`、`cgroup.apply`、`exists_check.stat`、`cni.setup`、P95 |
 | B. v7.0 + 确认 `CONFIG_CGROUP_MISC=n` | 避免 misc 回退 | `manager.new.subsys.misc` |
-| C. v7.0 + cgroup v2（单独变量） | 验证 apply 是否大降 | `runc.cgroup.apply.*` Cnt/Avg |
+| C. **仅切 cgroup v2**（同内核，单独变量） | 验证 apply 是否大降 | `runc.cgroup.apply.*` Cnt/Avg、`cri.sandbox.run` |
 | D. v7.0 默认 vs 开 `DEBUG_NET_SMALL_RTNL` | 证明转换期 debug 无生产收益 | `cni.setup`（预期持平或变差） |
 | E. `--perf_sandbox` 对比 `cgroup_mutex` / `kernfs_rwsem` / `rtnl_lock` | 锁符号是否从全局 kernfs_mutex 变为 per-root | 火焰图 |
+| F. 同配置 v7.0 → 最新主线（§16.9） | 量化 7.1/7.2 旁路增量 | 预期 apply/CNI 无数量级变化 |
 
-**一句话（§16）**：从 **5.10.229 升到 7.0**，对本冷启动场景的**确定收益偏「旁路」**（kernfs 读侧、dump/拆 netns、可能的调度尾延迟）；**NewTask 秒级主因（`cgroup_mutex` 串行的多子系统 apply、全局 `namespace_sem`、未完成的全局 RTNL）不会因换核自动消失**。若目标是砍 `cgroup.apply`，应把 **cgroup v2 / 减少 controller 操作** 与换核分开立项验证；网络侧则继续保留 **关 printk**，并等待 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
+### 16.9 相对 v7.0：最新 upstream（≈7.2-rc）增量
+
+对照：`/home/nathan/linux-upstream-v1` HEAD ≈ **v7.2-rc4**（`b95f03f04d47`）相对 **v7.0**（约 3.3 万 commits）。
+
+**对本场景：没有「能砍掉 NewTask / `cgroup.apply` / 全局 RTNL」的新杀手特性。** 主锁与 §16.1–16.5 对 v7.0 的判断一致。
+
+| 档位 | 特性 | 对本场景 |
+|------|------|----------|
+| **低** | RTNL 继续卸压（`GETLINK`+`NAME_ONLY` 可不拿 RTNL；ipmr/ip6mr、部分 fib exit、ops-locked ethtool） | 减压旁路；**不砍** bridge/veth `newlink`/`setlink` |
+| **低** | bridge lockless flag / atomic 读 | 查询路径；**`br_info` 仍 printk** |
+| **低** | `cgroup_file_notify` 细锁 + defer `kill_css` | 通知/销毁；非 mkdir apply |
+| **条件/中（需改用户态）** | `CLONE_EMPTY_MNTNS` / `FSMOUNT_NAMESPACE` | **可能**缩短 mounts / `wait.for_hooks`；runc 当前未用 |
+| **基本无** | `cgroup_mutex` / `namespace_sem` / 默认全局 RTNL / favordynmods 跃迁 | 与 v7.0 同档 |
+
+`DEBUG_NET_SMALL_RTNL` 仍 default **n**；默认 `rtnl_net_lock()` ≡ `rtnl_lock()`。换核仍保留关 `br_info`/console 策略。
+
+**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）**，确定收益偏「旁路」；**`cgroup_mutex` 内核侧优化不消掉串行 mkdir/procs**（§16.3.1）。砍 `cgroup.apply` 应 **切 cgroup v2 / 减少 controller**（§16.3.3）并单独压测；网络侧保留关 printk，等 per-netns RTNL 完成后再预期 CNI 并行度跃迁。
 
 ---
 
@@ -1579,3 +1689,4 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | 2026-07-21 | §2.3 / §8.3 / **§8.5** / §9 / §12 / §15：写入细粒度 TRACE 复测——NewTask 再成头号；拆解 `cgroup.apply` / `shim.cgroup.load`；说明 `runc.init.sync` 在等子进程及与 `mounts` 的对应关系 |
 | 2026-07-21 | **§16**：对照 `/home/nathan/linux`（5.10.229）与 `/home/nathan/linux-upstream-v1`（7.0），按 TRACE 桶评估换核对冷启动的收益与边界 |
 | 2026-07-21 | **§17**：bbolt 单写者机制 + `no_sync`/Batch/减少 Update/Prepare 双 tx 等优化分层与验证矩阵 |
+| 2026-07-21 | **§16.3.1 / §16.3.3 / §16.9**：展开 `cgroup_mutex` 旁路优化与源码路径；切 cgroup v2 对本场景的好处与边界；v7.0→≈7.2-rc 增量 |
