@@ -63,8 +63,21 @@
 | + `ipMasq: false`（目录较干净） | **~17.3** | **~10.7s** | 6.92s | **386ms** | **NewTask ~36%** |
 | 同上 + host-local 预填 5000（无索引） | （以 profile 为主） | run P95 ~12.8s | 9.26s | **8.83s** | **CNI / bridge** |
 | + host-local **旁路索引**（`by_id.idx`） | — | run P95 **~11.9s** | **7.49s** | **342ms** | **NewTask ~3.24s**；**端到端未见收益** |
+| + runc：**跳过缺失 cgroup 控制器的 mountinfo**（misc） | — | run P95 **~9.4s** | **6.45s** | **245ms** | **NewContainer ~2.3s**（见 §8.4） |
 
-**当前工作点**：关 printk + `ipMasq: false`、目录较干净时，以 `profile/..._disable-printk_ip-masq-false` 为准（吞吐 ~17.3/s，`cni.setup` ~386ms，NewTask 为首）。host-local 旁路索引改动后的复测与该点同量级，**未带来可感知的端到端改善**（见 §7.5）。
+**当前工作点（2026-07-20）**：关 printk + `ipMasq: false` + 上述 runc 短路后（profile 复测）：
+
+| Span | Avg | 约占 `cri.sandbox.run` |
+|------|-----|------------------------|
+| `cri.sandbox.run` | **6.45s** | 100% |
+| `client.NewContainer` | **2.30s** | **~36%** ← 头号 |
+| `container.NewTask` | **1.59s** | ~25% |
+| `cni.setup_pod_network` | **245ms** | ~4% |
+| `runc.create`（合并 TRACE） | **694ms** | — |
+| └ `manager.new` / `initPaths` | **~28ms** | （改前 ~870ms） |
+| └ `subsys.misc` | Avg 23ms / **P50 0.13ms** | （改前 Avg ~866ms） |
+
+host-local 旁路索引相对干净目录基线仍**未见端到端收益**（§7.5）。下一刀：NewContainer（snapshot/lease/metadata）与 shim/NewTask（§8）。
 
 ---
 
@@ -646,7 +659,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | `client.NewContainer` | 1.95s | ~28% |
 | `cni.setup_pod_network` | 386ms | ~6% |
 
-关 masq 后 NewTask 从 1.71s（关 printk）升到 **2.48s**：配网变轻后更多工作堆到 task 创建，**瓶颈 B 已是当前主战场**。host-local 旁路索引复测里 NewTask 仍约 **3.2s**、CNI 仍约 **0.3s**，进一步说明动 IPAM **拉不动** 端到端（§7.5）。
+关 masq 后 NewTask 从 1.71s（关 printk）升到 **2.48s**：配网变轻后更多工作堆到 task 创建，**瓶颈 B 曾是主战场**。host-local 旁路索引复测里 NewTask 仍约 **3.2s**。进一步用 runc TRACE 下钻后，发现 `runc.create` 内 **`manager.new` 几乎全是 `subsys.misc`**（§8.4）；短路优化后 NewTask/`runc.create` 明显下降，端到端头号换到 **NewContainer**。
 
 ### 8.2 机制（当前深度）与下钻方式
 
@@ -668,7 +681,70 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 8.3 小结（瓶颈 B）
 
-基线下 NewTask 是与 CNI 并列的大桶；**关 printk + 关 ipMasq 且 IPAM 目录较干净之后，NewTask 升为端到端头号（Avg ~2.5s，约占 run 的 ~36%）**。表现为 CPU + 大量 off-CPU 等待。优化方向：用带 TRACE 的 shim/runc 拆 `shim.task.create`（§8.2 / §13）、预热/复用、减少 per-sandbox 进程成本、或降并发观察是否线性改善。
+基线下 NewTask 是与 CNI 并列的大桶；关 printk + 关 ipMasq 后曾升为端到端头号。**runc TRACE 进一步暴露：`manager.new` 被不存在的 `misc` 控制器拖到 ~0.9s（§8.4）**；短路后 `runc.create` ~1.9s→~0.7s，NewTask ~1.6s，端到端头号转为 **NewContainer**。仍需继续拆 shim Create / snapshot / metadata。
+
+### 8.4 对照实验：cgroup v1 `misc` 假路径（mountinfo）——已优化
+
+#### 现象（优化前）
+
+关 printk + `ipMasq: false`、带 runc 细粒度 TRACE 时，`runc.create` Avg 约 **1.9s**，其中：
+
+| Span | Avg | 说明 |
+|------|-----|------|
+| `runc.cgroup.manager.new` / `initPaths` | **~870ms** | 几乎整段 `container.new` |
+| `…subsys.cpuset` … `name=systemd` | 各 **&lt;1ms** | `tryDefaultPath` 命中 |
+| **`…subsys.misc`** | **~866ms** | **占满 initPaths**；随压测变慢（前 50 次 ~288ms → 后 50 次 ~2.7s） |
+| `runc.cgroup.apply` | ~480ms | 真实写 cgroup；`cpuset` 最大 |
+| `runc.init.sync` | ~360ms | 多为 `sync.wait` |
+
+`apply` 树中**没有** `apply.misc` → misc 在 `initPaths` 已 NotFound 并 skip，却仍付了查找成本。
+
+#### 机制
+
+1. **runc 无「关闭 misc」配置**：`fs.Manager` 的 `subsystems` 写死含 `&NameGroup{GroupName: "misc", Join: true}`（OCI/`SkipDevices` 等均管不到 misc）。
+2. CRI 的 `cgroupsPath` 为**绝对路径**（如 `/k8s.io/<id>`）→ `subsysPath` 对每个控制器调 `FindCgroupMountpoint`。
+3. 已有控制器：`tryDefaultPath` → `/sys/fs/cgroup/<name>` 命中，很快。
+4. **misc**：本机无该挂载 → `tryDefaultPath` miss → **读并解析整份 `/proc/.../mountinfo`**（过滤 `fstype=cgroup`），再线性查 `VFSOptions` → NotFound。
+5. **每个 `runc create` 新进程**：`sync.Once` 仅进程内有效；128 并发下反复扫 mountinfo，且沙箱增多后表变大、与 CNI mount 争用 → 延迟恶化。
+
+**「读 mountinfo 全表」要点**：`GetMounts(FSTypeFilter("cgroup"))` 仍对文件**逐行完整 parse**，过滤器只决定是否放入结果、且不提前 `stop`；贵的是整表读+parse，不是最后那次字符串比较。
+
+#### 内核侧（本机 5.10.229）
+
+| 项 | 结论 |
+|----|------|
+| `/home/nathan/linux`（5.10） | **无** `kernel/cgroup/misc.c`，**无** `SUBSYS(misc)` |
+| 运行中 | `/proc/cgroups` 无 misc；`/sys/fs/cgroup/misc` 不存在 |
+| 上游 ≥5.13 + `CONFIG_CGROUP_MISC` | 文档在 cgroup-v2；实现可同时有 `legacy_cftypes` / `dfl_cftypes`，v1 上也可能出现 |
+| 对本机 | **没有 misc；每次 Find 都是无效工作** |
+
+一般不能说「凡 cgroup v1 都永远没有 misc」；对本机 5.10 可以确定没有。
+
+#### 优化（已做）
+
+改 `/home/nathan/runc` → `vendor/.../cgroups/v1_utils.go` 的 `FindCgroupMountpoint`（commit `944c5b07`，分支 `profile_cgroup-misc`）：
+
+1. 进程内缓存 `/proc/cgroups` 中 `enabled!=0` 的控制器集合。
+2. `tryDefaultPath` miss 后：若**不是** `name=*` 且集合中**没有**该名 → 直接 `NotFound`，**不扫 mountinfo**。
+3. `name=systemd` 等命名层级不在 `/proc/cgroups`，仍走 mountinfo 兜底。
+4. 读 `/proc/cgroups` 失败则退回旧逻辑（安全）。
+
+无独立配置项可关 misc；必须改代码（或换不含该探测的 runc）。
+
+#### 优化后对照（同配置 profile）
+
+| 指标 | 优化前（约） | 优化后 | 变化 |
+|------|--------------|--------|------|
+| `cri.sandbox.run` Avg / P95 | ~7.5s / ~11.9s | **6.45s / 9.42s** | 端到端下降 |
+| `runc.create` Avg | ~1.9s | **694ms** | **约 −63%** |
+| `manager.new` / `initPaths` | ~870ms | **~28ms** | 数量级下降 |
+| `subsys.misc` Avg / P50 | ~866ms / ~500ms | **23ms / 0.13ms** | 主路径已短路；Avg 受少数慢尾拉高 |
+| `cni.setup` | ~340ms | **245ms** | 略降 |
+| 端到端头号 | NewTask | **NewContainer ~2.30s** | 阶段换位 |
+
+优化后 `runc.create` 内：`apply` ~293ms（`cpuset` ~123ms）、`init.sync` ~219ms（多为 wait）；misc 不再主导。
+
+**解读**：misc 短路对准的是 runc 内无效 mountinfo 成本，已验证有效；端到端下一层是 **NewContainer**（`snapshotter.Prepare` ~874ms、`WithLease` / Containers.Create 等）与仍占 ~1.6s 的 **NewTask/shim**。
 
 ---
 
@@ -732,13 +808,14 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | C4. **host-local 预填 5000**（已做） | 量化 `GetByID` Walk | 关 masq 上：`cni.setup` **386ms→8.83s**（约 ×23）；`scripts/hostlocal_prefill.sh`（见 §7.5） |
 | C5. **host-local 旁路索引 `by_id.idx`**（已做） | 去掉/缩短脏目录 Walk | **相对干净目录基线端到端未见效果**：run ~7.5s、`cni.setup` ~342ms vs 基线 386ms；NewTask 仍主导（见 §7.5） |
+| C6. **runc：缺失控制器跳过 mountinfo**（已做） | `subsys.misc` 扫 mountinfo | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；run ~6.45s；头号换 **NewContainer**（见 §8.4） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 shim / NewTask / runc**（关 printk + 关 `ipMasq` 且目录干净时）。host-local 旁路索引在当前工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM 应对，不宜再指望旁路索引拉动冷启动 P95。建议补跑 `hostlocal_prefill.sh clear` 空目录对照并带 `--resources`。
+中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 NewContainer（snapshot/lease）与 shim / NewTask**。misc mountinfo 短路已落地（§8.4）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。建议补跑 `hostlocal_prefill.sh clear` 空目录对照并带 `--resources`。
 
-不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**。
+不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
 ---
 
@@ -922,6 +999,8 @@ Create 内部 TRACE span：
 
 关 `ipMasq` 后若 `manager.new` / `init.sync` 仍大：优先看 `initPaths`/`subsys.*` 与 `sync.wait` + 子侧 `prepareRootfs`/`mounts`。
 
+**本机已优化（§8.4）**：`FindCgroupMountpoint` 在 `tryDefaultPath` miss 后查 `/proc/cgroups`；内核未启用的控制器（如无 `CONFIG_CGROUP_MISC` 时的 `misc`）直接 `NotFound`，不再扫 mountinfo。验证：`subsys.misc` P50 ~0.13ms，`initPaths` ~28ms。
+
 ---
 
 ### 13.4 CNI 插件（`/home/nathan/plugins`）
@@ -1044,19 +1123,22 @@ ls "$RESULT/perf"/*.svg
 | 端到端（关 printk + `ipMasq: false`） | P95 ≈ **10.7s**，吞吐约 **17.3** 沙箱/s；`cni.setup` Avg **1.21s→386ms**；iptables on-CPU **~25%→0%** |
 | 端到端（同上 + host-local 预填 5000） | `cni.setup` Avg **386ms→8.83s**（约 ×23）；CNI 再次主导 `cri.sandbox.run` |
 | **host-local 旁路索引**（`by_id.idx`） | **端到端未见效果**：相对关 masq 干净目录，`cni.setup` 386→342ms（同量级），run ~7.5s 仍由 NewTask 主导 |
-| **当前工作点**（关 printk + masq false，目录较干净） | 吞吐 ~**17.3**/s，P95 ~**10.7s**；`cni.setup` ~**386ms**；**NewTask ~2.48s（~36%）** |
+| **runc：misc / 缺失控制器跳过 mountinfo**（已做） | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；`subsys.misc` P50 **~0.13ms**（见 §8.4） |
+| **当前工作点**（关 printk + masq false + misc 短路） | `cri.sandbox.run` Avg **~6.45s** / P95 **~9.4s**；`cni.setup` ~**245ms**；**NewContainer ~2.30s（~36%）**；NewTask ~1.59s |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
 | 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
 | 再关 ipMasq 后主阶段（目录较干净） | **`container.NewTask` ~2.5s / ~36%**；CNI 仅 ~6%；iptables 消失 |
+| misc 短路后主阶段 | **`client.NewContainer` ~2.3s**；NewTask ~1.6s；CNI ~4%；`runc.create` ~0.7s |
 | 预填 5000 后主阶段 | **`cni.setup` / bridge ~8.8s**；NewTask/NewContainer Avg 骤降（队头在 IPAM） |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
 | 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证）；旁路索引**未拉到端到端** |
-| 瓶颈 B / C / D | **当前主战场：shim/NewTask**；metadata DB；containerd 4 核放大 |
-| 非主因 | 磁盘、内存 |
+| 瓶颈 B 深挖 | shim/NewTask；其中 **`manager.new`←`subsys.misc` 扫 mountinfo** 已对照并短路（§8.4） |
+| 瓶颈 B / C / D（当前） | **主战场：NewContainer（snapshot/lease/metadata）+ NewTask/shim**；containerd 4 核放大 |
+| 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重，下钻到 **`rtnl_mutex`**；**`br_info`→串口 printk** 与 **`ipMasq`→xtables** 已对照验证（吞吐约 12.8→15.1→17.3/s，`cni.setup` 约 5s→1.2s→0.4s）。脏目录下 Walk 可使 CNI 回升到 ~8.8s；**host-local 旁路索引相对干净目录基线未见端到端效果**。当前工作点下瓶颈在 **NewTask / shim / runc**。下一刀：shim/runc TRACE 下钻（§8 / §13）。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc 侧 **`misc` 在无该控制器的内核上仍扫 mountinfo**，已用 `/proc/cgroups` 短路砍掉（`runc.create` ~1.9s→0.7s）。**当前工作点**下端到端由 **NewContainer ~2.3s** 与 **NewTask ~1.6s** 主导；下一刀继续拆 snapshot/shim。
 
 ---
 
@@ -1082,3 +1164,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §7.5：写入 host-local 预填 5000 对照（`cni.setup` 386ms→8.83s；`hostlocal_prefill.sh`） |
 | 2026-07-17 | §2.3 / §7.5 / §12 / §15：记录 host-local 旁路索引（`by_id.idx`）改动后**端到端未见效果** |
 | 2026-07-20 | §13.3：补充 `manager.new.initPaths` / `init.sync.wait|hooks|…` / 子进程 `prepareRootfs` 等细粒度 TRACE |
+| 2026-07-20 | §2.3 / §8.4 / §12 / §15：记录 cgroup `misc` 扫 mountinfo 根因、内核确认、`/proc/cgroups` 短路优化与对照数据 |
