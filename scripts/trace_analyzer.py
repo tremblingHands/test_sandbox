@@ -331,6 +331,14 @@ def _span_label(span):
 _ANCHOR_ROOTS = frozenset({
     "cri.sandbox.run",
     "runc.create",
+    "containerd.task.v3.Task/Create",
+})
+
+# High-frequency RPC roots that must not absorb unrelated orphans/children
+# in the printed summary tree (common otel/journal parent-link noise).
+_NOISE_ROOTS = frozenset({
+    "containerd.task.v3.Task/State",
+    "containerd.services.events.ttrpc.v1.Events/Forward",
 })
 
 
@@ -356,16 +364,27 @@ def _fold_parent_for_orphan_root(name):
     return None
 
 
+def _path_top(path_key):
+    return path_key.split("\0", 1)[0] if path_key else ""
+
+
+def _path_under_noise(path_key):
+    return _path_top(path_key) in _NOISE_ROOTS
+
+
 def _root_sort_key(span):
     """Process real forest anchors before orphans so suffix-merge can hit."""
     name = span.name
     if name == "cri.sandbox.run":
-        return (0, name)
+        return (0, 0, name)
+    # Create before State/other Task methods so folded orphans attach here.
+    if name == "containerd.task.v3.Task/Create":
+        return (1, 0, name)
     if name.startswith("containerd.task.v3.Task/"):
-        return (1, name)
+        return (1, 1, name)
     if name == "runc.create":
-        return (2, name)
-    return (3, name)
+        return (2, 0, name)
+    return (3, 0, name)
 
 
 def _resolve_agg_path(parent_path, label, seen_paths):
@@ -381,13 +400,16 @@ def _resolve_agg_path(parent_path, label, seen_paths):
     if parent_path:
         pref = parent_path + "\0"
         matches = [k for k in matches if k.startswith(pref)]
+    # Never merge into noise RPC forests (Task/State, Events/Forward, …).
+    matches = [k for k in matches if not _path_under_noise(k)]
     if not matches:
         return path_key
 
     def rank(k):
         if k == "cri.sandbox.run" or k.startswith("cri.sandbox.run\0"):
             group = 0
-        elif k.startswith("containerd.task.v3.Task/"):
+        elif k == "containerd.task.v3.Task/Create" or k.startswith(
+                "containerd.task.v3.Task/Create\0"):
             group = 1
         elif k == "runc.create" or k.startswith("runc.create\0"):
             group = 2
@@ -414,13 +436,24 @@ def print_summary_tree_report(traces, file=sys.stdout):
 
     Orphan roots (missing parent in the log) are folded under canonical
     forest anchors and/or suffix-merged so the same logical span is not
-    printed twice as disconnected trees.
+    printed twice as disconnected trees. Fold anchors are always printed
+    even when never observed as a real span, so orphans do not visually
+    nest under the previous unrelated root (e.g. Task/State).
     """
     # order: [(path_key, label, depth)] first-appearance order
     order = []
     seen_paths = set()
+    # Anchors inserted only so folded orphans have a visible parent row.
+    synthetic_anchors = set()
     # all_spans: [(path_key, duration_ms)]
     all_spans = []
+
+    def ensure_anchor(anchor_name):
+        if anchor_name in seen_paths:
+            return
+        seen_paths.add(anchor_name)
+        order.append((anchor_name, anchor_name, 0))
+        synthetic_anchors.add(anchor_name)
 
     for _trace_id, spans in traces.items():
         roots = build_trees(spans)
@@ -430,6 +463,15 @@ def print_summary_tree_report(traces, file=sys.stdout):
 
         def walk(nodes, depth, parent_path):
             for s in nodes:
+                # Reparent spans that otel/journal wrongly hung under noise RPCs.
+                top = _path_top(parent_path)
+                if top in _NOISE_ROOTS:
+                    alt = _fold_parent_for_orphan_root(s.name)
+                    if alt:
+                        ensure_anchor(alt)
+                        walk([s], 1, alt)
+                        continue
+
                 label = _span_label(s)
                 natural = parent_path + "\0" + label if parent_path else label
                 path_key = _resolve_agg_path(parent_path, label, seen_paths)
@@ -443,6 +485,7 @@ def print_summary_tree_report(traces, file=sys.stdout):
                 if path_key not in seen_paths:
                     seen_paths.add(path_key)
                     order.append((path_key, label, disp_depth))
+                    synthetic_anchors.discard(path_key)
 
                 all_spans.append((path_key, s.duration_ms))
                 walk(s.children, disp_depth + 1, path_key)
@@ -450,11 +493,12 @@ def print_summary_tree_report(traces, file=sys.stdout):
         for root in roots:
             fold = _fold_parent_for_orphan_root(root.name)
             if fold:
+                ensure_anchor(fold)
                 walk([root], 1, fold)
             else:
                 walk([root], 0, "")
 
-    if not all_spans:
+    if not all_spans and not order:
         print("No spans to summarize.", file=file)
         return
 
@@ -480,9 +524,25 @@ def print_summary_tree_report(traces, file=sys.stdout):
         return data[int(f)] * (c - k) + data[int(c)] * (k - f)
 
     # Print in tree order; indent + leaf label only (path is for grouping)
+    prev_depth = None
     for path_key, label, depth in order:
+        # Blank line between top-level forests for readability.
+        if depth == 0 and prev_depth is not None:
+            print("", file=file)
+        prev_depth = depth
+
+        indent = "  " * depth
+        display = indent + label
+
         if path_key not in stats:
+            # Synthetic fold anchor with no observed samples of its own.
+            print(
+                "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
+                    display[:65], "-", "-", "-", "-", "-"),
+                file=file,
+            )
             continue
+
         durs = sorted(stats[path_key])
         n = len(durs)
         avg = sum(durs) / n
@@ -490,9 +550,6 @@ def print_summary_tree_report(traces, file=sys.stdout):
         p50 = percentile(durs, 50)
         p95 = percentile(durs, 95)
         p99 = percentile(durs, 99)
-
-        indent = "  " * depth
-        display = indent + label
 
         print(
             "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
