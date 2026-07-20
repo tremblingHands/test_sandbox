@@ -64,20 +64,23 @@
 | 同上 + host-local 预填 5000（无索引） | （以 profile 为主） | run P95 ~12.8s | 9.26s | **8.83s** | **CNI / bridge** |
 | + host-local **旁路索引**（`by_id.idx`） | — | run P95 **~11.9s** | **7.49s** | **342ms** | **NewTask ~3.24s**；**端到端未见收益** |
 | + runc：**跳过缺失 cgroup 控制器的 mountinfo**（misc） | — | run P95 **~9.4s** | **6.45s** | **245ms** | **NewContainer ~2.3s**（见 §8.4） |
+| + 细粒度 TRACE 复测（同环境，2026-07-21） | — | run P95 **~12.8s** | **6.36s** | **303ms** | **NewTask ~3.77s**（见 §8.5） |
 
-**当前工作点（2026-07-20）**：关 printk + `ipMasq: false` + 上述 runc 短路后（profile 复测）：
+**当前工作点（2026-07-21）**：关 printk + `ipMasq: false` + misc 短路 + 最新 shim/runc TRACE（profile 复测，`cri.sandbox.run` Cnt≈473）：
 
 | Span | Avg | 约占 `cri.sandbox.run` |
 |------|-----|------------------------|
-| `cri.sandbox.run` | **6.45s** | 100% |
-| `client.NewContainer` | **2.30s** | **~36%** ← 头号 |
-| `container.NewTask` | **1.59s** | ~25% |
-| `cni.setup_pod_network` | **245ms** | ~4% |
-| `runc.create`（合并 TRACE） | **694ms** | — |
-| └ `manager.new` / `initPaths` | **~28ms** | （改前 ~870ms） |
-| └ `subsys.misc` | Avg 23ms / **P50 0.13ms** | （改前 Avg ~866ms） |
+| `cri.sandbox.run` | **6.36s**（P95 **12.8s**） | 100% |
+| **`container.NewTask`** | **3.77s** | **~59%** ← **头号** |
+| `client.NewContainer` | **985ms** | ~15%（较 misc 刚短路后的 ~2.3s 已降） |
+| `cni.setup_pod_network` | **303ms** | ~5% |
+| `client.task.Start` | **345ms** | ~5% |
+| `runc.create`（合并 TRACE） | **2.18s** | —（含 pause+业务等，Cnt=1023） |
+| └ `runc.cgroup.apply` | **1.03s** | runc 内最大头（cpuset/devices/memory） |
+| └ `runc.init.sync` | **693ms** | 几乎全是等子进程（§8.5） |
+| `shim.cgroup.load` | **734ms** | NewTask 内新暴露次桶 |
 
-host-local 旁路索引相对干净目录基线仍**未见端到端收益**（§7.5）。下一刀：NewContainer（snapshot/lease/metadata）与 shim/NewTask（§8）。
+host-local 旁路索引相对干净目录基线仍**未见端到端收益**（§7.5）。下一刀：**cgroup.apply / shim.cgroup.load / init.sync 等待**，以及贯穿全程的 **bbolt `.tx.wait`**（§8.5 / §9）。
 
 ---
 
@@ -673,15 +676,18 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | Span | 位置 | 含义 |
 |------|------|------|
 | `shim.container.create` | shim `task.Create` | server 侧整段 Create |
+| `shim.container.new` | `NewContainer` | 应包裹 mount/init/cgroup.load |
 | `shim.rootfs.mount` | `mount.All` | 挂 rootfs |
 | `shim.init.create` | `Init.Create` | 准备并创建 init |
 | `shim.runc.create` | `go-runc Create` | 真正 `runc create` |
+| `shim.cgroup.load` | create 后 `loadProcessCgroup` | 按 init pid 加载 cgroup 句柄 |
+| `shim.manager.start` / `binary.exec.*` | 启 shim 进程 | `exec.start` + **`exec.wait`**（等就绪） |
 
 进一步可在 `/home/nathan/runc` 打同格式 TRACE，拆开 `runc.create` 内部（见 §13）。安装带 TRACE 的 **shim + runc** 后，`--profile` 会合并 journal 与 `/tmp/runc-trace.log`，再用 `scripts/trace_analyzer.py --summary-tree` 看子阶段。亦可继续用 `--perf_sandbox` 交叉验证。
 
 ### 8.3 小结（瓶颈 B）
 
-基线下 NewTask 是与 CNI 并列的大桶；关 printk + 关 ipMasq 后曾升为端到端头号。**runc TRACE 进一步暴露：`manager.new` 被不存在的 `misc` 控制器拖到 ~0.9s（§8.4）**；短路后 `runc.create` ~1.9s→~0.7s，NewTask ~1.6s，端到端头号转为 **NewContainer**。仍需继续拆 shim Create / snapshot / metadata。
+基线下 NewTask 是与 CNI 并列的大桶；关 printk + 关 ipMasq 后曾升为端到端头号。**runc TRACE 暴露 `manager.new`←`subsys.misc` 扫 mountinfo**（§8.4）并已短路。**2026-07-21 复测**（§8.5）里端到端仍约 **6.4s**，但阶段换位：**NewTask ~3.8s 再成头号**（NewContainer 降至 ~1s）；主因是 **`runc.cgroup.apply` + `shim.cgroup.load` + `init.sync` 等待子进程**。
 
 ### 8.4 对照实验：cgroup v1 `misc` 假路径（mountinfo）——已优化
 
@@ -744,7 +750,117 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 优化后 `runc.create` 内：`apply` ~293ms（`cpuset` ~123ms）、`init.sync` ~219ms（多为 wait）；misc 不再主导。
 
-**解读**：misc 短路对准的是 runc 内无效 mountinfo 成本，已验证有效；端到端下一层是 **NewContainer**（`snapshotter.Prepare` ~874ms、`WithLease` / Containers.Create 等）与仍占 ~1.6s 的 **NewTask/shim**。
+**解读**：misc 短路对准的是 runc 内无效 mountinfo 成本，已验证有效；端到端下一层当时是 **NewContainer**（`snapshotter.Prepare` ~874ms、`WithLease` / Containers.Create 等）与仍占 ~1.6s 的 **NewTask/shim**。后续细粒度 TRACE 复测见 **§8.5**（NewTask 再次主导）。
+
+### 8.5 细粒度 TRACE 复测（2026-07-21）：NewTask 再成头号
+
+同配置（关 printk + `ipMasq: false` + misc 短路），安装最新 containerd/shim/runc TRACE 后 `--summary-tree` 复测（`cri.sandbox.run` Cnt≈473）。
+
+#### 8.5.1 端到端结构
+
+| 阶段 | Avg | 约占 run | 角色 |
+|------|-----|----------|------|
+| **`container.NewTask`** | **3.77s** | **~59%** | **头号** |
+| **`client.NewContainer`** | **985ms** | ~15% | 第二（较 §8.4 的 ~2.3s 已降） |
+| `metadata.sandbox.Update`（多次） | 单次 ~0.2–0.35s，Cnt≫run | 合计可观 | 几乎全是 `.tx.wait` |
+| `cni.setup_pod_network` | 303ms | ~5% | 次要（bridge ~268ms） |
+| `client.task.Start` | 345ms | ~5% | 次要 |
+| `metadata.sandbox.Create` / 顶层 `lease.Create` | ~180–230ms | 各 ~3% | 多为 `.tx.wait` |
+
+P95/P99（~12.8s / ~14.0s）远高于 Avg → 高并发**锁/争用尾部**仍显著。
+
+相对 §8.4 工作点：端到端仍约 **6.3–6.5s**；**NewContainer 已从 ~2.3s 降到 ~1s**，瓶颈明确转回 **NewTask**。
+
+#### 8.5.2 NewTask / `Task/Create` 分解
+
+```text
+container.NewTask                 ~3.77s
+  client.task_service.create        ~3.76s
+  └─ Task/Create 森林               ~3.13s
+       shim.container.new             ~3.12s
+         shim.runc.create             ~1.91s   ← 真 runc create
+         shim.cgroup.load             ~734ms   ← 新暴露次桶
+         shim.rootfs.mount             ~46ms
+       （另）shim.manager.start       ~300ms   ← binary.exec.wait ~240ms
+```
+
+**`shim.cgroup.load`（Avg ~734ms，P50 ~883ms）**：runc create 成功后，shim 对 init pid 做 `loadProcessCgroup`。量级已接近 `runc.create` 的一半，值得单独用 `--perf_sandbox` / 再拆 span 下钻（cgroupfs 读路径 / 争用）。
+
+**shim 冷启动**：`shim.binary.exec` ≈ `exec.start`(~60ms) + **`exec.wait`(~240ms)**（等 shim 就绪），小于 apply/load，但仍是固定税。
+
+#### 8.5.3 `runc.create` 内部（Cnt=1023，含多类 create）
+
+| 子阶段 | Avg | 解读 |
+|--------|-----|------|
+| **`runc.cgroup.apply`** | **1.03s** | **runc 内最大头**；v1 多 controller mkdir + 写 `cgroup.procs` |
+| └ cpuset / devices / memory | 328 / 172 / 116ms | 争用型；P95 可达 0.5–1s+ |
+| **`runc.init.sync`** | **693ms** | 父进程同步管道；几乎全是 **wait**（见下） |
+| `runc.container.new` | 161ms | misc 短路后可接受；`subsys.misc` 仍 Avg ~54ms（P50 ~22ms） |
+| `exists_check.stat` | Avg 76ms / **P50 0.29ms** | **争用尾**：多数很快，少数卡在 cgroupfs Stat |
+| `runc.init.mounts`（独立林） | 152ms | 跨进程，不挂在 sync 下 |
+
+#### 8.5.4 `runc.init.sync` 到底在等什么？
+
+`runc.init.sync` 是**父进程**（`runc create`）在 sync pipe 上阻塞读；等的是子进程 **`runc init`** 发来的阶段信号，不是父进程自己在算。
+
+```text
+父: runc.init.sync
+  ├─ wait.for_hooks   ← 阻塞，直到子发 procHooks
+  ├─ sync.hooks       ← 父本地：cgroup.set + prestart hooks，回 procHooksDone
+  ├─ wait.for_ready   ← 再阻塞，直到子发 procReady
+  ├─ sync.ready       ← 父本地：rlimit / 写 state，回 procRun
+  └─ wait.for_eof     ← 等到子关掉 sync pipe
+```
+
+| 父进程 wait | 子进程这段时间在干什么 |
+|-------------|------------------------|
+| **`wait.for_hooks`** | `prepareRoot` → **`mounts`** → `setupDev` → `syncParentHooks` |
+| **`wait.for_ready`** | 收到 `procHooksDone` 后：pivot / finalize 等 → `syncParentReady` |
+| **`wait.for_eof`** | 子继续 exec 前收尾并关 pipe（通常很短） |
+
+**本轮 profile 对照**：
+
+| Span | Avg | 说明 |
+|------|-----|------|
+| `wait.for_hooks` | **336ms** | 等子进程 rootfs 准备+挂载 |
+| `sync.hooks` | 7.6ms | 父做 `cgroup.set`，可忽略 |
+| `wait.for_ready` | **339ms** | 等子进程 pivot/收尾 |
+| `sync.ready` / `wait.for_eof` | 2ms / 5ms | 收尾 |
+
+子侧对应工作在**另一棵林**（跨进程 `traceutil` 栈空，挂不进 `init.sync`）：
+
+| Span | Avg | 对应哪次 wait |
+|------|-----|----------------|
+| `runc.init.prepareRoot` | 59ms | ⊆ `wait.for_hooks` |
+| **`runc.init.mounts`** | **152ms** | ⊆ `wait.for_hooks`（主头） |
+| 各 `mount.*` | 各 ~17–23ms | 同上 |
+| `setupDev` / `syncParentHooks` | ~2ms / ~10ms | hooks 前后 |
+
+**结论**：trace **已经呈现**「在等什么」——两个 ~330ms 的 wait；子进程具体干了啥在 `runc.init.mounts` / `prepareRoot` 里，只是缩进上不在 `init.sync` 下。要优化 sync，应打**子进程**（尤其 mounts / prepareRoot / pivot），而不是父进程 wait 本身。
+
+#### 8.5.5 NewContainer（~985ms）与 bbolt
+
+| 子阶段 | Avg | 说明 |
+|--------|-----|------|
+| `opt (#2)` → `snapshotter.Prepare` | 310–334ms | 几乎全是 **`alloc/store.tx.wait`** |
+| `Containers.Create` | 230ms | 客户端等 RPC；本地 `metadata.containers.Create` 仅 ~0.06ms |
+| `WithLease.create` | 110ms | 同样是 `lease.Create.tx.wait` |
+
+顶层还有 `metadata.lease.Create` ~184ms、多次 `sandbox.Update`：所有 `*.tx.exec` 亚毫秒，**`*.tx.wait` 占 90%+** → 可写事务排队（与 §9 同源）。
+
+#### 8.5.6 展示噪声（分析时打折）
+
+- `Task/State`、`Events/Forward` 下仍可能误挂 `runtime.*` / `shim.*` / 少量 CNI → 以 **`Task/Create` 与 `runc.create` 两棵林为准**（`trace_analyzer` 已加强折叠/重挂，旧日志仍可能脏）。
+- `tasks.create` / `shim.task.create` Cnt 常少于 `NewTask`（跨进程断链）→ 不要用偏小 Cnt 当全量。
+- `runc.create` Cnt=1023 ≫ sandbox run → 含 pause 容器等，解读吞吐时注意。
+
+#### 8.5.7 优先优化顺序（本轮）
+
+1. **`runc.cgroup.apply`**（尤其 cpuset / devices / memory）— cgroup v1 争用  
+2. **`shim.cgroup.load`**（~734ms）— create 后读 cgroup 路径  
+3. **`runc.init.sync` 等待** — 优化子进程 mounts/prepare/pivot  
+4. **bbolt 写锁** — 减少 Update/lease/snapshot 排队  
+5. shim `binary.exec.wait`、CNI、Start — 次要  
 
 ---
 
@@ -755,6 +871,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 - pprof mutex：**~80%** 落在 `metadata.(*DB).Update`。
 - CPU：`bbolt.(*Tx).write` **~12.5%**。
 - profile：单次 Create/Update 不高（百毫秒级），但 Update **次数多**（采样窗口内数百次）。
+- **2026-07-21 细粒度 TRACE**（§8.5）：`lease.Create` / `sandbox.Create|Update` / `snapshot.Prepare` 的 `*.tx.exec` 均亚毫秒，**`*.tx.wait` 占 90%+**（例如 Update.tx.wait Avg ~331ms、lease.tx.wait ~174ms、Prepare store.tx.wait ~188ms）→ 确认是**可写事务排队**，不是回调逻辑慢。
 
 ### 9.2 机制
 
@@ -762,7 +879,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 
 ### 9.3 小结（瓶颈 C）
 
-**containerd 内部主要可见锁是 metadata DB**；对端到端占比低于 CNI/shim，但在高并发下会放大 P95，且与 pprof 证据最直接。
+**containerd 内部主要可见锁是 metadata DB（bbolt 写锁）**；单次占比低于 NewTask，但 Update/lease/snapshot **次数多、全链路共享一把写锁**，是 P95 放大器，且与 pprof / TRACE `.tx.wait` 证据一致。
 
 ---
 
@@ -808,12 +925,14 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
 | C4. **host-local 预填 5000**（已做） | 量化 `GetByID` Walk | 关 masq 上：`cni.setup` **386ms→8.83s**（约 ×23）；`scripts/hostlocal_prefill.sh`（见 §7.5） |
 | C5. **host-local 旁路索引 `by_id.idx`**（已做） | 去掉/缩短脏目录 Walk | **相对干净目录基线端到端未见效果**：run ~7.5s、`cni.setup` ~342ms vs 基线 386ms；NewTask 仍主导（见 §7.5） |
-| C6. **runc：缺失控制器跳过 mountinfo**（已做） | `subsys.misc` 扫 mountinfo | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；run ~6.45s；头号换 **NewContainer**（见 §8.4） |
+| C6. **runc：缺失控制器跳过 mountinfo**（已做） | `subsys.misc` 扫 mountinfo | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；run ~6.45s；当时头号换 **NewContainer**（见 §8.4） |
+| C7. **细粒度 TRACE 复测**（已做，2026-07-21） | 拆 NewTask / runc / bbolt | run ~6.36s；**NewTask ~3.77s 再成头号**；暴露 `cgroup.apply` / `shim.cgroup.load` / `init.sync` wait（见 §8.5） |
 | D. workers 32 / 64 / 128 | 锁竞争曲线 | P95 非线性上升 → 确认全局锁/漏斗 |
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
+| G. **`--perf_sandbox` 打 `shim.cgroup.load` / `cgroup.apply`** | 瓶颈 B 下一刀 | 确认 cgroupfs / kernfs 争用符号 |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 NewContainer（snapshot/lease）与 shim / NewTask**。misc mountinfo 短路已落地（§8.4）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。建议补跑 `hostlocal_prefill.sh clear` 空目录对照并带 `--resources`。
+中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 `runc.cgroup.apply`、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5）。misc mountinfo 短路已落地（§8.4）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
@@ -1124,21 +1243,22 @@ ls "$RESULT/perf"/*.svg
 | 端到端（同上 + host-local 预填 5000） | `cni.setup` Avg **386ms→8.83s**（约 ×23）；CNI 再次主导 `cri.sandbox.run` |
 | **host-local 旁路索引**（`by_id.idx`） | **端到端未见效果**：相对关 masq 干净目录，`cni.setup` 386→342ms（同量级），run ~7.5s 仍由 NewTask 主导 |
 | **runc：misc / 缺失控制器跳过 mountinfo**（已做） | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；`subsys.misc` P50 **~0.13ms**（见 §8.4） |
-| **当前工作点**（关 printk + masq false + misc 短路） | `cri.sandbox.run` Avg **~6.45s** / P95 **~9.4s**；`cni.setup` ~**245ms**；**NewContainer ~2.30s（~36%）**；NewTask ~1.59s |
+| **当前工作点**（2026-07-21 TRACE 复测） | `cri.sandbox.run` Avg **~6.36s** / P95 **~12.8s**；`cni.setup` ~**303ms**；**NewTask ~3.77s（~59%）**；NewContainer ~**985ms** |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
 | 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
 | 再关 ipMasq 后主阶段（目录较干净） | **`container.NewTask` ~2.5s / ~36%**；CNI 仅 ~6%；iptables 消失 |
-| misc 短路后主阶段 | **`client.NewContainer` ~2.3s**；NewTask ~1.6s；CNI ~4%；`runc.create` ~0.7s |
+| misc 短路后主阶段（§8.4） | **`client.NewContainer` ~2.3s**；NewTask ~1.6s；CNI ~4%；`runc.create` ~0.7s |
+| **细粒度 TRACE 复测后主阶段（§8.5）** | **`container.NewTask` ~3.8s**；NewContainer ~1s；`runc.cgroup.apply` ~1.0s；`shim.cgroup.load` ~0.7s；`init.sync` wait ~0.7s |
 | 预填 5000 后主阶段 | **`cni.setup` / bridge ~8.8s**；NewTask/NewContainer Avg 骤降（队头在 IPAM） |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
 | 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证）；旁路索引**未拉到端到端** |
-| 瓶颈 B 深挖 | shim/NewTask；其中 **`manager.new`←`subsys.misc` 扫 mountinfo** 已对照并短路（§8.4） |
-| 瓶颈 B / C / D（当前） | **主战场：NewContainer（snapshot/lease/metadata）+ NewTask/shim**；containerd 4 核放大 |
+| 瓶颈 B 深挖 | shim/NewTask；**`misc` mountinfo 已短路**（§8.4）；当前主因 **`cgroup.apply` + `cgroup.load` + `init.sync` 等子进程**（§8.5） |
+| 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc 侧 **`misc` 在无该控制器的内核上仍扫 mountinfo**，已用 `/proc/cgroups` 短路砍掉（`runc.create` ~1.9s→0.7s）。**当前工作点**下端到端由 **NewContainer ~2.3s** 与 **NewTask ~1.6s** 主导；下一刀继续拆 snapshot/shim。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95。下一刀优先 cgroup 路径与 sync 子进程侧。
 
 ---
 
@@ -1165,3 +1285,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §2.3 / §7.5 / §12 / §15：记录 host-local 旁路索引（`by_id.idx`）改动后**端到端未见效果** |
 | 2026-07-20 | §13.3：补充 `manager.new.initPaths` / `init.sync.wait|hooks|…` / 子进程 `prepareRootfs` 等细粒度 TRACE |
 | 2026-07-20 | §2.3 / §8.4 / §12 / §15：记录 cgroup `misc` 扫 mountinfo 根因、内核确认、`/proc/cgroups` 短路优化与对照数据 |
+| 2026-07-21 | §2.3 / §8.3 / **§8.5** / §9 / §12 / §15：写入细粒度 TRACE 复测——NewTask 再成头号；拆解 `cgroup.apply` / `shim.cgroup.load`；说明 `runc.init.sync` 在等子进程及与 `mounts` 的对应关系 |
