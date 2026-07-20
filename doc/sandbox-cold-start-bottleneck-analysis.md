@@ -1275,6 +1275,7 @@ ls "$RESULT/perf"/*.svg
 | 现网 / 分析用 | `/home/nathan/linux` | **v5.10.229**（含关 netlink printk：`0d91342dba12`） |
 | 上游对照（§16 主文） | `/home/nathan/linux-upstream-v1` @ **v7.0** | 换核收益基线 |
 | 上游最新（§16.9） | 同树 HEAD ≈ **v7.2-rc4**（`b95f03f04d47`） | 相对 v7.0 的增量 |
+| OpenEuler（§16.10） | `/home/nathan/openeuler-kernel` **OLK-6.6** | `6.6.0-…`（分析时 `85f45c3abb4d`） |
 
 前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）、RTNL（§16.5）**。
 
@@ -1858,7 +1859,69 @@ CNI / netns → RTM_NEWLINK|SETLINK|register_netdev(lo)
 
 `DEBUG_NET_SMALL_RTNL` 仍 default **n**；默认 `rtnl_net_lock()` ≡ `rtnl_lock()`。换核仍保留关 `br_info`/console 策略。
 
-**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）**，确定收益偏「旁路」；**`cgroup_mutex` / 全局 `namespace_sem` / 默认全局 RTNL 不因换核消失**（§16.3.1 / §16.4 / §16.5）。砍 `cgroup.apply` 应 **切 cgroup v2**（§16.3.3）；砍 `init.sync` 应评估 **空 mntns**（§16.4.3）；`favordynmods` 仅旁路（§16.3.5）。网络侧保留关 printk，等 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
+### 16.10 OpenEuler OLK-6.6 对本场景是否有帮助
+
+对照：`/home/nathan/openeuler-kernel` 分支 **OLK-6.6**（基线 **Linux 6.6.0** + OE 补丁；分析时 HEAD `85f45c3abb4d`）。相对现网 **5.10.229** 与上游 **7.x**（§16.1–16.9）。
+
+**结论**：换到 OE 6.6 对本冷启动是 **旁路级**（量级接近「升到主线 6.6」），**没有**能砍掉 `runc.cgroup.apply ~1s` / 全局 RTNL 的杀手特性；`openeuler_defconfig` 部分默认项还可能 **加重** cgroup 路径。
+
+#### 16.10.1 场景相关能力矩阵
+
+| 能力 | 现网 5.10 | OE OLK-6.6 | 上游 ≈7.2 | 对本场景 |
+|------|-----------|------------|-----------|----------|
+| 全局 `cgroup_mutex` | 有 | **仍有** | 仍有 | apply 主轴 **不变** |
+| kernfs per-root `rwsem` | 全局 mutex | **有** | 有 | 读/跨 root 中等（§16.3.2） |
+| `favordynmods`（第一层） | 无 | **有**（可配） | 有 | 旁路；defconfig **默认关** |
+| per-tg `cgroup.procs` 写锁 | 无 | **无** | 有（开 favor） | OE 无第二层（§16.3.5） |
+| 全局 `namespace_sem` | 有 | **仍有** | 仍有 | mounts 仍串行 |
+| mounts：list → RB 树 | list | **仍 list** | RB | OE **无**树化 |
+| `CLONE_EMPTY_MNTNS` | 无 | **无** | 有 | — |
+| `OPEN_TREE_NAMESPACE` | 无 | **有** | 有 | **条件**（需改 runc，§16.4） |
+| 默认全局 `rtnl_mutex` | 有 | **仍有** | 仍有 | CNI 仍串行（§16.5） |
+| per-netns RTNL / `DEBUG_NET_SMALL_RTNL` | 无 | **无** | 转换中 | — |
+| EEVDF | 无 | **有** | 有 | 尾延迟放大器 |
+| bridge `br_info` | 本机已关 | **仍在** | 仍在 | 换核须再关 printk |
+
+相对「只升主线 6.6」：锁模型基本一致；OE 多的是产品/厂商特性，不是 cgroup/RTNL 拆锁。相对上游 7.2：OE 6.6 **更旧**（缺 mounts RB、EMPTY_MNTNS、favor 第二层、RTNL 脚手架等）。
+
+#### 16.10.2 OpenEuler 特有项
+
+| 特性 | 作用 | 对本冷启动 |
+|------|------|------------|
+| XSched / `CONFIG_CGROUP_XCU` | NPU/扩展算力调度 | **无关**；defconfig `=y` 多一个子系统入口（挂进层级则 apply 更重） |
+| UB / urma 等 | 互联/RDMA | **无关** |
+| `CGROUP_IFS` | 干扰统计 | 偏观测；defconfig 关 |
+| `CGROUP_FILES` | 限制 open fd | 再多一个 controller；arm64 defconfig **`=y`** |
+| `memory.qos_level`（v2） | 内存 QoS | 偏运行时；**不砍** create/apply |
+| `proc_cgroup_show` 去 mutex（backport） | 加速 `/proc/*/cgroup` | 读路径有益；**非** mkdir 热路径 |
+| dmem cgroup | 设备内存记账 | 无关；误开多成本 |
+| soft-domain / LLC 调度 | 唤醒选核 | 放大器 |
+
+**`openeuler_defconfig`（arm64）风险**：
+
+- `CONFIG_CGROUP_MISC=y` → 用户态未短路时可重现 **misc 扫 mountinfo**（§8.4）。  
+- `CONFIG_CGROUP_XCU=y`、`CONFIG_CGROUP_FILES=y` → 控制器变多，v1 apply **可能更差**。  
+- `# CONFIG_CGROUP_FAVOR_DYNMODS is not set` → 默认不吃 favor。
+
+#### 16.10.3 按 TRACE 桶
+
+| 瓶颈 | OE 6.6 |
+|------|--------|
+| `runc.cgroup.apply` / `cgroup_mutex` | **基本无**；注意别多开 misc/xcu/files |
+| `shim.cgroup.load` / exists_check | **中等偏尾延迟**（kernfs） |
+| `init.sync` / mounts | **低（默认）**；接 `OPEN_TREE_NAMESPACE` 才可能明显 |
+| CNI / RTNL | **低**；保留关 printk |
+| bbolt / 绑 4 核 | **无** |
+| 调度尾延迟 | EEVDF + OE 调度补丁 → **微调** |
+
+#### 16.10.4 建议
+
+1. **不要预期「上 OLK-6.6 就解决冷启动」**；收益 ≪ 切 cgroup v2 / 减 apply / 空 mntns 类用户态改造。  
+2. 试 OE 时精简 cgroup：`CGROUP_MISC=n`（或保留 runc 短路）、非必要关 XCU/FILES、可试 `favordynmods`。  
+3. 保留关 `br_info`/console。  
+4. 挂载侧优先评估已有的 **`OPEN_TREE_NAMESPACE`**（OE 有、`EMPTY_MNTNS` 无）。
+
+**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）或 OpenEuler OLK-6.6**，确定收益偏「旁路」；**`cgroup_mutex` / 全局 `namespace_sem` / 默认全局 RTNL 不因换核消失**（§16.3.1 / §16.4 / §16.5 / §16.10）。砍 `cgroup.apply` 应 **切 cgroup v2**（§16.3.3）；砍 `init.sync` 应评估 **空 mntns / OPEN_TREE_NAMESPACE**（§16.4）；`favordynmods` 仅旁路（§16.3.5）。网络侧保留关 printk，等 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
 
 ---
 
