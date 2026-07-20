@@ -1288,11 +1288,11 @@ ls "$RESULT/perf"/*.svg
 | **基本无收益** | misc mountinfo | `subsys.misc` | 已用户态修；v7.0 若误开 `CONFIG_CGROUP_MISC` 反可能多成本 | 保持 misc 关或保留短路 |
 | **低 / 条件** | per-netns RTNL | `cni.plugin.*` ~300ms | **默认构建几乎无并行收益**；转换未完成 | 见 §16.5 |
 | **低** | STP `br_info` printk | 历史 CNI 持锁放大 | **上游仍在**；本机补丁仍有价值 | 需继续关 printk 或上游安静化 |
-| **中等（读侧）** | kernfs 全局锁→per-root rwsem | `exists_check.stat`、部分 cgroup 读 | 减轻与 **sysfs 等其它 kernfs 根** 的交叉争用；**同层级 mkdir 仍串行** | 见 §16.3 |
+| **中等（读侧）** | kernfs 全局锁→per-root rwsem | `exists_check.stat`、部分 cgroup 读 | 减轻与 **sysfs 等其它 kernfs 根** 的交叉争用；**同层级 mkdir 仍串行** | 见 **§16.3.2** |
 | **中等（条件）** | favordynmods / 更细 threadgroup 锁 | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 偏 cgroup v2 + 配置 |
 | **中等** | mount ns RB 树等 | `runc.init.mounts` / `wait.for_hooks` | 大 ns 内查找/簿记更好；**全局 `namespace_sem` 仍在** | 见 §16.4 |
 | **中等（放大器）** | EEVDF 调度 | `exec.wait`、等锁 sleep 尾延迟 | 可能改善唤醒尾延迟，**不砍秒级 apply** | 见 §16.6 |
-| **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **v7.0 仍是全局 `cgroup_mutex`**；无 cgroup pool | 真要大降：减 controller / 切 v2 / 用户态策略 |
+| **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **仍是全局主锁**；旁路优化见 §16.3.1 | 真要大降：减 controller / **切 v2**（§16.3.3） |
 | **待验证 / 高相关** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能显著降 apply**（少 N 次抢 `cgroup_mutex`） | 见 §16.3.3；CRI/runc 全路径 |
 
 ### 16.2 L0 — 换核几乎帮不上的边界
@@ -1370,17 +1370,107 @@ cgroup_mkdir
 | `cgroup_file_notify` 细锁 | 无关 | 基本无感 |
 | 拆 mutex / cgroup pool | — | **未合入** |
 
-#### 16.3.2 kernfs：全局 mutex → per-root rwsem（读侧有帮助）
+#### 16.3.2 kernfs：全局锁 → per-root rwsem（读侧/跨 root；同树 mkdir 仍互斥）
 
-| | 5.10.229 | 7.0 |
-|--|----------|-----|
-| 锁 | **全局** `DEFINE_MUTEX(kernfs_mutex)`（`fs/kernfs/dir.c:20`） | **每 kernfs_root** `struct rw_semaphore kernfs_rwsem`（`fs/kernfs/kernfs-internal.h`） |
-| 演进 | — | v5.15 改 rwsem；v5.17 改为 per-fs/per-root |
+对照：`/home/nathan/linux`（5.10）`fs/kernfs/dir.c` vs `/home/nathan/linux-upstream-v1` `fs/kernfs/`。kernfs 是 cgroupfs / sysfs 的底层。
 
-**对本场景**：
+##### 5.10：一把全局 mutex
 
-- **`exists_check.stat` / 部分 cgroup 读**：可与 sysfs 等其它 kernfs 根解耦，读侧可共享持锁 → **中等、偏尾延迟**收益。  
-- **`runc.cgroup.apply` mkdir**：同一 cgroup 层级上仍要过 **`cgroup_mutex`**；per-root kernfs **不能**让同层级并发 mkdir 真正并行。
+```c
+/* fs/kernfs/dir.c (5.10) */
+DEFINE_MUTEX(kernfs_mutex);
+static DEFINE_SPINLOCK(kernfs_rename_lock);  /* kn->parent / name */
+static DEFINE_SPINLOCK(kernfs_idr_lock);     /* root->ino_idr */
+```
+
+查找也排他：
+
+```c
+/* kernfs_find_and_get_ns (5.10) */
+mutex_lock(&kernfs_mutex);
+kn = kernfs_find_ns(parent, name, ns);
+kernfs_get(kn);
+mutex_unlock(&kernfs_mutex);
+```
+
+后果：sysfs 开文件、cgroup mkdir、无关 path walk 都可能抢 **同一把** `kernfs_mutex`（见 `393c3714081a` 动机：reclaim 持锁拖死其它独立 fs）。
+
+##### 演进（合入顺序）
+
+| 阶段 | 代表 commit | 改动 |
+|------|-------------|------|
+| mutex → 全局 rwsem | `7ba0273b2f34`（~5.15） | 查找可 `down_read` 并行 |
+| 全局 → **per-fs / per-root** | `393c3714081a`（~5.17） | `rwsem` 放进 `kernfs_root` |
+| 拆 inode 属性锁 | `9caf69614225`（~6.4） | `kernfs_iattr_rwsem` |
+| 拆 supers 列表 | `c9f2dfb7b59e` | `kernfs_supers_rwsem` |
+| 拆 idr / rename | `cec59c440a05` / `93b27a845ec1`（~6.16+） | 全局 → per-root |
+| RCU 读 parent/name | `633488947ef6` / `741c10b096bc` | 部分路径少持树锁 |
+
+当前 `struct kernfs_root`（upstream）：
+
+```c
+struct kernfs_root {
+	spinlock_t		kernfs_idr_lock;
+	struct rw_semaphore	kernfs_rwsem;		/* 目录树主锁 */
+	struct rw_semaphore	kernfs_iattr_rwsem;	/* inode 属性 */
+	struct rw_semaphore	kernfs_supers_rwsem;	/* super 列表 */
+	rwlock_t		kernfs_rename_lock;	/* parent/name */
+	...
+};
+```
+
+`kernfs_create_root()` 内 `init_rwsem` / `rwlock_init` / `spin_lock_init`。每个 cgroup hierarchy / sysfs 各有自己的 root（cgroup：`cgroup_setup_root` → `kernfs_create_root`）。
+
+##### 代码路径：读共享 / 写互斥 / 旁路锁
+
+**读（同 root 可并行）**：
+
+```c
+/* kernfs_find_and_get_ns (upstream) */
+down_read(&root->kernfs_rwsem);
+kn = kernfs_find_ns(...);
+kernfs_get(kn);
+up_read(&root->kernfs_rwsem);
+```
+
+**写（挂节点，同树仍 exclusive）**：
+
+```c
+/* kernfs_add_one */
+down_write(&root->kernfs_rwsem);
+/* 插入 RB 子树、更新 nlink 等 */
+```
+
+用户态 `mkdir` 入口 `kernfs_iop_mkdir` 只拿 `kernfs_get_active`；真正改树在 `scops->mkdir`（cgroup：`cgroup_mkdir`）→ `kernfs_add_one` 的 **写锁**。
+
+**属性路径不堵主树写**（大批量 `/sys` open 的动机）：
+
+```c
+/* kernfs_iop_permission / kernfs_setattr */
+down_read/write(&root->kernfs_iattr_rwsem);
+```
+
+另：`kernfs_supers_rwsem`（mount 侧 supers 列表）、per-root idr/rename、RCU 读 `parent`/`name`、`kernfs_drain` 等 active_ref 时短暂 `up_write` 再 wait。
+
+##### 与 `cgroup_mutex`、本场景的叠层
+
+```
+用户 mkdir .../cgroup/.../foo
+  → kernfs_iop_mkdir（active_ref）
+  → cgroup_mkdir
+       → cgroup_kn_lock_live → 【全局 cgroup_mutex】   ← apply 主串行轴
+       → cgroup_create → kernfs_add_one
+            → 【本 root 的 kernfs_rwsem 写锁】
+```
+
+| 优化 | 对本冷启动 |
+|------|------------|
+| per-root + 读共享 | **`exists_check.stat`、跨 sysfs/其它 cgroup 根的读** 少交叉排队 → **中等、偏尾延迟** |
+| v1 多 hierarchy | 各 controller **各有** `kernfs_root`，kernfs 写锁不跨树；但 **`cgroup_mutex` 仍全局** |
+| 同层级并发 mkdir | **仍** `down_write` + `cgroup_mutex` → **砍不掉** `runc.cgroup.apply ~1s` |
+| iattr / idr / rename 拆分 | 减轻与大量 sysfs open 的干扰；对纯 apply 次要 |
+
+**一句话（kernfs）**：优化 = 缩小粒度与读并发、跨 root 解耦；**不是**让同一棵 cgroup 树上的并发 mkdir 并行。砍 apply 仍看减 controller / 切 v2（§16.3.3），与 kernfs 层次不同。
 
 #### 16.3.3 切 cgroup v2（unified）的好处（对本场景）
 
@@ -1690,3 +1780,4 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | 2026-07-21 | **§16**：对照 `/home/nathan/linux`（5.10.229）与 `/home/nathan/linux-upstream-v1`（7.0），按 TRACE 桶评估换核对冷启动的收益与边界 |
 | 2026-07-21 | **§17**：bbolt 单写者机制 + `no_sync`/Batch/减少 Update/Prepare 双 tx 等优化分层与验证矩阵 |
 | 2026-07-21 | **§16.3.1 / §16.3.3 / §16.9**：展开 `cgroup_mutex` 旁路优化与源码路径；切 cgroup v2 对本场景的好处与边界；v7.0→≈7.2-rc 增量 |
+| 2026-07-21 | **§16.3.2**：展开 kernfs 全局 mutex→per-root rwsem、iattr/supers/idr/rename 拆分与对本场景边界 |
