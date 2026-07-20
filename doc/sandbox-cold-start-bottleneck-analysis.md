@@ -879,7 +879,7 @@ container.NewTask                 ~3.77s
 
 ### 9.3 小结（瓶颈 C）
 
-**containerd 内部主要可见锁是 metadata DB（bbolt 写锁）**；单次占比低于 NewTask，但 Update/lease/snapshot **次数多、全链路共享一把写锁**，是 P95 放大器，且与 pprof / TRACE `.tx.wait` 证据一致。
+**containerd 内部主要可见锁是 metadata DB（bbolt 写锁）**；单次占比低于 NewTask，但 Update/lease/snapshot **次数多、全链路共享一把写锁**，是 P95 放大器，且与 pprof / TRACE `.tx.wait` 证据一致。优化分层（`no_sync` / Batch / 减少 Update / Prepare 双 tx）见 **§17**。
 
 ---
 
@@ -931,8 +931,10 @@ container.NewTask                 ~3.77s
 | E. containerd 核 4 → 16+ | 瓶颈 D | 饱和缓解；锁等待可能仍在 |
 | F. 同配置 `--profile` + perf 对比 | 量化 | 分开看 bridge/loopback span 与 `rtnl_*` vs xtables |
 | G. **`--perf_sandbox` 打 `shim.cgroup.load` / `cgroup.apply`** | 瓶颈 B 下一刀 | 确认 cgroupfs / kernfs 争用符号 |
+| H. **换内核 5.10→7.0（同用户态配置）** | 量化纯换核 | 见 §16.8；预期 apply/CNI 不会数量级下降 |
+| I. **bbolt：`no_sync` / 合并 sandbox Update** | 瓶颈 C | 见 §17.7；盯 `.tx.wait` / Update Cnt |
 
-中期：减少 `metadata.sandbox.Update` 持锁；snapshotter 预热；**优先 `runc.cgroup.apply`、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5）。misc mountinfo 短路已落地（§8.4）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
+中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`、`shim.cgroup.load`、子进程 mounts（降 `init.sync` wait）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游 7.0 内核的预期与边界见 §16**（不能替代 cgroup 路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
@@ -1258,7 +1260,7 @@ ls "$RESULT/perf"/*.svg
 | 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95。下一刀优先 cgroup 路径与 sync 子进程侧。**换内核（5.10→7.0）的预期收益见 §16**——不能指望单独解决秒级 NewTask。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 cgroup 路径与 sync 子进程侧；bbolt 可并行试 `no_sync` / 减 Update。**换内核（5.10→7.0）的预期收益见 §16**——不能指望单独解决秒级 NewTask。
 
 ---
 
@@ -1407,6 +1409,150 @@ LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全
 
 ---
 
+## 17. bbolt（metadata）优化方法（对本场景）
+
+对照：`go.etcd.io/bbolt`（[`vendor/.../bbolt`](file:///home/nathan/containerd/vendor/go.etcd.io/bbolt)）+ containerd [`core/metadata`](file:///home/nathan/containerd/core/metadata) + [`plugins/metadata/plugin.go`](file:///home/nathan/containerd/plugins/metadata/plugin.go)。公开资料：bbolt 文档（单写者 / `Batch` / `NoSync`）、containerd [PR #10745](https://github.com/containerd/containerd/pull/10745)（`no_sync`）、[#13721](https://github.com/containerd/containerd/pull/13721)（`NoStatistics`）。
+
+### 17.1 本场景证据与机制
+
+TRACE（§8.5）：`lease.Create` / `sandbox.Create|Update` / `snapshot.Prepare` 的 **`*.tx.exec` 亚毫秒，`*.tx.wait` 占 90%+**；`.tx.commit` 多为数～数十 ms。
+
+对应代码：[`updateTraced`](file:///home/nathan/containerd/core/metadata/bolt.go) 把一次 `db.Update` 拆成 wait / exec / commit。bbolt 侧：
+
+| 阶段 | bbolt | TRACE |
+|------|-------|-------|
+| 获写锁 | `DB.Begin(true)` → `rwlock.Lock()`（全局单写者） | `.tx.wait` |
+| 回调 | 用户 `fn(tx)` | `.tx.exec` |
+| 提交 | `Tx.Commit`：写脏页 + **fdatasync**，再写 meta + **再 sync**（`NoSync` 时跳过） | `.tx.commit`（含在 Update 返回前） |
+
+**结论**：本场景不是「业务写太重」，而是 **128 路并发下大量短写抢一把 `rwlock`，持锁时间被 fsync 拉长 → 后来者 wait 爆掉**。
+
+```mermaid
+flowchart TB
+  subgraph perRun [单次 RunPodSandbox 典型可写次数]
+    L[lease.Create]
+    C[sandbox.Create]
+    U1[Update netns]
+    U2[Update after CNI]
+    A[snapshot.Prepare alloc]
+    S[snapshot.Prepare store]
+    CC[Containers.Create]
+    U3[Update after Start]
+  end
+  DB["meta.db single writer"]
+  L --> DB
+  C --> DB
+  U1 --> DB
+  U2 --> DB
+  A --> DB
+  S --> DB
+  CC --> DB
+  U3 --> DB
+```
+
+### 17.2 收益总表
+
+| 档位 | 手段 | 对准 | 本树状态 | 风险 |
+|------|------|------|----------|------|
+| **配置可试** | `no_sync = true` | 缩短 commit/持锁 → 间接降 wait | 已有 TOML，默认 **false** | 掉电丢最近提交 |
+| **已开** | `NoFreelistSync` | 略减 commit | 插件默认 **true** | 恢复扫 freelist |
+| **上游可跟** | `NoStatistics` | 减事务内开销 | **本 vendor 无此选项** | 低 |
+| **中等/改代码** | `DB.Batch` | 合并并发写、少 fsync | **全仓库未用 Batch** | 回调须幂等 |
+| **高（应用层）** | 减少 sandbox Update 次数 | Cnt≫run | Create + 最多 3 次 Update（见下） | 行为/兼容 |
+| **高（应用层）** | Prepare alloc+store 合并为一 tx | 两次 wait | 现为两段 `updateTraced` | 与 backend 调用顺序耦合 |
+| **中** | 同请求复用可写 tx / lease 复用 | 少次 `Update` | 有 `boltutil.Transaction` 钩子，热路径多用独立 Update | 改调用栈 |
+| **低/长期** | 拆库、换引擎 | 交叉排队 | snapshot metastore 已部分独立 | 大改 |
+
+### 17.3 L1 — 引擎参数
+
+[`plugins/metadata/plugin.go`](file:///home/nathan/containerd/plugins/metadata/plugin.go)：
+
+```toml
+[plugins.'io.containerd.metadata.v1.bolt']
+  no_sync = true   # 同时设 NoSync + NoGrowSync；打 Warn 日志
+```
+
+- **默认已开**：`NoFreelistSync = true`（避免 freelist 损坏；见 etcd-io/bbolt 相关 PR）。  
+- **`no_sync`**：跳过 Commit 路径上的 `fdatasync`（见 vendor `tx.go`：`if !tx.db.NoSync`）。持锁临界区变短 → **后来者 `.tx.wait` 下降**；对 ephemeral / 可重建沙箱场景上游明确推荐过。  
+- **`NoStatistics`**：上游较新 PR，**当前 vendor bbolt 无该字段**，本树暂不可配。  
+- Freelist 类型 / `InitialMmapSize`：次要，需单独基准，不作为本场景首选。
+
+**建议验证**：同压测开 `no_sync`，对比 `*.tx.commit` Avg 与 `*.tx.wait` P95；接受崩溃一致性风险后再谈生产。
+
+### 17.4 L2 — `DB.Batch`
+
+bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次数；**函数可能被多次调用，必须幂等**。
+
+本仓库 **`rg` 无任何 `db.Batch` 调用**；metadata 一律 `Update`。
+
+| 候选 | 是否适合 Batch | 原因 |
+|------|----------------|------|
+| 高频小 `sandbox.Update`（extensions） | **理论上可以** | 写小、并发高；需幂等（同一 ID 写同一扩展） |
+| `lease.Create`（随机 ID） | **难** | 重入会生成多个 ID / 副作用 |
+| `snapshot.Prepare` store | **难** | 与 backend 状态交织，失败回滚语义复杂 |
+| `sandbox.Create` | **谨慎** | AlreadyExists 等错误路径要清晰 |
+
+**预期**：Batch 主要砍 **commit/fsync 次数**，不能消灭单写者模型；在已开 `no_sync` 后边际变小。优先仍是 **少调用**（§17.5）。
+
+### 17.5 L3 — 应用层：写次数与临界区（对本场景最重要）
+
+#### 17.5.1 单次 `RunPodSandbox` 打到 `meta.db` 的可写点
+
+摘自 [`sandbox_run.go`](file:///home/nathan/containerd/internal/cri/server/sandbox_run.go)（非 hostNetwork 典型路径）+ NewContainer：
+
+| # | 调用 | 说明 |
+|---|------|------|
+| 1 | `leaseSvc.Create` | 沙箱名 lease |
+| 2 | `SandboxStore().Create` | 初始 sandbox 元数据 |
+| 3 | `SandboxStore().Update(..., "extensions")` | 写入 NetNSPath（建 netns 后） |
+| 4 | `SandboxStore().Update(..., "extensions")` | CNI 后再写 extensions |
+| 5–6 | `snapshot.Prepare`：**alloc** + **store** 两 tx | NewContainer 内 |
+| 7 | `Containers.Create` / 另可能 `WithLease.create` | 容器元数据 / 临时 lease |
+| 8 | `SandboxStore().Update(..., "extensions","spec","labels")` | StartSandbox 之后 |
+
+这与 TRACE 中 `metadata.sandbox.Update` Cnt ≈ 1.5–2× `cri.sandbox.run`、再叠加 lease/snapshot **一致**。
+
+**优化方向（按收益/难度）：**
+
+1. **合并 Update #3+#4**：netns + CNI 结果可攒一次再写 extensions（或 Start 前只写一次）。直接减少 1 次全局写锁排队。  
+2. **延迟非关键 Update**：能放到 Start 后的字段与最终 Update 合并（已有一次大 Update，可审视中间两次是否必要）。  
+3. **`snapshot.Prepare` 双 tx**：[`snapshot.go`](file:///home/nathan/containerd/core/metadata/snapshot.go) 先 `alloc`（占 key/parent），中间调 **backend**，再 `store`。中间必须释放 bolt 锁才能做可能较慢的 snapshotter IO——**不能简单合成一次 tx**。可探索：缩短两次 tx 之间持有的其它锁、或减少并发 Prepare 风暴（镜像预热）。  
+4. **lease**：CRI 顶层已 Create lease；NewContainer 内 `WithLease` 在已有 lease 时应 **reuse**（见 `lease.go`）。确认热路径未重复 Create。  
+5. **tx 回调内禁止 IO**：当前 `.exec` 已极短，保持即可；勿在 `Update(fn)` 内做网络/磁盘。
+
+#### 17.5.2 事务复用
+
+`boltutil.Transaction` + `update()` 支持「ctx 已带可写 tx 则复用」。热路径多数仍各自 `db.Update`。把同一次 RPC 内相邻的 Create/Update 收进**一个**外层 `DB.Update` 可少多次 wait+fsync，但要改 CRI→metadata 调用边界，回归面大于「合并两次 Update 字段」。
+
+### 17.6 L4 — 架构级边界
+
+| 手段 | 说明 | 本场景建议 |
+|------|------|------------|
+| 多 bolt 文件 | mount manager / erofs 等已有独立 db；主 `meta.db` 仍聚合 sandbox/container/lease/content 索引 | 拆主库成本高；非首选 |
+| 换 SQLite WAL / 其它 KV | 可多写或更好批量 | 超出 containerd 默认架构 |
+| 第三方多进程 bbolt fork | 与单进程 daemon 模型不符 | 不建议 |
+| 纯内存 + 异步落盘 | 极端 ephemeral | 近似 `no_sync` + 接受丢数据 |
+
+### 17.7 建议验证矩阵
+
+| 实验 | 目的 | 盯的指标 |
+|------|------|----------|
+| A. 仅开 `no_sync` | 量化 fsync 占比 | `.tx.commit` Avg、`.tx.wait` P95、`cri.sandbox.run` |
+| B. 合并 sandbox Update（补丁） | 少 1–2 次写/run | `metadata.sandbox.Update` Cnt、`.tx.wait` |
+| C. 确认 WithLease reuse | 少 lease.Create | `metadata.lease.Create` Cnt vs run |
+| D. 镜像/snapshot 预热 | 降并发 Prepare 风暴 | `snapshot.Prepare.*.tx.wait` |
+| E. pprof mutex | 与 TRACE 交叉 | `metadata.(*DB).Update` 占比是否下降 |
+
+### 17.8 小结（§17）
+
+1. **机制**：单写者 + 每事务（默认同步）fsync；TRACE 已证明 wait≫exec。  
+2. **最快可试**：`no_sync`（接受一致性风险）。  
+3. **最值得改代码**：减少 `RunPodSandbox` 路径上 **sandbox.Update 次数**；Prepare 双 tx 不宜强行合并。  
+4. **Batch**：本树未用，可作中期试验，次于「少写」。  
+5. **换内核（§16）对 bbolt 无直接帮助**；bbolt 与 cgroup/RTNL 是独立串行轴，需并行治理。
+
+---
+
 ## 修订记录
 
 | 日期 | 说明 |
@@ -1432,3 +1578,4 @@ LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全
 | 2026-07-20 | §2.3 / §8.4 / §12 / §15：记录 cgroup `misc` 扫 mountinfo 根因、内核确认、`/proc/cgroups` 短路优化与对照数据 |
 | 2026-07-21 | §2.3 / §8.3 / **§8.5** / §9 / §12 / §15：写入细粒度 TRACE 复测——NewTask 再成头号；拆解 `cgroup.apply` / `shim.cgroup.load`；说明 `runc.init.sync` 在等子进程及与 `mounts` 的对应关系 |
 | 2026-07-21 | **§16**：对照 `/home/nathan/linux`（5.10.229）与 `/home/nathan/linux-upstream-v1`（7.0），按 TRACE 桶评估换核对冷启动的收益与边界 |
+| 2026-07-21 | **§17**：bbolt 单写者机制 + `no_sync`/Batch/减少 Update/Prepare 双 tx 等优化分层与验证矩阵 |
