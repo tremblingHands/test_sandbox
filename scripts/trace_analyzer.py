@@ -319,43 +319,149 @@ def print_summary_report(traces, file=sys.stdout):
         )
 
 
+def _span_label(span):
+    """Span name with (#N) suffix for same-parent duplicate siblings."""
+    label = span.name
+    if span.dup_index > 0:
+        label += " (#{})".format(span.dup_index + 1)
+    return label
+
+
+# Canonical forest roots kept as top-level trees in --summary-tree.
+_ANCHOR_ROOTS = frozenset({
+    "cri.sandbox.run",
+    "runc.create",
+})
+
+
+def _fold_parent_for_orphan_root(name):
+    """Map orphan mid-tree roots onto a synthetic parent so they merge.
+
+    When journal/parent links drop a span, its children become roots and
+    --summary-tree used to print a second copy of the same logical subtree.
+    Fold those orphans back under the forest they belong to.
+    """
+    if name in _ANCHOR_ROOTS or name.startswith("containerd.task.v3.Task/"):
+        return None
+    if name.startswith("runc."):
+        return "runc.create"
+    if name.startswith(("shim.", "runtime.", "tasks.")):
+        # Detail often lives under the shim RPC forest; also appears under CRI.
+        return "containerd.task.v3.Task/Create"
+    if name.startswith((
+        "metadata.", "client.", "cni.", "container.", "cri.",
+        "sandbox.", "process.",
+    )):
+        return "cri.sandbox.run"
+    return None
+
+
+def _root_sort_key(span):
+    """Process real forest anchors before orphans so suffix-merge can hit."""
+    name = span.name
+    if name == "cri.sandbox.run":
+        return (0, name)
+    if name.startswith("containerd.task.v3.Task/"):
+        return (1, name)
+    if name == "runc.create":
+        return (2, name)
+    return (3, name)
+
+
+def _resolve_agg_path(parent_path, label, seen_paths):
+    """Build aggregation path; merge fragments into an existing suffix path."""
+    path_key = parent_path + "\0" + label if parent_path else label
+    if path_key in seen_paths:
+        return path_key
+
+    # Prefer merging into an already-seen nested path ending with this label
+    # (covers journal orphans and fold-under-anchor short paths).
+    suffix = "\0" + label
+    matches = [k for k in seen_paths if k == label or k.endswith(suffix)]
+    if parent_path:
+        pref = parent_path + "\0"
+        matches = [k for k in matches if k.startswith(pref)]
+    if not matches:
+        return path_key
+
+    def rank(k):
+        if k == "cri.sandbox.run" or k.startswith("cri.sandbox.run\0"):
+            group = 0
+        elif k.startswith("containerd.task.v3.Task/"):
+            group = 1
+        elif k == "runc.create" or k.startswith("runc.create\0"):
+            group = 2
+        else:
+            group = 3
+        return (group, -k.count("\0"), -len(k))
+
+    matches.sort(key=rank)
+    return matches[0]
+
+
 def print_summary_tree_report(traces, file=sys.stdout):
     """Print per-stage summary in tree-structure order across all sandboxes.
 
     Unlike --summary (alphabetical), this walks each trace's span tree and
     preserves the parent-child ordering with indentation, so the output
     mirrors the hierarchical structure of the sandbox creation flow.
+
+    Aggregation key is the full ancestor path (including (#N) labels), not
+    the leaf name alone. Otherwise a second sibling such as
+    ``metadata.sandbox.Update (#2)`` would look like a bare leaf: its
+    children share names with the first Update's children and get folded
+    into that first subtree instead of nesting under (#2).
+
+    Orphan roots (missing parent in the log) are folded under canonical
+    forest anchors and/or suffix-merged so the same logical span is not
+    printed twice as disconnected trees.
     """
-    order = []       # [(display_name, depth)] in first-appearance order
-    all_spans = []   # [(display_name, duration_ms)]
+    # order: [(path_key, label, depth)] first-appearance order
+    order = []
+    seen_paths = set()
+    # all_spans: [(path_key, duration_ms)]
+    all_spans = []
 
     for _trace_id, spans in traces.items():
         roots = build_trees(spans)
         if not roots:
             continue
+        roots = sorted(roots, key=_root_sort_key)
 
-        def walk(nodes, depth):
+        def walk(nodes, depth, parent_path):
             for s in nodes:
-                display = s.name
-                if s.dup_index > 0:
-                    display += " (#{})".format(s.dup_index + 1)
+                label = _span_label(s)
+                natural = parent_path + "\0" + label if parent_path else label
+                path_key = _resolve_agg_path(parent_path, label, seen_paths)
 
-                if display not in [n for n, _ in order]:
-                    order.append((display, depth))
+                # If suffix-merge rewrote the path, indent to the merged location.
+                if path_key != natural:
+                    disp_depth = path_key.count("\0")
+                else:
+                    disp_depth = depth
 
-                all_spans.append((display, s.duration_ms))
-                walk(s.children, depth + 1)
+                if path_key not in seen_paths:
+                    seen_paths.add(path_key)
+                    order.append((path_key, label, disp_depth))
 
-        walk(roots, 0)
+                all_spans.append((path_key, s.duration_ms))
+                walk(s.children, disp_depth + 1, path_key)
+
+        for root in roots:
+            fold = _fold_parent_for_orphan_root(root.name)
+            if fold:
+                walk([root], 1, fold)
+            else:
+                walk([root], 0, "")
 
     if not all_spans:
         print("No spans to summarize.", file=file)
         return
 
-    # Aggregate stats per display name
+    # Aggregate stats per path (not bare span name)
     stats = defaultdict(list)
-    for name, dur in all_spans:
-        stats[name].append(dur)
+    for path_key, dur in all_spans:
+        stats[path_key].append(dur)
 
     # Header
     header = "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
@@ -363,31 +469,30 @@ def print_summary_tree_report(traces, file=sys.stdout):
     print(header, file=file)
     print("-" * 105, file=file)
 
-    # Print in tree order with indentation
-    name_depth = {n: d for n, d in order}
-    for name, depth in order:
-        if name not in stats:
+    def percentile(data, p):
+        if not data:
+            return 0
+        k = (p / 100.0) * (len(data) - 1)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return data[int(k)]
+        return data[int(f)] * (c - k) + data[int(c)] * (k - f)
+
+    # Print in tree order; indent + leaf label only (path is for grouping)
+    for path_key, label, depth in order:
+        if path_key not in stats:
             continue
-        durs = sorted(stats[name])
+        durs = sorted(stats[path_key])
         n = len(durs)
         avg = sum(durs) / n
-
-        def percentile(data, p):
-            if not data:
-                return 0
-            k = (p / 100.0) * (len(data) - 1)
-            f = math.floor(k)
-            c = math.ceil(k)
-            if f == c:
-                return data[int(k)]
-            return data[int(f)] * (c - k) + data[int(c)] * (k - f)
 
         p50 = percentile(durs, 50)
         p95 = percentile(durs, 95)
         p99 = percentile(durs, 99)
 
         indent = "  " * depth
-        display = indent + name
+        display = indent + label
 
         print(
             "{:<65} {:>5} {:>8} {:>8} {:>8} {:>8}".format(
