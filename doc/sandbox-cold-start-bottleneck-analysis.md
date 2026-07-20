@@ -1276,7 +1276,7 @@ ls "$RESULT/perf"/*.svg
 | 上游对照（§16 主文） | `/home/nathan/linux-upstream-v1` @ **v7.0** | 换核收益基线 |
 | 上游最新（§16.9） | 同树 HEAD ≈ **v7.2-rc4**（`b95f03f04d47`） | 相对 v7.0 的增量 |
 
-前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）**。
+前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）、RTNL（§16.5）**。
 
 公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）；`favordynmods` / per-threadgroup rwsem（`6a010a49b63a`、`0568f89d4fb8`）。
 
@@ -1287,7 +1287,7 @@ ls "$RESULT/perf"/*.svg
 | **基本无收益** | bbolt 写锁 | `*.tx.wait`、lease/snapshot | **不动** | — |
 | **基本无收益** | containerd 绑 4 核 | 端到端 P95 放大器 | **不动**（调度略有间接） | — |
 | **基本无收益** | misc mountinfo | `subsys.misc` | 已用户态修；v7.0 若误开 `CONFIG_CGROUP_MISC` 反可能多成本 | 保持 misc 关或保留短路 |
-| **低 / 条件** | per-netns RTNL | `cni.plugin.*` ~300ms | **默认构建几乎无并行收益**；转换未完成 | 见 §16.5 |
+| **低 / 条件** | per-netns RTNL | `cni.plugin.*` ~300ms | **默认构建几乎无并行收益**；转换未完成 | 见 **§16.5** |
 | **低** | STP `br_info` printk | 历史 CNI 持锁放大 | **上游仍在**；本机补丁仍有价值 | 需继续关 printk 或上游安静化 |
 | **中等（读侧）** | kernfs 全局锁→per-root rwsem | `exists_check.stat`、部分 cgroup 读 | 减轻与 **sysfs 等其它 kernfs 根** 的交叉争用；**同层级 mkdir 仍串行** | 见 **§16.3.2** |
 | **中等（条件）** | favordynmods / per-tg rwsem | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 见 **§16.3.5** |
@@ -1724,21 +1724,91 @@ runc 子进程 CLONE_NEWNS (+ 可能 EMPTY)
 
 **映射**：`cni.setup` ~303ms（bridge/loopback）；历史 RTNL + printk（§7）。
 
-| | 5.10.229 | 7.0 |
-|--|----------|-----|
-| 全局 `rtnl_mutex` | 唯一主锁（`net/core/rtnetlink.c`） | **仍在** |
-| `rtnl_net_lock` / per-netns | 无 | 有 API + `net->rtnl_mutex`，但挂在 **`CONFIG_DEBUG_NET_SMALL_RTNL`（default n）** |
-| 默认行为 | 全局锁 | **默认 `rtnl_net_lock` ≡ `rtnl_lock()`**；debug 开启时是 **全局 + 每 netns 嵌套**（转换期更慢） |
-| 真实进展 | — | `RTNL_FLAG_DUMP_UNLOCKED`、`exit_rtnl` 批量拆 netns、部分 dump/地址路径减压 |
-| bridge STP `br_info` | 本机 **已注释**（`0d91342dba12`） | **上游仍 printk**（`net/bridge/br_stp.c` `br_set_state`） |
+对照：`/home/nathan/linux` vs `/home/nathan/linux-upstream-v1` 的 `net/core/rtnetlink.c`、`include/linux/rtnetlink.h`、`net/Kconfig.debug`。
 
-LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全局锁仍在进行中**（Kconfig 帮助文本写明转换完成后才有真正 per-netns 可扩展性）。
+#### 16.5.1 基线：全局 `rtnl_mutex`（5.10 与上游默认相同）
 
-**对本场景（已关 printk、已关 ipMasq）**：
+```c
+static DEFINE_MUTEX(rtnl_mutex);
+void rtnl_lock(void) { mutex_lock(&rtnl_mutex); }
+```
 
-1. CNI 只剩 ~5% 端到端 → 即便将来 per-netns 完成，端到端也多半是 **几十～一百多 ms** 量级，不是 NewTask 秒级。  
-2. **当前 v7.0 默认构建**：veth/bridge/`RTM_NEWLINK` 仍实质全局串行 → **不要预期 CNI 再腰斩**。  
-3. 换上游内核时 **务必保留** 关 STP/`br_info` printk（或等价），否则可能部分回到 §7.5 的持锁放大。
+未标 `DOIT_UNLOCKED` 的消息：
+
+```c
+if (flags & RTNL_FLAG_DOIT_UNLOCKED) {
+	err = doit(...);          /* 不拿全局锁 */
+} else {
+	rtnl_lock();
+	err = link->doit(...);
+	rtnl_unlock();
+}
+```
+
+对本场景：建 netns 注册 `lo`、CNI `RTM_NEWLINK`/`SETLINK`（veth、bridge、master）都挤这把锁——对应历史 `cni.setup` 与 `rtnl_setlink`（§7）。sleeping mutex：等锁者让出 CPU，持锁者跑临界区（§7.3）。
+
+#### 16.5.2 主线战略：per-netns RTNL（转换未完成）
+
+目标（`76aed95319da`）：最终每个 `struct net` 一把小 mutex，去掉全局锁。
+
+| | 默认生产构建 | `CONFIG_DEBUG_NET_SMALL_RTNL=y`（default **n**） |
+|--|--------------|--------------------------------------------------|
+| `rtnl_net_lock(net)` | **≡ `rtnl_lock()`** | 先全局，再 `net->rtnl_mutex`（**更慢**） |
+| Kconfig 意图 | — | 转换期用 LOCKDEP 验证；**完成后**才去掉全局、获真正 per-netns 可扩展性 |
+
+```c
+/* 未开 DEBUG 时 */
+static inline void rtnl_net_lock(struct net *net) { rtnl_lock(); }
+```
+
+**不要开 `DEBUG_NET_SMALL_RTNL` 指望加速**（§16.8 实验 D）。
+
+消息标志（施工状态）：
+
+```c
+RTM_NEWLINK → RTNL_FLAG_DOIT_PERNET       /* 已走 rtnl_nets 风格；默认仍落到全局锁 */
+RTM_DELLINK → RTNL_FLAG_DOIT_PERNET_WIP
+RTM_SETLINK → RTNL_FLAG_DOIT_PERNET_WIP   /* CNI 改链路：仍 WIP */
+RTM_GETLINK → DOIT_UNLOCKED | DUMP_UNLOCKED
+```
+
+`d91191ffe23f`：NEWLINK 转 per-netns **风格**；默认构建底层仍是全局锁。SETLINK/DELLINK 正是 CNI 热路径，仍 WIP。
+
+#### 16.5.3 已落地的旁路优化（减压，不拆 CNI 串行）
+
+| 手段 | 代表 | 对本场景 |
+|------|------|----------|
+| `DOIT_UNLOCKED` / `DUMP_UNLOCKED` | GETLINK 等 | 查询少堵配置路径 |
+| `RTEXT_FILTER_NAME_ONLY` | `e896e5c0734b`：getlink/dump 可不拿 RTNL | 脚本 `ip link show` 减压；**非** CNI newlink/setlink |
+| `->exit_rtnl` 批量拆 ns | netns 退出 | 销毁略好；建沙箱帮助有限 |
+| ipmr/ip6mr、fib exit、ops-locked ethtool 少占 RTNL | 7.1–7.2（§16.9） | 旁路 |
+| 关 bridge `br_info` printk | 本机 `0d91342dba12`；**上游仍在** | **缩短持锁**（已验证，§7.5）；非锁粒度 |
+
+#### 16.5.4 与冷启动路径叠层
+
+```
+CNI / netns → RTM_NEWLINK|SETLINK|register_netdev(lo)
+           → rtnl_lock() 或 rtnl_net_lock()≡rtnl_lock()  【默认全局串行】
+           → rtnl_newlink / rtnl_setlink / br_add_if ...
+并发沙箱 → 等同一把 rtnl_mutex
+```
+
+| 优化 | 默认是否并行化 CNI newlink/setlink | 对本场景 |
+|------|-------------------------------------|----------|
+| 全局 `rtnl_mutex` | 否 | 关 printk/masq 后 CNI ~300ms 仍受此约束 |
+| `rtnl_net_lock` API | **否**（≡ 全局） | 转换脚手架 |
+| `DEBUG_NET_SMALL_RTNL` | 更慢 | 仅 lockdep |
+| UNLOCKED / NAME_ONLY / dump | 否（旁路） | 减压查询 |
+| NEWLINK `DOIT_PERNET` | 默认仍全局 | 为拆锁铺路 |
+| SETLINK `PERNET_WIP` | 否 | CNI 改链路仍 WIP |
+| 关 `br_info` printk | 缩短持锁 | **已验证高杠杆** |
+
+#### 16.5.5 对本场景小结
+
+1. 已关 printk、已关 ipMasq 后 CNI 只剩 ~5% 端到端；即便将来 per-netns 完成，端到端也多半是 **几十～一百多 ms**，不是 NewTask 秒级。  
+2. **当前默认构建**：veth/bridge/`RTM_NEWLINK`/`SETLINK` 仍实质全局串行 → **不要预期换核再腰斩 CNI**。  
+3. 换上游内核时 **务必保留** 关 STP/`br_info` printk（或 `dmesg -n 4` 等），否则可能部分回到 §7.5。  
+4. 若要继续压 CNI：换形态（ipvlan / hostNetwork）或等转换完成；**不要指望只升内核**。
 
 ### 16.6 L4 — 调度 / 进程创建（放大器）
 
@@ -1769,6 +1839,8 @@ LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全
 | D. v7.0 默认 vs 开 `DEBUG_NET_SMALL_RTNL` | 证明转换期 debug 无生产收益 | `cni.setup`（预期持平或变差） |
 | E. `--perf_sandbox` 对比 `cgroup_mutex` / `kernfs_rwsem` / `rtnl_lock` | 锁符号是否从全局 kernfs_mutex 变为 per-root | 火焰图 |
 | F. 同配置 v7.0 → 最新主线（§16.9） | 量化 7.1/7.2 旁路增量 | 预期 apply/CNI 无数量级变化 |
+| G. **runc 接 `CLONE_EMPTY_MNTNS`**（同内核） | 少拷挂载 | `wait.for_hooks`、`runc.init.mounts`（§16.4） |
+| H. 开 `favordynmods`（同内核） | attach↔fork 尾延迟 | P95；**不预期** apply Avg 腰斩（§16.3.5） |
 
 ### 16.9 相对 v7.0：最新 upstream（≈7.2-rc）增量
 
@@ -1781,12 +1853,12 @@ LPC / LWN：per-netns RTNL 目标是容器化配置可扩展；**完整拿掉全
 | **低** | RTNL 继续卸压（`GETLINK`+`NAME_ONLY` 可不拿 RTNL；ipmr/ip6mr、部分 fib exit、ops-locked ethtool） | 减压旁路；**不砍** bridge/veth `newlink`/`setlink` |
 | **低** | bridge lockless flag / atomic 读 | 查询路径；**`br_info` 仍 printk** |
 | **低** | `cgroup_file_notify` 细锁 + defer `kill_css` | 通知/销毁；非 mkdir apply |
-| **条件/中（需改用户态）** | `CLONE_EMPTY_MNTNS` / `FSMOUNT_NAMESPACE` | **可能**缩短 mounts / `wait.for_hooks`；runc 当前未用 |
-| **基本无** | `cgroup_mutex` / `namespace_sem` / 默认全局 RTNL / favordynmods 跃迁 | 与 v7.0 同档 |
+| **条件/中（需改用户态）** | `CLONE_EMPTY_MNTNS` / `FSMOUNT_NAMESPACE` | **可能**缩短 mounts / `wait.for_hooks`；详见 §16.4；runc 当前未用 |
+| **基本无** | `cgroup_mutex` / `namespace_sem` / 默认全局 RTNL / favordynmods 跃迁 | 与 v7.0 同档；favor 机制见 §16.3.5 |
 
 `DEBUG_NET_SMALL_RTNL` 仍 default **n**；默认 `rtnl_net_lock()` ≡ `rtnl_lock()`。换核仍保留关 `br_info`/console 策略。
 
-**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）**，确定收益偏「旁路」；**`cgroup_mutex` 内核侧优化不消掉串行 mkdir/procs**（§16.3.1）。砍 `cgroup.apply` 应 **切 cgroup v2 / 减少 controller**（§16.3.3）并单独压测；网络侧保留关 printk，等 per-netns RTNL 完成后再预期 CNI 并行度跃迁。
+**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）**，确定收益偏「旁路」；**`cgroup_mutex` / 全局 `namespace_sem` / 默认全局 RTNL 不因换核消失**（§16.3.1 / §16.4 / §16.5）。砍 `cgroup.apply` 应 **切 cgroup v2**（§16.3.3）；砍 `init.sync` 应评估 **空 mntns**（§16.4.3）；`favordynmods` 仅旁路（§16.3.5）。网络侧保留关 printk，等 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
 
 ---
 
@@ -1962,3 +2034,5 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | 2026-07-21 | **§17**：bbolt 单写者机制 + `no_sync`/Batch/减少 Update/Prepare 双 tx 等优化分层与验证矩阵 |
 | 2026-07-21 | **§16.3.1 / §16.3.3 / §16.9**：展开 `cgroup_mutex` 旁路优化与源码路径；切 cgroup v2 对本场景的好处与边界；v7.0→≈7.2-rc 增量 |
 | 2026-07-21 | **§16.3.2**：展开 kernfs 全局 mutex→per-root rwsem、iattr/supers/idr/rename 拆分与对本场景边界 |
+| 2026-07-21 | **§16.3.5 / §16.4**：展开 `favordynmods`（threadgroup rwsem 两层优化）与 mount/namespace（RB 树、`CLONE_EMPTY_MNTNS`、OPEN_TREE/FSMOUNT_NAMESPACE） |
+| 2026-07-21 | **§16.5**：展开 RTNL——全局 `rtnl_mutex`、`rtnl_net_lock` 转换期、UNLOCKED/NAME_ONLY 旁路与对本场景 CNI 边界 |
