@@ -901,10 +901,26 @@ Create 内部 TRACE span：
 | `runc.create` | 整次 `runc create` |
 | `runc.spec.load` | 读 OCI config |
 | `runc.container.new` | libcontainer Create |
+| `runc.cgroup.manager.new` | 创建 cgroup Manager |
+| └ `…manager.new.initPaths` | v1：解析各子系统绝对路径（常见热点） |
+| └ `…manager.new.rootPath` / `inner` | cgroup 根与 inner path |
+| └ `…manager.new.subsys.<name>` | 单控制器路径解析 |
+| `runc.cgroup.exists_check` | 已有 cgroup 是否非空 |
 | `runc.container.start` | `Container.Start` |
 | `runc.init.start` | 拉起 / 等待 init |
-| `runc.cgroup.apply` | 写 cgroup |
-| `runc.init.sync` | 与 init 同步（通常最大） |
+| `runc.cgroup.apply` / `…apply.<ctrl>` | 写 cgroup（按控制器） |
+| `runc.init.sync` | 父进程与 init 同步总墙钟 |
+| └ `…sync.wait` | 父进程阻塞读 sync pipe（等子进程） |
+| └ `…sync.hooks` / `ready` / `mount` / `seccomp` | 父侧处理对应消息 |
+| └ `runc.cgroup.set` / `…set.<ctrl>` | hooks 内写资源限制 |
+| **子进程（同 `/tmp/runc-trace.log`）** | |
+| `runc.init.prepareRootfs` | init 配 rootfs 总段 |
+| └ `…prepareRoot` / `mounts` / `setupDev` / `pivotRoot` | 子步骤 |
+| └ `…syncParentHooks` | 子进程等父进程跑 hooks |
+| `runc.init.finalizeRootfs` | pivot 后收尾 |
+| `runc.init.syncParentReady` | 子进程 ready ↔ 父进程 procRun |
+
+关 `ipMasq` 后若 `manager.new` / `init.sync` 仍大：优先看 `initPaths`/`subsys.*` 与 `sync.wait` + 子侧 `prepareRootfs`/`mounts`。
 
 ---
 
@@ -1065,3 +1081,4 @@ ls "$RESULT/perf"/*.svg
 | 2026-07-17 | §13：补充 on-CPU `--call-graph dwarf`（默认仍 fp；仅影响 on-CPU）以减少 Go `[unknown]` |
 | 2026-07-17 | §7.5：写入 host-local 预填 5000 对照（`cni.setup` 386ms→8.83s；`hostlocal_prefill.sh`） |
 | 2026-07-17 | §2.3 / §7.5 / §12 / §15：记录 host-local 旁路索引（`by_id.idx`）改动后**端到端未见效果** |
+| 2026-07-20 | §13.3：补充 `manager.new.initPaths` / `init.sync.wait|hooks|…` / 子进程 `prepareRootfs` 等细粒度 TRACE |
