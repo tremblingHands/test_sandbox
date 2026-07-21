@@ -33,7 +33,7 @@
 
 | 项 | 值 |
 |----|-----|
-| 主机 | HM70，aarch64，内核 5.10.229，2 × NUMA，256 核 |
+| 主机 | HM70，aarch64，**基线内核 5.10.229**；**当前工作点内核 6.6.118+debug + cgroup v2**（§2.3 / §8.6），2 × NUMA，256 核 |
 | containerd | v2.3.0-100-g36696e157.m |
 | Workers | **128**（绑定 CPU **128–255**，NUMA 1） |
 | containerd CPU | **1–4**（仅 4 核） |
@@ -65,22 +65,26 @@
 | + host-local **旁路索引**（`by_id.idx`） | — | run P95 **~11.9s** | **7.49s** | **342ms** | **NewTask ~3.24s**；**端到端未见收益** |
 | + runc：**跳过缺失 cgroup 控制器的 mountinfo**（misc） | — | run P95 **~9.4s** | **6.45s** | **245ms** | **NewContainer ~2.3s**（见 §8.4） |
 | + 细粒度 TRACE 复测（同环境，2026-07-21） | — | run P95 **~12.8s** | **6.36s** | **303ms** | **NewTask ~3.77s**（见 §8.5） |
+| + 内核 **6.6.118** + **cgroup v2**（仍有 allmulti printk） | — | run P95 **~9.2s** | **5.60s** | **4.11s** | **CNI ~73%**；apply **~45ms**（见 §8.6） |
+| + 再关 **allmulticast** printk（同 6.6+v2） | — | run P95 **~8.2s** | **4.94s** | **3.34s** | **CNI ~68%**（见 §8.6） |
 
-**当前工作点（2026-07-21）**：关 printk + `ipMasq: false` + misc 短路 + 最新 shim/runc TRACE（profile 复测，`cri.sandbox.run` Cnt≈473）：
+**当前工作点（2026-07-21，内核 6.6.118+debug + cgroup v2）**：`systemd.unified_cgroup_hierarchy=1` + 关 promiscuous/STP/ADDRCONF/**allmulticast** printk + `ipMasq: false` + misc 短路（`cri.sandbox.run` Cnt≈344）：
 
 | Span | Avg | 约占 `cri.sandbox.run` |
 |------|-----|------------------------|
-| `cri.sandbox.run` | **6.36s**（P95 **12.8s**） | 100% |
-| **`container.NewTask`** | **3.77s** | **~59%** ← **头号** |
-| `client.NewContainer` | **985ms** | ~15%（较 misc 刚短路后的 ~2.3s 已降） |
-| `cni.setup_pod_network` | **303ms** | ~5% |
-| `client.task.Start` | **345ms** | ~5% |
-| `runc.create`（合并 TRACE） | **2.18s** | —（含 pause+业务等，Cnt=1023） |
-| └ `runc.cgroup.apply` | **1.03s** | runc 内最大头（cpuset/devices/memory） |
-| └ `runc.init.sync` | **693ms** | 几乎全是等子进程（§8.5） |
-| `shim.cgroup.load` | **734ms** | NewTask 内新暴露次桶 |
+| `cri.sandbox.run` | **4.94s**（P95 **8.23s**） | 100% |
+| **`cni.setup_pod_network`** | **3.34s** | **~68%** ← **头号** |
+| └ `cni.plugin.bridge` | **2.73s** | — |
+| └ `cni.plugin.loopback` | **~0.8–1.0s** | — |
+| `container.NewTask` | **527ms** | ~11%（v1 时 ~3.8s） |
+| `client.NewContainer` | **185ms** | ~4% |
+| `client.task.Start` | **76ms** | ~2% |
+| `runc.create`（合并 TRACE） | **296ms** | —（Cnt=1023） |
+| └ `runc.cgroup.apply` | **~51ms** | **v2 已砍掉数量级**（v1 时 ~1.0s） |
+| └ `runc.init.sync` | **172ms** | 仍以 wait 为主 |
+| `shim.cgroup.load` | **~15ms** | v1 时 ~734ms |
 
-host-local 旁路索引相对干净目录基线仍**未见端到端收益**（§7.5）。下一刀：**cgroup.apply / shim.cgroup.load / init.sync 等待**，以及贯穿全程的 **bbolt `.tx.wait`**（§8.5 / §9）。
+相对 §8.5（5.10 + cgroup v1）：**`runc.cgroup.apply` 1.03s→~50ms，`shim.cgroup.load` 734ms→~15ms，NewTask 3.77s→~0.5s** —— §16.3.3 预测已验证。端到端从 ~6.4s 降到 ~4.9s，但 **CNI 因 6.6 新增 allmulti 刷屏曾回潮到 ~4s**；关 allmulti 后仍 **~3.3s**，成为新头号。下一刀：**CNI/RTNL（bridge）** + **bbolt `.tx.wait`**（§7 / §17）；cgroup apply 不再是主战场。
 
 ---
 
@@ -862,6 +866,63 @@ container.NewTask                 ~3.77s
 4. **bbolt 写锁** — 减少 Update/lease/snapshot 排队  
 5. shim `binary.exec.wait`、CNI、Start — 次要  
 
+> **后续实测（§8.6）**：切 **6.6.118 + cgroup v2** 后，第 1/2 项已落地（apply ~50ms、load ~15ms）；当前头号回到 **CNI**。
+
+### 8.6 实测：内核 6.6.118 + cgroup v2（2026-07-21）
+
+同用户态配置（`ipMasq: false`、misc 短路、shim/runc TRACE），主机切换：
+
+| 项 | 值 |
+|----|-----|
+| 内核 | `/home/nathan/linux-6.6` @ **v6.6.118**，`EXTRAVERSION=+debug` |
+| cgroup | **unified v2**（`systemd.unified_cgroup_hierarchy=1`，`cgroup2 on /sys/fs/cgroup`） |
+| containerd runc | `SystemdCgroup = false`（cgroupfs / fs2） |
+| printk | 继承 5.10 的 promisc/STP/ADDRCONF 注释；6.6 另需关 **allmulticast**（见下） |
+
+#### 8.6.1 关键对照（相对 §8.5 / 5.10 + v1）
+
+| Span | §8.5（5.10 + v1） | 6.6+v2（有 allmulti 刷屏） | **6.6+v2（关 allmulti）** |
+|------|------------------|---------------------------|---------------------------|
+| `cri.sandbox.run` | 6.36s / P95 12.8s | 5.60s / P95 9.21s | **4.94s / P95 8.23s** |
+| `cni.setup_pod_network` | **303ms** | **4.11s** | **3.34s** |
+| `cni.plugin.bridge` | ~268ms | ~3.4s | **2.73s** |
+| `container.NewTask` | **3.77s** | 319ms | **527ms** |
+| `runc.cgroup.apply` | **1.03s** | 45ms | **~51ms** |
+| `shim.cgroup.load` | **734ms** | 4ms | **~15ms** |
+| `runc.init.sync` | 693ms | 111ms | **172ms** |
+| `client.NewContainer` | 985ms | 64ms | **185ms** |
+
+#### 8.6.2 结论：§16.3.3 已验证
+
+1. **切 cgroup v2 达到预期**：`runc.cgroup.apply` **~1s → ~50ms**（约 −95%）；`shim.cgroup.load` **734ms → ~15ms**；NewTask **3.8s → ~0.3–0.5s**。全局 `cgroup_mutex` 仍在，但抢锁次数从「每子系统一套」降到统一层级，墙钟数量级下降与机制分析一致。  
+2. **不能把「换 6.6」与「切 v2」混为一谈**：纯换核、继续 v1 时 apply 仍会是秒级争用（§16.1）；本轮收益主要来自 **unified hierarchy**。  
+3. **端到端未同比例下降**：run 仅 6.4s→4.9s，因为 **CNI 回潮**吃掉了 NewTask 省下的时间。
+
+#### 8.6.3 CNI 回潮：6.6 新增 `allmulticast` printk
+
+dmesg 统计（关 allmulti **之前**）：
+
+| 日志 | 次数 | 说明 |
+|------|------|------|
+| `veth*: entered allmulticast mode` | **~1033** | 冷启动创建主洪水 |
+| `veth* (unregistering): left allmulticast` | **~449** | 清理路径 |
+| promiscuous / STP `entered %s state` / ADDRCONF | **0** | 旧三处注释已生效 |
+
+根因：6.6 的 `__dev_set_allmulti()`（`net/core/dev.c`，提交 `802dcbd6f30f`）在改 `IFF_ALLMULTI` 时打 `netdev_info`；**5.10 无此日志**。路径带 `ASSERT_RTNL()`，与当年 promiscuous/`br_info` 一样：**持 RTNL + 串口 console → 放大 CNI**。Bridge 给 veth 开 allmulti（IPv6/ND 等）即可触发。
+
+对照：关 allmulti 后 `cni.setup` **4.11s→3.34s**（~−0.8s），dmesg 相关计数归零。**剩余 bridge ~2.7s 不是 printk**，属真实 RTNL/veth/bridge 成本（配置已 `ipMasq: false`）。
+
+#### 8.6.4 NewTask 变慢（319→527ms）与次要项
+
+CNI 松绑后争用换位：`runc.init.sync`、`shim.container.oom`、bbolt wait 略升；**`cgroup.apply` 仍 ~50ms**，不是 v2 回退。相对 3s CNI，NewTask 为次要。
+
+#### 8.6.5 优先优化顺序（本工作点）
+
+1. **CNI / RTNL**（`cni.plugin.bridge` ~2.7s）— `--perf_sandbox` 打 `rtnl_lock`；对照 ipvlan  
+2. **bbolt `.tx.wait`** — `no_sync` / 减 Update（§17）  
+3. **`runc.init.sync` / mounts** — 空 mntns 等（§16.4）  
+4. cgroup apply/load — **已不是主战场**
+
 ---
 
 ## 9. 瓶颈 C：metadata DB 争用
@@ -933,10 +994,11 @@ container.NewTask                 ~3.77s
 | G. **`--perf_sandbox` 打 `shim.cgroup.load` / `cgroup.apply`** | 瓶颈 B 下一刀 | 确认 cgroupfs / kernfs 争用符号 |
 | H. **换内核 5.10→7.0（同用户态配置）** | 量化纯换核 | 见 §16.8；预期 apply/CNI 不会数量级下降 |
 | I. **bbolt：`no_sync` / 合并 sandbox Update** | 瓶颈 C | 见 §17.7；盯 `.tx.wait` / Update Cnt |
-| J. **仅切 cgroup v2** | 瓶颈 B / `cgroup.apply` | 见 §16.3.3 / §16.8；盯 `runc.cgroup.apply.*` Cnt/Avg |
+| J. **切 cgroup v2 + 内核 6.6.118**（已做） | 瓶颈 B / `cgroup.apply` | **已验证**：apply **1.03s→~50ms**，load **734ms→~15ms**；run ~4.9s；头号变 CNI（见 §8.6 / §16.11） |
+| J2. **关 6.6 `allmulticast` printk**（已做） | CNI / RTNL 串口放大 | `cni.setup` **4.11s→3.34s**；dmesg allmulti 归零（见 §8.6.3） |
 | K. **runc 试 `CLONE_EMPTY_MNTNS`** | `init.sync` / mounts | 见 §16.4.3；盯 `wait.for_hooks`、`runc.init.mounts` |
 
-中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 `runc.cgroup.apply`（评估 cgroup v2，§16.3.3）、`shim.cgroup.load`、子进程 mounts / 空 mntns（§16.4）与 bbolt `.tx.wait`**（§8.5 / §17）。misc mountinfo 短路已落地（§8.4）。**换上游内核的预期与边界见 §16**（含 `cgroup_mutex` §16.3.1、kernfs §16.3.2、`favordynmods` §16.3.5、mount/ns §16.4；7.2-rc 增量 §16.9；不能替代用户态路径改造）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
+中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 CNI/RTNL（bridge ~2.7s）与 bbolt `.tx.wait`**（§8.6 / §17）；cgroup apply/load 在 v2 下已非主战场。misc 短路（§8.4）与 **cgroup v2（§8.6）** 已落地。**换上游内核的预期与边界见 §16**（实测 6.6.118 见 §16.11）。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
@@ -1247,22 +1309,24 @@ ls "$RESULT/perf"/*.svg
 | 端到端（同上 + host-local 预填 5000） | `cni.setup` Avg **386ms→8.83s**（约 ×23）；CNI 再次主导 `cri.sandbox.run` |
 | **host-local 旁路索引**（`by_id.idx`） | **端到端未见效果**：相对关 masq 干净目录，`cni.setup` 386→342ms（同量级），run ~7.5s 仍由 NewTask 主导 |
 | **runc：misc / 缺失控制器跳过 mountinfo**（已做） | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；`subsys.misc` P50 **~0.13ms**（见 §8.4） |
-| **当前工作点**（2026-07-21 TRACE 复测） | `cri.sandbox.run` Avg **~6.36s** / P95 **~12.8s**；`cni.setup` ~**303ms**；**NewTask ~3.77s（~59%）**；NewContainer ~**985ms** |
+| **当前工作点**（2026-07-21 TRACE 复测，5.10+v1） | `cri.sandbox.run` Avg **~6.36s** / P95 **~12.8s**；`cni.setup` ~**303ms**；**NewTask ~3.77s（~59%）**；NewContainer ~**985ms** |
+| **当前工作点**（2026-07-21，**6.6.118 + cgroup v2** + 关 allmulti） | run Avg **~4.94s** / P95 **~8.2s**；**CNI ~3.34s（~68%）**；NewTask ~**527ms**；`cgroup.apply` ~**50ms**（见 §8.6） |
 | 最大阶段（基线 profile） | **CNI 配网** 与 **shim/NewTask** 为主 |
 | 关 printk 后主阶段 | **`client.NewContainer` ~30%**；CNI 降至 ~14%；NewTask/cgroup 也大幅变快 |
 | 再关 ipMasq 后主阶段（目录较干净） | **`container.NewTask` ~2.5s / ~36%**；CNI 仅 ~6%；iptables 消失 |
 | misc 短路后主阶段（§8.4） | **`client.NewContainer` ~2.3s**；NewTask ~1.6s；CNI ~4%；`runc.create` ~0.7s |
 | **细粒度 TRACE 复测后主阶段（§8.5）** | **`container.NewTask` ~3.8s**；NewContainer ~1s；`runc.cgroup.apply` ~1.0s；`shim.cgroup.load` ~0.7s；`init.sync` wait ~0.7s |
+| **6.6 + cgroup v2 后主阶段（§8.6）** | **`cni.setup` ~3.3s**；NewTask ~0.5s；`cgroup.apply` ~50ms；需关 6.6 **allmulticast** printk |
 | 预填 5000 后主阶段 | **`cni.setup` / bridge ~8.8s**；NewTask/NewContainer Avg 骤降（队头在 IPAM） |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
-| 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
+| 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**；6.6 另有 **`allmulticast` `netdev_info`**（§8.6.3） |
 | 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证）；旁路索引**未拉到端到端** |
-| 瓶颈 B 深挖 | shim/NewTask；**`misc` mountinfo 已短路**（§8.4）；当前主因 **`cgroup.apply` + `cgroup.load` + `init.sync` 等子进程**（§8.5） |
-| 瓶颈 B / C / D（当前） | **主战场：NewTask（runc cgroup / shim load / sync wait）+ bbolt `.tx.wait`**；containerd 4 核放大 |
-| 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修） |
+| 瓶颈 B 深挖 | shim/NewTask；**`misc` mountinfo 已短路**（§8.4）；**cgroup v2 已验证** apply/load 数量级下降（§8.6） |
+| 瓶颈 B / C / D（当前） | **主战场：CNI/RTNL（bridge）+ bbolt `.tx.wait`**；NewTask/cgroup 已降为次要；containerd 4 核仍放大 |
+| 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修）；cgroup apply（v2 下已非主因） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已用 `/proc/cgroups` 短路。**当前工作点**下端到端仍约 **6.4s**，由 **NewTask ~3.8s** 主导（`cgroup.apply`、`shim.cgroup.load`、`init.sync` 等待子进程 mounts）；NewContainer 已降至 ~1s；bbolt 写锁贯穿各阶段抬高 P95（优化见 **§17**）。下一刀优先 **评估 cgroup v2**（§16.3.3）与 **mounts / 空 mntns**（§16.4）；bbolt 可并行试 `no_sync` / 减 Update。**换内核收益见 §16**（含 `favordynmods` §16.3.5）——不能指望单独解决秒级 NewTask。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已短路；**切 6.6.118 + cgroup v2** 后 **`cgroup.apply`/`cgroup.load` 从秒级落到几十毫秒**（§8.6 验证 §16.3.3）。**当前工作点** run≈**4.9s**，头号回到 **CNI≈3.3s**（6.6 曾因 allmulti printk 回潮，关后仍剩真实 RTNL/bridge 成本）；bbolt `.tx.wait` 贯穿抬高 P95（§17）。下一刀优先 **CNI/RTNL** 与 **bbolt**，而非继续打 cgroup apply。
 
 ---
 
@@ -1276,8 +1340,9 @@ ls "$RESULT/perf"/*.svg
 | 上游对照（§16 主文） | `/home/nathan/linux-upstream-v1` @ **v7.0** | 换核收益基线 |
 | 上游最新（§16.9） | 同树 HEAD ≈ **v7.2-rc4**（`b95f03f04d47`） | 相对 v7.0 的增量 |
 | OpenEuler（§16.10） | `/home/nathan/openeuler-kernel` **OLK-6.6** | `6.6.0-…`（分析时 `85f45c3abb4d`） |
+| **实测（§16.11 / §8.6）** | `/home/nathan/linux-6.6` @ **v6.6.118+debug** | 已切 **cgroup v2** + 关 allmulti printk |
 
-前提：当前工作点已关 printk、关 `ipMasq`、misc mountinfo 用户态短路（§2.3 / §8.5）。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）、RTNL（§16.5）**。
+前提：§8.5 工作点已关 printk、关 `ipMasq`、misc 短路。分析回答：**换到 v7.0（及更新主线）能砍哪几段墙钟、砍不动哪几段**；并展开 **`cgroup_mutex`（§16.3.1）、kernfs（§16.3.2）、切 v2（§16.3.3）、`favordynmods`（§16.3.5）、mount/namespace（§16.4）、RTNL（§16.5）**。**6.6.118 + cgroup v2 实测见 §16.11 / §8.6**。
 
 公开资料交叉：LPC/LWN per-netns RTNL；LKML cgroup pool RFC（未合入）；cgroup_file_notify 细锁系列（偏 reclaim 通知，非 mkdir 热路径）；EEVDF（6.6+）；`favordynmods` / per-threadgroup rwsem（`6a010a49b63a`、`0568f89d4fb8`）。
 
@@ -1294,8 +1359,8 @@ ls "$RESULT/perf"/*.svg
 | **中等（条件）** | favordynmods / per-tg rwsem | attach vs fork/exit | 减轻 attach 与无关进程 fork 的争用；**不消掉 cgroup_mutex** | 见 **§16.3.5** |
 | **中等 / 条件高** | mount ns RB 树；`CLONE_EMPTY_MNTNS` 等 | `runc.init.mounts` / `wait.for_hooks` | 换核默认旁路；**空 mntns 需改 runc** 才可能显著 | 见 **§16.4** |
 | **中等（放大器）** | EEVDF 调度 | `exec.wait`、等锁 sleep 尾延迟 | 可能改善唤醒尾延迟，**不砍秒级 apply** | 见 §16.6 |
-| **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s** | **仍是全局主锁**；旁路优化见 §16.3.1 | 真要大降：减 controller / **切 v2**（§16.3.3） |
-| **待验证 / 高相关** | 切 cgroup v2（unified） | apply 次数、单层级 | **可能显著降 apply**（少 N 次抢 `cgroup_mutex`） | 见 §16.3.3；CRI/runc 全路径 |
+| **高相关但换核不够** | `cgroup_mutex` 串行 mkdir/procs | **`runc.cgroup.apply` ~1s（v1）** | **仍是全局主锁**；旁路优化见 §16.3.1 | 真要大降：减 controller / **切 v2**（§16.3.3） |
+| **已验证 / 高相关** | 切 cgroup v2（unified） | apply 次数、单层级 | **实测 apply ~1s→~50ms**（6.6.118） | 见 §16.3.3 / **§16.11** / §8.6 |
 
 ### 16.2 L0 — 换核几乎帮不上的边界
 
@@ -1474,9 +1539,11 @@ down_read/write(&root->kernfs_iattr_rwsem);
 
 这是相对「只换内核、继续 v1」**最可能显著砍 `runc.cgroup.apply`** 的用户态/节点配置变更，需 CRI/runc/systemd 全路径切换并单独压测（§16.8 实验 C），**不能算进「默默升内核包」**。
 
+> **实测状态（2026-07-21）**：**已验证**。主机 `6.6.118+debug` + `systemd.unified_cgroup_hierarchy=1`：`runc.cgroup.apply` **1.03s→~50ms**，`shim.cgroup.load` **734ms→~15ms**，NewTask **3.77s→~0.5s**（§8.6 / §16.11）。端到端同时受 CNI 回潮约束，见下。
+
 ##### 机制：少抢几次全局 `cgroup_mutex`
 
-当前 TRACE：`runc.cgroup.apply ~1s`，拆成 cpuset / devices / memory 等。v1 下 runc（`opencontainers/cgroups/fs`）**按子系统循环**——每个控制器各自路径 mkdir + 写 `cgroup.procs`：
+§8.5 TRACE（cgroup v1）：`runc.cgroup.apply ~1s`，拆成 cpuset / devices / memory 等。v1 下 runc（`opencontainers/cgroups/fs`）**按子系统循环**——每个控制器各自路径 mkdir + 写 `cgroup.procs`：
 
 ```go
 // vendor/.../cgroups/fs/fs.go — Manager.Apply
@@ -1493,12 +1560,13 @@ CreateCgroupPath(m.dirPath, m.config)
 cgroups.WriteCgroupProc(m.dirPath, pid)  // 一次挂进程
 ```
 
-| 对比 | cgroup v1（现状） | cgroup v2 |
-|------|-------------------|-----------|
+| 对比 | cgroup v1（§8.5） | cgroup v2（§8.6 实测） |
+|------|-------------------|------------------------|
 | 层级 | 每 controller 一棵树 | **单棵** `/sys/fs/cgroup/...` |
 | 建组 | N 次 mkdir（N≈启用子系统） | 路径上 **一层一次** mkdir |
 | 挂进程 | N 次写 `cgroup.procs` | **1 次** |
 | 与 `cgroup_mutex` | N 次串行排队 | 次数 ≈ **O(路径深度)**，不再 ×N |
+| **`runc.cgroup.apply` Avg** | **~1.03s** | **~50ms（约 −95%）** |
 
 高并发下：同样 128 路沙箱，对全局锁的抢锁次数少一个数量级量级 → **`runc.cgroup.apply` / NewTask 才有机会从秒级明显下降**。
 
@@ -1513,7 +1581,8 @@ cgroups.WriteCgroupProc(m.dirPath, pid)  // 一次挂进程
 
 - **`cgroup_mutex` 仍在**：v2 是 **少拿**，不是无锁；同层级并发 mkdir 仍串行。  
 - **`CreateCgroupPath` 仍可能多层 mkdir + 写 `subtree_control`**：路径深或 enable 很多 controller 仍有成本，通常仍远好于 v1「每子系统一整套」。  
-- **不管**：`shim.cgroup.load`、`init.sync`、bbolt、RTNL。  
+- **实测已证实「不管」的项**：切 v2 **不直接砍** CNI/RTNL；本轮 CNI 甚至因 6.6 allmulti printk **回潮到秒级**（§8.6.3）。`init.sync`、bbolt 仍在。  
+- **`shim.cgroup.load`**：机制上「不管」，但实测从 **734ms→~15ms**（读路径/争用随 v2 单层级显著变轻）。  
 - **兼容**：v1-only 行为（旧 devices 等）要迁到 v2 等价物。
 
 ##### 与 favordynmods 的关系
@@ -1836,12 +1905,14 @@ CNI / netns → RTM_NEWLINK|SETLINK|register_netdev(lo)
 |------|------|------------------|
 | A. 同配置仅换 v7.0（保留关 printk） | 量化「纯换核」 | `cri.sandbox.run`、`cgroup.apply`、`exists_check.stat`、`cni.setup`、P95 |
 | B. v7.0 + 确认 `CONFIG_CGROUP_MISC=n` | 避免 misc 回退 | `manager.new.subsys.misc` |
-| C. **仅切 cgroup v2**（同内核，单独变量） | 验证 apply 是否大降 | `runc.cgroup.apply.*` Cnt/Avg、`cri.sandbox.run` |
+| C. **切 cgroup v2**（已做：6.6.118 + unified） | 验证 apply 是否大降 | **已验证**：apply **1.03s→~50ms**；load **734→~15ms**；详见 §8.6 / §16.11 |
+| C2. **关 6.6 allmulticast printk**（已做） | CNI 串口放大 | `cni.setup` **4.11→3.34s**；dmesg 归零 |
 | D. v7.0 默认 vs 开 `DEBUG_NET_SMALL_RTNL` | 证明转换期 debug 无生产收益 | `cni.setup`（预期持平或变差） |
 | E. `--perf_sandbox` 对比 `cgroup_mutex` / `kernfs_rwsem` / `rtnl_lock` | 锁符号是否从全局 kernfs_mutex 变为 per-root | 火焰图 |
 | F. 同配置 v7.0 → 最新主线（§16.9） | 量化 7.1/7.2 旁路增量 | 预期 apply/CNI 无数量级变化 |
 | G. **runc 接 `CLONE_EMPTY_MNTNS`**（同内核） | 少拷挂载 | `wait.for_hooks`、`runc.init.mounts`（§16.4） |
 | H. 开 `favordynmods`（同内核） | attach↔fork 尾延迟 | P95；**不预期** apply Avg 腰斩（§16.3.5） |
+| I. **同配置换 OLK-6.6**（精简 cgroup：MISC=n） | 量化 OE 相对 5.10 | 见 §16.10；预期旁路级，盯 apply/CNI |
 
 ### 16.9 相对 v7.0：最新 upstream（≈7.2-rc）增量
 
@@ -1921,7 +1992,49 @@ CNI / netns → RTM_NEWLINK|SETLINK|register_netdev(lo)
 3. 保留关 `br_info`/console。  
 4. 挂载侧优先评估已有的 **`OPEN_TREE_NAMESPACE`**（OE 有、`EMPTY_MNTNS` 无）。
 
-**一句话（§16）**：从 **5.10.229 升到 7.0（及更新主线）或 OpenEuler OLK-6.6**，确定收益偏「旁路」；**`cgroup_mutex` / 全局 `namespace_sem` / 默认全局 RTNL 不因换核消失**（§16.3.1 / §16.4 / §16.5 / §16.10）。砍 `cgroup.apply` 应 **切 cgroup v2**（§16.3.3）；砍 `init.sync` 应评估 **空 mntns / OPEN_TREE_NAMESPACE**（§16.4）；`favordynmods` 仅旁路（§16.3.5）。网络侧保留关 printk，等 per-netns RTNL 转换完成后再预期 CNI 并行度跃迁。
+### 16.11 实测：主线 6.6.118 + cgroup v2（2026-07-21）
+
+对照：`/home/nathan/linux-6.6` @ **v6.6.118**（`EXTRAVERSION=+debug`），相对 §8.5（**5.10.229 + cgroup v1**）。用户态：`ipMasq: false`、misc 短路、containerd `SystemdCgroup=false`。
+
+#### 16.11.1 配置
+
+| 项 | 值 |
+|----|-----|
+| cmdline | `systemd.unified_cgroup_hierarchy=1` |
+| 挂载 | `cgroup2 on /sys/fs/cgroup`（`nsdelegate`） |
+| printk | promisc / STP / ADDRCONF（同 5.10）；另关 **`allmulticast`**（6.6 新增，`802dcbd6f30f`） |
+
+`setup.sh` **不会**自动切 v2；是否 unified 完全看主机启动参数（见对话结论）。
+
+#### 16.11.2 TRACE 摘要
+
+| 指标 | 5.10 + v1（§8.5） | 6.6+v2（有 allmulti 刷屏） | **6.6+v2（关 allmulti）** |
+|------|------------------|---------------------------|---------------------------|
+| `cri.sandbox.run` Avg / P95 | 6.36s / 12.8s | 5.60s / 9.21s | **4.94s / 8.23s** |
+| `cni.setup` | 303ms | 4.11s | **3.34s** |
+| `container.NewTask` | 3.77s | 319ms | **527ms** |
+| `runc.cgroup.apply` | 1.03s | 45ms | **~51ms** |
+| `shim.cgroup.load` | 734ms | 4ms | **~15ms** |
+
+完整分解与 dmesg 统计见 **§8.6**。
+
+#### 16.11.3 对 §16 预测的回填
+
+| §16 预测 | 实测 |
+|----------|------|
+| 切 v2 可显著砍 `cgroup.apply` | **成立**（~−95%） |
+| 纯换核不够、须切 hierarchy | **成立**（本轮与 v2 绑定；未做「仅 6.6 仍 v1」对照，但机制与 §16.1 一致） |
+| 切 v2 不管 CNI/RTNL | **成立**；且 6.6 多出 allmulti printk，CNI **一度恶化到 ~4s** |
+| kernfs / EEVDF 旁路级 | 与「apply 数量级下降来自 v2」不矛盾；未单独拆出 |
+| 换核后仍须关 net printk | **成立**；6.6 须额外关 allmulti |
+
+#### 16.11.4 当前主战场（回填后）
+
+1. **CNI/bridge ~2.7–3.3s**（printk 已净）→ RTNL / veth / bridge 真实成本；对照 ipvlan（§12 实验 B）。  
+2. **bbolt `.tx.wait`**（§17）。  
+3. NewTask/`init.sync` 为次要（~0.5s 量级）。
+
+**一句话（§16）**：从 **5.10.229 升到 7.0 / OLK-6.6** 的**纯换核**收益仍偏旁路；**`cgroup_mutex` / 全局 RTNL 不因换核消失**。但 **切 cgroup v2 已在 6.6.118 上验证**：apply/load 数量级下降（§16.11）。当前墙钟头号是 **CNI**（含 6.6 allmulti 教训），不是 cgroup apply。砍 `init.sync` 仍看空 mntns（§16.4）；网络侧保留关 printk（含 allmulti），等 per-netns RTNL 完成后再预期 CNI 并行度跃迁。
 
 ---
 
@@ -2099,3 +2212,5 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | 2026-07-21 | **§16.3.2**：展开 kernfs 全局 mutex→per-root rwsem、iattr/supers/idr/rename 拆分与对本场景边界 |
 | 2026-07-21 | **§16.3.5 / §16.4**：展开 `favordynmods`（threadgroup rwsem 两层优化）与 mount/namespace（RB 树、`CLONE_EMPTY_MNTNS`、OPEN_TREE/FSMOUNT_NAMESPACE） |
 | 2026-07-21 | **§16.5**：展开 RTNL——全局 `rtnl_mutex`、`rtnl_net_lock` 转换期、UNLOCKED/NAME_ONLY 旁路与对本场景 CNI 边界 |
+| 2026-07-21 | **§16.10**：对照 OpenEuler OLK-6.6——相对 5.10/上游 7.x 的能力矩阵、OE 特有项与 defconfig 风险 |
+| 2026-07-21 | **§2.3 / §8.6 / §12 / §15 / §16.3.3 / §16.8 / §16.11**：写入 **6.6.118 + cgroup v2** 实测——apply/load 数量级下降已验证；allmulti printk 致 CNI 回潮及关后数据；更新当前工作点与下一刀 |
