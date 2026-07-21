@@ -81,7 +81,9 @@
 | └ `runc.init.sync` | **939ms** | 仍以 wait 为主；`mounts` ~248ms |
 | `shim.cgroup.load` | **2.1ms** | v1 时 **~734ms** |
 
-相对 §8.5（**同内核 5.10 + cgroup v1**）：切 v2 后 **`cgroup.apply` / `cgroup.load` / NewTask 数量级下降**，端到端 **6.36s→3.36s**，P95 **12.8s→3.71s**（见 §8.6）。CNI 仍健康。下一刀：**bbolt `.tx.wait`（NewContainer / Update）** 与 **`runc.init.sync` / mounts**（§17 / §16.4）；cgroup apply 已非主战场。
+相对 §8.5（**同内核 5.10 + cgroup v1**）：切 v2 后 **`cgroup.apply` / `cgroup.load` / NewTask 数量级下降**，端到端 **6.36s→3.36s**，P95 **12.8s→3.71s**（见 §8.6）。CNI 仍健康。下一刀：**bbolt `.tx.wait`（NewContainer / Update）** 与 **`runc.init.sync`（子侧 mounts / pivot / mask 等）**（§17 / §16.4 / **§8.7**）；cgroup apply 已非主战场。
+
+> **§8.7（2026-07-21）**：补全子侧 TRACE（含 pivot 后 FD 常开）后，`wait.for_ready` 已可与子 span 对齐；高并发样本上 sync 可达 ~2s，主头为 **mounts + prepareRoot + pivotRoot + readonlyPaths/maskPaths/sysctl**。
 
 ---
 
@@ -802,7 +804,7 @@ container.NewTask                 ~3.77s
 
 #### 8.5.4 `runc.init.sync` 到底在等什么？
 
-`runc.init.sync` 是**父进程**（`runc create`）在 sync pipe 上阻塞读；等的是子进程 **`runc init`** 发来的阶段信号，不是父进程自己在算。
+`runc.init.sync` 是**父进程**（`runc create`）在 sync pipe 上阻塞读；等的是子进程 **`runc init`** 发来的阶段信号，不是父进程自己在算。父子分工与协议见 **§8.7.1**；子侧细粒度对齐见 **§8.7.2**（补全 TRACE 后）。
 
 ```text
 父: runc.init.sync
@@ -815,11 +817,11 @@ container.NewTask                 ~3.77s
 
 | 父进程 wait | 子进程这段时间在干什么 |
 |-------------|------------------------|
-| **`wait.for_hooks`** | `prepareRoot` → **`mounts`** → `setupDev` → `syncParentHooks` |
-| **`wait.for_ready`** | 收到 `procHooksDone` 后：pivot / finalize 等 → `syncParentReady` |
+| **`wait.for_hooks`** | `preRootfs` → `prepareRoot` → `openRootfs` → **`mounts`** → `setupDev` → `syncParentHooks.send` |
+| **`wait.for_ready`** | `syncParentHooks.waitDone` 返回后：`afterHooks`（**`pivotRoot`**）→ **`beforeReady`**（sysctl / readonlyPaths / maskPaths…）→ `syncParentReady.send` |
 | **`wait.for_eof`** | 子继续 exec 前收尾并关 pipe（通常很短） |
 
-**本轮 profile 对照**：
+**§8.5 本轮（cgroup v1）profile 对照**：
 
 | Span | Avg | 说明 |
 |------|-----|------|
@@ -828,7 +830,7 @@ container.NewTask                 ~3.77s
 | `wait.for_ready` | **339ms** | 等子进程 pivot/收尾 |
 | `sync.ready` / `wait.for_eof` | 2ms / 5ms | 收尾 |
 
-子侧对应工作在**另一棵林**（跨进程 `traceutil` 栈空，挂不进 `init.sync`）：
+子侧对应工作在**另一棵林**（跨进程 `traceutil` 栈空，挂不进 `init.sync`；analyzer 折叠到 `runc.create` 下）：
 
 | Span | Avg | 对应哪次 wait |
 |------|-----|----------------|
@@ -837,7 +839,7 @@ container.NewTask                 ~3.77s
 | 各 `mount.*` | 各 ~17–23ms | 同上 |
 | `setupDev` / `syncParentHooks` | ~2ms / ~10ms | hooks 前后 |
 
-**结论**：trace **已经呈现**「在等什么」——两个 ~330ms 的 wait；子进程具体干了啥在 `runc.init.mounts` / `prepareRoot` 里，只是缩进上不在 `init.sync` 下。要优化 sync，应打**子进程**（尤其 mounts / prepareRoot / pivot），而不是父进程 wait 本身。
+**结论**：trace **已经呈现**「在等什么」——两个 ~330ms 的 wait；子进程具体干了啥在 `runc.init.mounts` / `prepareRoot` 里，只是缩进上不在 `init.sync` 下。要优化 sync，应打**子进程**（尤其 mounts / prepareRoot / pivot），而不是父进程 wait 本身。v2 工作点上的完整对齐与 ready 段拆解见 **§8.7**。
 
 #### 8.5.5 NewContainer（~985ms）与 bbolt
 
@@ -932,9 +934,130 @@ cri.sandbox.run ≈ 3.36s（P95 ≈ 3.71s）
 #### 8.6.5 优先优化顺序（切 v2 后）
 
 1. **bbolt `.tx.wait`** — NewContainer / sandbox.Update / lease（§17）  
-2. **`runc.init.sync` / `runc.init.mounts`** — 空 mntns 等（§16.4）  
+2. **`runc.init.sync` 子侧** — `mounts` / `prepareRoot` / **`pivotRoot`** / **`readonlyPaths`·`maskPaths`·`sysctl`**（§8.7 / §16.4）  
 3. CNI、shim `exec.wait` — 次要  
 4. cgroup apply/load — **已完成**
+
+---
+
+### 8.7 runc 父/子进程与 `init.sync` 子侧 TRACE（2026-07-21）
+
+本节回答三件事：（1）为何有「父/子」；（2）子侧 span 如何与 `wait.for_*` 对齐；（3）为何早期 ready 段「消失」及如何修好。工作点：**5.10 + cgroup v2**；样本 `runc.create` Cnt≈884（高并发合并林）。
+
+#### 8.7.1 为什么 runc 有父进程和子进程
+
+`runc create` **不是单进程一路干完**，而是：
+
+| | **父** | **子** |
+|--|--------|--------|
+| 命令 | `runc create …`（shim 拉起） | **同二进制**再 exec 成 `runc init` |
+| 命名空间 | 宿主机 | 已 `unshare`/`setns` 进容器 ns |
+| 代码入口 | `Container.Start` → `initProcess.start()`（`process_linux.go`） | `init.go` → `libcontainer.Init()` → `standard_init.Init()` |
+
+子如何进来：父 `cmd.Start()` 后，子在 Go `main` **之前**经 `nsenter`/`nsexec` 进命名空间，再认 `Args[1]=="init"`：
+
+```go
+// init.go
+if len(os.Args) > 1 && os.Args[1] == "init" {
+    libcontainer.Init()
+}
+```
+
+父/子用三对管道通信（`process_linux.go` 的 `comm`）：`init`（bootstrap/config）、**`sync`（阶段握手）**、`log`（日志转发）。子从 `_LIBCONTAINER_SYNCPIPE` 取 sync FD（`init_linux.go`）。
+
+**必须拆开的原因**：
+
+1. **进 ns 的活只能子做**：`prepareRoot` / `mounts` / `pivot_root` / mask 路径等。  
+2. **宿主机视角的活只能父做**：`cgroup.apply`、CreateRuntime/prestart hooks、部分 mount 代开（idmap）、`pidfd_getfd` 拿 seccomp fd、最后放行 exec。  
+3. 两边用 **sync 管道握手**（`sync.go`）：
+
+```text
+子 procHooks  →  父跑 hooks →  父 procHooksDone
+子 procReady  →  父收尾     →  父 procRun
+```
+
+父在 `parseSync` 上阻塞读时打出 `wait.for_hooks` / `wait.for_ready`；**墙钟在子，父只是在等**。优化 sync 应改子路径，不是父 wait 本身。
+
+```text
+父 (宿主机)                              子 (容器 ns，runc init)
+─────────────                            ────────────────────────
+cgroup.apply
+wait.for_hooks  ←──────────────────────  preRootfs / prepareRoot / mounts / …
+                                           syncParentHooks.send (procHooks)
+sync.hooks / cgroup.set ───────────────→  syncParentHooks.waitDone
+wait.for_ready  ←──────────────────────  afterHooks (pivotRoot) / beforeReady / …
+                                           syncParentReady.send (procReady)
+sync.ready / wait.for_eof ─────────────→  waitRun；关 pipe；execve 用户进程
+```
+
+#### 8.7.2 子侧 span 与父 wait 对齐（补全 TRACE 后）
+
+子 span 与父不同进程，`traceutil` 栈不共享 → summary 里常折叠在 `runc.create` 下（与 `container.start` 同级），**不要**期望缩进在 `init.sync` 里。读数时用下表映射；**Avg 跨沙箱不可严丝合缝相加**（尾延迟不同），同量级 + 内部自洽即可。
+
+**父 `init.sync` 内部分解（本轮）**：
+
+| Span | Avg | |
+|------|-----|--|
+| `wait.for_hooks` | **929ms** | |
+| `sync.hooks` | 16.8ms | ≈ 子 `syncParentHooks.waitDone` **18ms** |
+| `wait.for_ready` | **1.19s** | |
+| `sync.ready` + `wait.for_eof` | ~5ms | |
+| **合计** | **≈ 2.14s** | = `runc.init.sync` **2.14s** ✓ |
+
+**`wait.for_hooks` ↔ 子（发 `procHooks` 前）**：
+
+| 子 span | Avg |
+|---------|-----|
+| `preRootfs` | 4ms |
+| `prepareRoot` | **211ms**（`propagation` 92 + `parentPrivate` 68 + `bind` 51） |
+| `mounts` | **511ms**（各 `mount.*` 之和 ≈ 510ms ✓） |
+| `setupDev` + `send` | ~4ms |
+| **小计** | **≈ 730ms** vs 父 **929ms**（差 ~200ms，Avg 可接受） |
+
+**`wait.for_ready` ↔ 子（对齐很好）**：
+
+| 子 span | Avg | |
+|---------|-----|--|
+| `afterHooks`（几乎全是 `pivotRoot`） | **398ms** | |
+| `beforeReady` | **790ms** | `sysctl` 163 + `readonlyPaths` 317 + `maskPaths` 310 ≈ 790 ✓ |
+| `syncParentReady.send` | ~0.1ms | |
+| **合计** | **≈ 1.19s** | = 父 `wait.for_ready` **1.19s** ✓ |
+
+注意：`prepareRootfs` **~1.14s** **跨两个阶段**（含 `waitDone` + `afterHooks`），**不要**拿它直接对比 `wait.for_hooks`。
+
+**当前 sync 主头（本轮）**：
+
+```text
+wait.for_hooks ~0.9s  →  prepareRoot(~0.2s) + mounts(~0.5s)
+wait.for_ready ~1.2s  →  pivotRoot(~0.4s)
+                         + sysctl(~0.16s) + readonlyPaths(~0.3s) + maskPaths(~0.3s)
+```
+
+相对 §8.6 早期（sync ~0.9s、`mounts` ~248ms）：本轮并发/负载下 sync 更重；**结构相同**，只是各段被放大。下一刀仍打这些子 span（§16.4 空 mntns；用户态减少 readonly/mask 路径数或合并挂载等）。
+
+#### 8.7.3 `pivot_root` 导致 ready 段 TRACE「消失」及修复
+
+**现象**：早期 summary 只有 `preRootfs` / `mounts` / `syncParentHooks`，**看不到** `pivotRoot` / `beforeReady` / `maskPaths` 等；`wait.for_ready` 无法用子侧核对。
+
+**根因**：`traceutil` 原先每次 `OpenFile("/tmp/runc-trace.log")`。子进程 `pivot_root` 后 `/` 已是容器 rootfs，再按路径打开写到**容器内**（或失败静默丢弃）。`trace_analyzer.py` **丢弃无 `end` 的 span** → 凡跨 pivot 的 span（含 `prepareRootfs` 总段）整段从汇总消失。
+
+**修复**（`/home/nathan/runc/libcontainer/traceutil/trace.go`）：首次打开后**保持 FD**，后续 start/end 只往该 FD 写。打开的文件描述符指向原 inode，不随 mount ns / root 改变，故 pivot 后仍写入宿主机 `/tmp/runc-trace.log`。`--profile` 合并该文件后即可看到完整 ready 段（§8.7.2）。
+
+#### 8.7.4 子侧 span 一览（当前 runc TRACE）
+
+| Span | 阶段 | 含义 |
+|------|------|------|
+| `runc.init.preRootfs` | hooks 前 | keyring / network / route / selinux |
+| `runc.init.prepareRootfs` | 跨 hooks/ready | 子配 rootfs 总段（含 afterHooks） |
+| └ `prepareRoot` / `.propagation` / `.parentPrivate` / `.bind` | hooks | 根传播 / parent private / bind rootfs |
+| └ `openRootfs` | hooks | 打开 rootfs 目录 FD |
+| └ `mounts` / `mount.<type>:<dst>` | hooks | 挂载循环 |
+| └ `setupDev` | hooks | 配 `/dev` |
+| └ `syncParentHooks` / `.send` / `.waitDone` | 交界 | 发 procHooks；等父 hooks |
+| └ `afterHooks` / `pivotRoot` / `postPivot` | ready | pivot 及之后短收尾 |
+| `runc.init.beforeReady` | ready | console→finalize→hostname→apparmor→**sysctl**→**readonlyPaths**→**maskPaths**→setupProcess |
+| └ `finalizeRootfs` / `.remountRO` / `.setReadonly` | ready | 只读收尾（本场景很短） |
+| `runc.init.syncParentReady` / `.send` / `.waitRun` | ready 末 | 发 procReady；等父 procRun |
 
 ---
 
@@ -1183,18 +1306,24 @@ Create 内部 TRACE span：
 | `runc.container.start` | `Container.Start` |
 | `runc.init.start` | 拉起 / 等待 init |
 | `runc.cgroup.apply` / `…apply.<ctrl>` | 写 cgroup（按控制器） |
-| `runc.init.sync` | 父进程与 init 同步总墙钟 |
-| └ `…sync.wait` | 父进程阻塞读 sync pipe（等子进程） |
+| `runc.init.sync` | **父**与 init 同步总墙钟 |
+| └ `…sync.wait.for_hooks` / `for_ready` / `for_eof` | 父阻塞读 sync pipe |
 | └ `…sync.hooks` / `ready` / `mount` / `seccomp` | 父侧处理对应消息 |
 | └ `runc.cgroup.set` / `…set.<ctrl>` | hooks 内写资源限制 |
-| **子进程（同 `/tmp/runc-trace.log`）** | |
-| `runc.init.prepareRootfs` | init 配 rootfs 总段 |
-| └ `…prepareRoot` / `mounts` / `setupDev` / `pivotRoot` | 子步骤 |
-| └ `…syncParentHooks` | 子进程等父进程跑 hooks |
-| `runc.init.finalizeRootfs` | pivot 后收尾 |
-| `runc.init.syncParentReady` | 子进程 ready ↔ 父进程 procRun |
+| **子进程 `runc init`（同 `/tmp/runc-trace.log`；跨进程林）** | 见 **§8.7** |
+| `runc.init.preRootfs` | hooks 前：network/route/keyring |
+| `runc.init.prepareRootfs` | 配 rootfs 总段（跨 hooks→ready） |
+| └ `prepareRoot` / `.propagation` / `.parentPrivate` / `.bind` | 根准备 |
+| └ `openRootfs` / `mounts` / `setupDev` | 打开根、挂载、`/dev` |
+| └ `syncParentHooks` / `.send` / `.waitDone` | 发 procHooks；等父 |
+| └ `afterHooks` / `pivotRoot` / `postPivot` | ⊆ `wait.for_ready` |
+| `runc.init.beforeReady` | console→finalize→sysctl→readonly→mask→setupProcess |
+| └ `finalizeRootfs` / `setHostname` / `apparmor` / `sysctl` / `readonlyPaths` / `maskPaths` / `setupProcess` | ready 子项 |
+| `runc.init.syncParentReady` / `.send` / `.waitRun` | 发 procReady；等父 procRun |
 
-关 `ipMasq` 后若 `manager.new` / `init.sync` 仍大：优先看 `initPaths`/`subsys.*` 与 `sync.wait` + 子侧 `prepareRootfs`/`mounts`。
+**`pivot_root` 与 TRACE 文件**：`traceutil` 须在 pivot **前**打开 `/tmp/runc-trace.log` 并**保持 FD**（§8.7.3）；否则 ready 段 `end` 丢失，analyzer 丢弃整段 span。
+
+关 `ipMasq` 后若 `manager.new` / `init.sync` 仍大：优先看 `initPaths`/`subsys.*` 与 `sync.wait` + 子侧 `prepareRootfs`/`mounts`/`beforeReady`（§8.7）。
 
 **本机已优化（§8.4）**：`FindCgroupMountpoint` 在 `tryDefaultPath` miss 后查 `/proc/cgroups`；内核未启用的控制器（如无 `CONFIG_CGROUP_MISC` 时的 `misc`）直接 `NotFound`，不再扫 mountinfo。验证：`subsys.misc` P50 ~0.13ms，`initPaths` ~28ms。
 
@@ -1328,16 +1457,17 @@ ls "$RESULT/perf"/*.svg
 | misc 短路后主阶段（§8.4） | **`client.NewContainer` ~2.3s**；NewTask ~1.6s；CNI ~4%；`runc.create` ~0.7s |
 | **细粒度 TRACE 复测后主阶段（§8.5，cgroup v1）** | **`container.NewTask` ~3.8s**；NewContainer ~1s；`runc.cgroup.apply` ~1.0s；`shim.cgroup.load` ~0.7s；`init.sync` wait ~0.7s |
 | **切 cgroup v2 后主阶段（§8.6，同 5.10）** | run ~**3.4s** / P95 ~**3.7s**；apply ~**26ms**；load ~**2ms**；下一层 **bbolt + init.sync/mounts** |
+| **`init.sync` 子侧对齐（§8.7）** | 父/子分工与协议已写清；`wait.for_ready`≈`pivotRoot`+`sysctl`+`readonlyPaths`+`maskPaths`；pivot 后 TRACE FD 常开已修 |
 | 预填 5000 后主阶段 | **`cni.setup` / bridge ~8.8s**；NewTask/NewContainer Avg 骤降（队头在 IPAM） |
 | 关 printk 副作用 | metadata/snapshotter Avg **升约 3–4×**（被暴露）；iptables 相对更显眼；idle↓/usr↑ |
 | 瓶颈 A 深挖 | CNI 高时延 → **全局 `rtnl_mutex`**（bridge / loopback / netns 共用） |
 | 瓶颈 A 持锁放大 | bridge `br_set_state` → `br_info` → **串口 `printk`**（对照实验已验证，见 §7.5） |
 | 瓶颈 A 配置叠加 | **`ipMasq`→xtables**；出网改节点级 MASQ；**host-local Walk**（预填对照已验证）；旁路索引**未拉到端到端** |
 | 瓶颈 B 深挖 | shim/NewTask；**`misc` mountinfo 已短路**（§8.4）；**cgroup v2 已验证** apply/load 数量级下降（§8.6） |
-| 瓶颈 B / C / D（当前） | **主战场：bbolt `.tx.wait` + `init.sync`/mounts**；cgroup apply 已降；containerd 4 核仍放大 |
+| 瓶颈 B / C / D（当前） | **主战场：bbolt `.tx.wait` + `init.sync` 子侧**（mounts / prepareRoot / pivot / mask·readonly·sysctl，§8.7）；cgroup apply 已降；containerd 4 核仍放大 |
 | 非主因 | 磁盘、内存；本机无效的 misc mountinfo（已修）；cgroup apply（v2 下已非主因） |
 
-**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已短路。**同内核 5.10 切 cgroup v2** 后，`cgroup.apply`/`cgroup.load`/NewTask **数量级下降**，run **~6.4s→~3.4s**，P95 **~12.8s→~3.7s**（§8.6 验证 §16.3.3）。**当前工作点**下一刀优先 **bbolt** 与 **init.sync/mounts**，而非继续打 cgroup apply。
+**一句话**：基线下 CNI 最重（RTNL / printk / ipMasq / 脏目录 Walk 已对照）。runc **`misc` 扫 mountinfo** 已短路。**同内核 5.10 切 cgroup v2** 后，`cgroup.apply`/`cgroup.load`/NewTask **数量级下降**，run **~6.4s→~3.4s**，P95 **~12.8s→~3.7s**（§8.6 验证 §16.3.3）。**`init.sync` 已拆到子侧**（§8.7）：hooks≈mounts+prepareRoot，ready≈pivot+readonly/mask/sysctl。**当前工作点**下一刀优先 **bbolt** 与 **这些子 span**，而非继续打 cgroup apply。
 
 ---
 
@@ -1698,7 +1828,9 @@ cgroup_attach_lock(*lock_mode, tsk);
 
 ### 16.4 L2 — mount / namespace（对准 `init.sync` wait）
 
-**映射**：父 `wait.for_hooks` ~336ms + `wait.for_ready` ~339ms；子 `runc.init.mounts` ~152ms、`prepareRoot` ~59ms（跨进程林，§8.5.4）。
+**映射（§8.5.4，cgroup v1）**：父 `wait.for_hooks` ~336ms + `wait.for_ready` ~339ms；子 `mounts` ~152ms、`prepareRoot` ~59ms。
+
+**映射（§8.7，cgroup v2 + 子侧补全）**：父 `wait.for_hooks` ~929ms ≈ 子 `prepareRoot`(~211ms)+`mounts`(~511ms)；父 `wait.for_ready` ~1.19s ≈ 子 `pivotRoot`(~398ms)+`sysctl`(~163ms)+`readonlyPaths`(~317ms)+`maskPaths`(~310ms)。父子协议与 TRACE 对齐细节见 §8.7。
 
 对照：`/home/nathan/linux` vs `/home/nathan/linux-upstream-v1` 的 `fs/namespace.c`、`fs/mount.h`。
 
@@ -2194,3 +2326,4 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | 2026-07-21 | **§16.10**：对照 OpenEuler OLK-6.6——相对 5.10/上游 7.x 的能力矩阵、OE 特有项与 defconfig 风险 |
 | 2026-07-21 | **§2.3 / §8.6 / §12 / §15 / §16.3.3 / §16.8 / §16.11**：写入 **6.6.118 + cgroup v2** 实测——apply/load 数量级下降已验证；allmulti printk 致 CNI 回潮及关后数据；更新当前工作点与下一刀 |
 | 2026-07-21 | **§2.3 / §8.6 / §12 / §15 / §16.3.3 / §16.8 / §16.11**：以 **同内核 5.10：cgroup v1→v2** 作为 cgroup v2 主对照（apply/load/NewTask/端到端）；更新当前工作点与下一刀（bbolt + init.sync） |
+| 2026-07-21 | **§8.7 / §8.5.4 / §13.3 / §15 / §16.4**：写明 runc **父/子**分工与 sync 协议；补全子侧 TRACE 对齐（`wait.for_ready`≈pivot+sysctl+readonly+mask）；记录 `pivot_root` 后 TRACE FD 常开修复 |
