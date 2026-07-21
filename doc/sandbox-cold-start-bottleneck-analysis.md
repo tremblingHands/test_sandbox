@@ -1131,9 +1131,10 @@ wait.for_ready ~1.2s  →  pivotRoot(~0.4s)
 | H. **换内核 5.10→7.0（同用户态配置）** | 量化纯换核 | 见 §16.8；预期 apply/CNI 不会数量级下降 |
 | I. **bbolt：`no_sync` / 合并 sandbox Update** | 瓶颈 C | 见 §17.7；盯 `.tx.wait` / Update Cnt |
 | J. **同内核 5.10 切 cgroup v2**（已做） | 瓶颈 B / `cgroup.apply` | **已验证**：apply **1.03s→25.5ms**，load **734ms→2.1ms**；run **6.36s→3.36s**；P95 **12.8s→3.71s**（见 §8.6 / §16.3.3） |
-| K. **runc 试 `CLONE_EMPTY_MNTNS`** | `init.sync` / mounts | 见 §16.4.3；盯 `wait.for_hooks`、`runc.init.mounts` |
+| C8. **runc 子侧 TRACE 补全 + pivot FD**（已做） | `wait.for_ready` 不可见 | ready≈pivot+sysctl+readonly+mask；hooks≈mounts+prepareRoot（见 **§8.7**） |
+| K. **runc 试 `CLONE_EMPTY_MNTNS`** | `init.sync` / mounts | 见 §16.4.3；盯 `wait.for_hooks`、`runc.init.mounts`；亦可盯 `pivotRoot` / `maskPaths`（§8.7） |
 
-中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 bbolt `.tx.wait` 与 `init.sync`/mounts**（§8.6 / §17 / §16.4）；**cgroup v2 已落地**（§8.6），apply/load 非主战场。misc 短路见 §8.4。**换上游内核的预期与边界见 §16**。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
+中期：减少 `metadata.sandbox.Update` 持锁（§17）；snapshotter 预热；**优先 bbolt `.tx.wait` 与 `init.sync` 子侧**（mounts / prepareRoot / pivot / readonly·mask·sysctl，§8.6 / **§8.7** / §17 / §16.4）；**cgroup v2 已落地**（§8.6），apply/load 非主战场。misc 短路见 §8.4。**换上游内核的预期与边界见 §16**。host-local 旁路索引在干净目录工作点 **未拉到端到端**；脏目录 Walk 仍可用运维 `clear` 或换 IPAM。
 
 不建议优先：只加内存/换盘；未上 K8s 就为「减创建路径配网锁」去部署 Cilium/Calico；指望「关掉 loopback 插件」消除 RTNL（netns 仍会注册 lo，且 CRI 默认仍挂 loopback）；**在目录已干净时继续改 host-local 索引指望端到端加速**；指望 runc/OCI **配置项**关闭 misc（无此开关，须改代码）。
 
