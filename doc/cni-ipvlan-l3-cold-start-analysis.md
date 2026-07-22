@@ -407,6 +407,75 @@ rename 能成功，是因为 `dev_change_name` 在**容器 netns** 内做名字�
 
 ---
 
+### 6.5 多网卡：容器内已有 eth0 时再建网 / RunPodSandbox 能否拿到 IP
+
+#### 6.5.1 go-cni 正常多网卡命名
+
+`WithLoNetwork` + `loadFromConfDir`（`max_conf_num` 控制业务网个数）：
+
+```text
+networks[0] = loopback      ifName = "lo"
+networks[1] = 第 1 个 conf  ifName = "eth0"   ← getIfName("eth", 0)
+networks[2] = 第 2 个 conf  ifName = "eth1"   ← getIfName("eth", 1)
+...
+```
+
+每个 network 的 `CNI_IFNAME` 不同，**第二张业务网不会再叫 eth0**。  
+本机默认 `max_conf_num = 1` → 只有 `lo` + 一张业务网 `eth0`。
+
+#### 6.5.2 RunPodSandbox 如何取 IP
+
+`internal/cri/server/sandbox_run.go` → `setupPodNetwork`：
+
+```go
+if configs, ok := result.Interfaces["eth0"]; ok && len(configs.IPConfigs) > 0 {
+    sandbox.IP, sandbox.AdditionalIPs = selectPodIPs(..., configs.IPConfigs, ...)
+    return nil
+}
+return fmt.Errorf("failed to find network info for sandbox %q", id)
+```
+
+| 规则 | 行为 |
+|------|------|
+| Pod 主 IP | **只认 `Interfaces["eth0"]`** |
+| `AdditionalIPs` | **同一块 eth0** 上的其它地址（如 IPv6），**不是 eth1 的 IP** |
+| eth1 / eth2 有 IP | 可留在 `CNIResult.Interfaces`，**不作为** `sandbox.IP` |
+| eth0 缺失或无 IPConfigs | **RunPodSandbox 失败** |
+| 任一 network Attach 失败 | 整个 `Setup` 失败 → 建沙箱失败 |
+
+#### 6.5.3 「容器里已经有 eth0」时再创建设备
+
+| 场景 | 设备侧 | RunPodSandbox / IP |
+|------|--------|---------------------|
+| 正规两张业务网（`max_conf_num≥2`） | 第一张 `eth0`，第二张 **`eth1`**（ipvlan：临时名→rename 到 eth1） | 成功；主 IP 仍来自 **eth0**；eth1 IP 在 Result 中 |
+| 已有 eth0，再建目标仍为 **`CNI_IFNAME=eth0`** | `LinkAdd(临时名)` 或可成功；`RenameLink→eth0` 在容器 ns 内 **EEXIST** → CNI ADD 失败 | **失败，拿不到 sandbox.IP** |
+| 已有 eth0，再建目标为 eth1 | 与 eth0 不冲突 | 成功；主 IP 仍 eth0 |
+| eth0 建好但 IPAM 未返回地址 | 接口可能存在 | **失败**（`Interfaces["eth0"]` 无 IP） |
+
+冲突路径（ipvlan）：
+
+```text
+容器内已有 eth0
+  → LinkAdd(veth*)        // 通常仍可成功
+  → RenameLink → eth0     // 同 netns 内名字冲突 → EEXIST
+  → CNI ADD 失败
+  → setupPodNetwork 失败
+  → RunPodSandbox 失败（不会进入 selectPodIPs）
+```
+
+说明：此处冲突检查在**容器 netns**（`dev_change_name`），与宿主机物理 `eth0` 无关；§6.4.2 的 host 侧 `-EEXIST` 是另一回事（建链请求名在 sock_net=host 上查找）。
+
+host-device 等把宿主机网卡迁入容器、目标名已是 eth0 时，容器内已有 eth0 同样会在最终 `LinkSetName` 失败（upstream 用临时名规避的是另一类迁移冲突）。
+
+#### 6.5.4 小结
+
+- 官方 go-cni 多 conf：**eth0 / eth1 / … 错开**，一般不会「再抢 eth0」。  
+- Pod 主 IP **永远只看 eth0**；多网卡时其它接口 IP 不进 `sandbox.IP` / `AdditionalIPs`（AdditionalIPs 仅 eth0 多地址）。  
+- 若容器内已有 eth0 仍要求建成 eth0 → **CNI 失败，RunPodSandbox 无 IP**。  
+- Multus 等旁路不走「按 conf 下标编 ethN」时，细节以该方案为准，但「目标 ifName 已存在 → 插件失败 → 沙箱失败」仍常见。
+
+---
+
 ## 7. 机制小结
 
 ```text
@@ -437,6 +506,7 @@ rename 能成功，是因为 `dev_change_name` 在**容器 netns** 内做名字�
 | perf（有效） | off-CPU：**ipvlan ~23%** + loopback ~8%；on-CPU：ipvlan ~14%，含 **mutex_spin** 与 **pl011@rename** |
 | dmesg | 几乎全是 `dev_change_name` 的 `eth0: renamed from veth…`（插件临时名，非真 veth） |
 | rename | 最终要 **`eth0`**；从宿主机直接 `LinkAdd(Name=eth0)` **会撞 host eth0（已实测）**，临时名+rename **必要** |
+| 多网卡 | go-cni 用 eth0/eth1…；主 IP 只认 eth0；容器内已有 eth0 再抢 eth0 → ADD 失败、无 Pod IP（§6.5） |
 | 已健康 | NewContainer / NewTask / runc / cgroup / bbolt wait |
 | 相对 bridge+v2 | 配网从 **0.1s 级回到数秒级**；其它阶段反而更轻 |
 | 根因类属 | **RTNL 串行** +（当前）**锁内 rename printk/串口**；换 ipvlan **未消除** RTNL |
@@ -501,3 +571,4 @@ CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
 | 2026-07-22 | 更新 §6.2/§7/§8：有效 perf（60s）显示 ipvlan off/on-CPU、RTNL spin、rename→pl011；修正「插件不在 1–4」表述 |
 | 2026-07-22 | 新增 §6.3/§6.4：dmesg↔`dev_change_name` 内核路径；讨论可否去 rename |
 | 2026-07-22 | **修正 §6.4**：本机实测从 host 直接建 `eth0` 因撞宿主机网卡失败；rename 在现路径下必要 |
+| 2026-07-22 | 新增 §6.5：多网卡命名、RunPodSandbox 只认 eth0、容器内已有 eth0 再建网的行为 |
