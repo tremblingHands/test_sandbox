@@ -208,11 +208,12 @@ ensure_src() {
     pass "已 clone: $name → $dest"
 }
 
-# 拉取远端并 checkout 到指定分支/commit
+# 先尝试本地 checkout；本地没有对应 ref 时再 fetch，然后重试
 # $1=显示名 $2=目录 $3=ref
 checkout_ref() {
     local name="$1" dest="$2" ref="$3"
     local head short
+    local co_flags=()
 
     if [ ! -d "$dest/.git" ]; then
         fail "$name 不是 git 仓库: $dest"
@@ -220,39 +221,54 @@ checkout_ref() {
     fi
 
     echo "  checkout $name → $ref"
-    # 更新远端引用（分支 / 对象）
-    if ! git -C "$dest" fetch --tags origin 2>/dev/null; then
-        warn "git fetch origin 失败，尝试继续用本地已有对象"
-    fi
-    # 再试 fetch 该 ref（commit 或分支）
-    git -C "$dest" fetch origin "$ref" 2>/dev/null || true
 
     if ! $FORCE_CHECKOUT; then
-        if [ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]; then
-            fail "$name 工作区有未提交改动: $dest"
+        # 只拦已跟踪文件的改动；忽略未跟踪构建产物（如 runc / runc.new）
+        if [ -n "$(git -C "$dest" status --porcelain -uno 2>/dev/null)" ]; then
+            fail "$name 工作区有未提交改动（已跟踪文件）: $dest"
             echo "  请提交/贮藏，或加 --force-checkout"
+            git -C "$dest" status --short -uno | head -20
             exit 1
+        fi
+        local untracked
+        untracked=$(git -C "$dest" ls-files --others --exclude-standard 2>/dev/null | head -5 || true)
+        if [ -n "$untracked" ]; then
+            warn "$name 存在未跟踪文件（忽略，不阻止 checkout），例如:"
+            echo "$untracked" | sed 's/^/    /'
         fi
     fi
-
-    local co_flags=()
     $FORCE_CHECKOUT && co_flags+=(-f)
 
-    # 优先：远端分支 origin/<ref>；否则直接 ref（本地分支或 commit）
-    if git -C "$dest" rev-parse --verify -q "origin/$ref" >/dev/null; then
-        if ! git -C "$dest" checkout "${co_flags[@]}" -B "$ref" "origin/$ref"; then
-            fail "checkout 失败: $name origin/$ref"
-            exit 1
+    # 尝试用当前本地已有对象/分支完成 checkout；成功返回 0
+    try_local_checkout() {
+        # 1) 本地分支或 commit / tag
+        if git -C "$dest" rev-parse --verify -q "$ref" >/dev/null; then
+            git -C "$dest" checkout "${co_flags[@]}" "$ref"
+            return $?
         fi
-    elif git -C "$dest" rev-parse --verify -q "$ref" >/dev/null; then
-        if ! git -C "$dest" checkout "${co_flags[@]}" "$ref"; then
-            fail "checkout 失败: $name $ref"
-            exit 1
+        # 2) 已有远端跟踪引用 origin/<ref>（此前 fetch 过）
+        if git -C "$dest" rev-parse --verify -q "origin/$ref" >/dev/null; then
+            git -C "$dest" checkout "${co_flags[@]}" -B "$ref" "origin/$ref"
+            return $?
         fi
+        return 1
+    }
+
+    if try_local_checkout; then
+        pass "$name 本地已有 ref，跳过 fetch"
     else
-        fail "找不到 ref: $name $ref（fetch 后仍无）"
-        echo "  仓库: $(git -C "$dest" remote get-url origin 2>/dev/null || echo '?')"
-        exit 1
+        echo "  本地无 $ref，fetch origin ..."
+        if ! git -C "$dest" fetch --tags origin 2>/dev/null; then
+            warn "git fetch --tags origin 失败，继续尝试 fetch $ref"
+        fi
+        git -C "$dest" fetch origin "$ref" 2>/dev/null || true
+
+        if ! try_local_checkout; then
+            fail "找不到 ref: $name $ref（本地无且 fetch 后仍无）"
+            echo "  仓库: $(git -C "$dest" remote get-url origin 2>/dev/null || echo '?')"
+            exit 1
+        fi
+        pass "$name fetch 后 checkout 成功"
     fi
 
     head=$(git -C "$dest" rev-parse HEAD)
