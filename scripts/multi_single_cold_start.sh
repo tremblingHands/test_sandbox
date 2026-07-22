@@ -647,8 +647,50 @@ else:
 
 # ============================================================
 # 最终批量清理（由启动器统一完成）
+#
+# 各 worker 带 --no-batch-cleanup，运行中除非透传 --cleanup，否则沙箱会堆积。
+# 单次 crictl rmp -fa 在高负载下常 DeadlineExceeded，且默认连接超时仅 ~2s，
+# 需加长 -t 并多次重试。
 # ============================================================
 echo ""
 echo "[post] 清理所有残留 pod..."
-crictl rmp -a -f >/dev/null 2>&1 || crictl rmp --all --force >/dev/null 2>&1 || true
-echo "[post] 清理完成"
+
+CLEANUP_ROUNDS="${CLEANUP_ROUNDS:-8}"
+CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-60s}"
+CLEANUP_SLEEP="${CLEANUP_SLEEP:-2}"
+
+pod_count() {
+    crictl -t "$CLEANUP_TIMEOUT" pods -q 2>/dev/null | grep -c . || true
+}
+
+round=1
+remain=$(pod_count)
+echo "[post] 清理前残留: ${remain} 个（最多 ${CLEANUP_ROUNDS} 轮, crictl -t ${CLEANUP_TIMEOUT}）"
+
+while [ "$round" -le "$CLEANUP_ROUNDS" ]; do
+    remain=$(pod_count)
+    if [ "${remain:-0}" -eq 0 ]; then
+        echo "[post] 第 ${round} 轮前已无残留 pod"
+        break
+    fi
+    echo "[post] 第 ${round}/${CLEANUP_ROUNDS} 轮: 残留 ${remain}，执行 crictl rmp -a -f ..."
+    # 不吞 stderr：便于看到 DeadlineExceeded；失败不退出，靠重试
+    if ! crictl -t "$CLEANUP_TIMEOUT" rmp -a -f; then
+        # 兼容旧 crictl 长选项
+        crictl -t "$CLEANUP_TIMEOUT" rmp --all --force || true
+    fi
+    sleep "$CLEANUP_SLEEP"
+    remain=$(pod_count)
+    echo "[post] 第 ${round} 轮后残留: ${remain}"
+    if [ "${remain:-0}" -eq 0 ]; then
+        break
+    fi
+    round=$((round + 1))
+done
+
+remain=$(pod_count)
+if [ "${remain:-0}" -eq 0 ]; then
+    echo "[post] 清理完成（0 残留）"
+else
+    echo "[post] 清理结束仍有 ${remain} 个 pod 残留（可手动: crictl -t ${CLEANUP_TIMEOUT} rmp -a -f）"
+fi
