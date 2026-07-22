@@ -202,14 +202,91 @@ ipvlan ADD 热路径仍包括：建 netns、在 master 上创建 ipvlan 设备�
 | mutex 仍可见 `metadata.(*DB).Update` | 锁等待仍存在，但 TRACE 上 **非墙钟主头** |
 | 几乎看不到 ipvlan 用户态符号 | CNI 是 **独立进程**，不在 containerd CPU profile 内 |
 
-### 6.2 perf（绑核 1–4）
+### 6.2 perf（绑核 1–4）— 有效采样（2026-07-22 10:49）
 
-| 类型 | 观察 |
+目录内 `perf/` 已更新为与 **`--duration 60`** 对齐的抓取（metadata：60s；off-CPU data ~**408MB**）。  
+此前同目录曾混入一份 **30s 空采**（几乎无 `ipvlan` comm），不可用；以下均以更新后数据为准。
+
+采集：`perf record -C 1-4`（on-CPU 99Hz；off-CPU sched + inject）。CNI 插件由 containerd **exec 继承 cpuset 1–4**，故 `-C 1-4` **可以**看到 `ipvlan` / `loopback`（不必误以为插件跑在别的核上）。
+
+#### 6.2.1 Off-CPU（等什么）
+
+`perf script -F comm` 与火焰图进程柱（约）：
+
+| 进程 | 角色 | 约占比 / 量级 |
+|------|------|----------------|
+| containerd-shim | 沙箱生命周期 futex 等待 | **~63%**（整图最大柱） |
+| **ipvlan** | 业务网插件睡眠 | **~23%**（~38.7M ms 加权） |
+| **loopback** | 并行 lo 插件睡眠 | **~8%** |
+| containerd | 等插件退出等 | ~5.5% |
+| host-local | IPAM | 很小 |
+
+与 RTNL 相关的 off-CPU 帧仍在，例如：
+
+- `rtnetlink_rcv*` / `mutex_lock*` ~**3.3%**
+- `loopback_net_init` → `register_netdev` → `rtnl_lock_killable` ~**0.5%**
+
+ipvlan 进程侧可见 `runtime.usleep` / `runtime.futex`（Go 运行时 + 等 netlink），与「墙钟很长、多数时间不在跑」一致。
+
+#### 6.2.2 On-CPU（跑什么）
+
+核 1–4 上进程级约占比：
+
+| 进程 | on-CPU 约占比 |
+|------|----------------|
+| runc / containerd / containerd-shim | 各约 **20–23%** |
+| **ipvlan** | **~14%** |
+| host-local | ~5.6% |
+| loopback | ~5.4% |
+
+采准之后 **ipvlan 在 on-CPU 上清晰可见**（对比空采时「图上没有 ipvlan」）。相对历史 bridge 热点仍更「薄」，但绝非零。
+
+**ipvlan 进程内两条关键栈：**
+
+1. **抢 RTNL 时自旋（占核等锁）**
+
+```text
+sendto → netlink_* → rtnetlink_rcv_msg
+       → mutex_lock → mutex_spin_on_owner
+```
+
+全图 `mutex_spin_on_owner` ~**4.2%**；ipvlan 子树内约 **2%+**。拿不到 `rtnl_mutex` 时先 spin，再睡——故 top 上也能感到一点热。
+
+2. **持锁 rename 时打串口（放大持锁）**
+
+```text
+rtnl_setlink → do_setlink → dev_change_name
+  → netdev_info → printk → console_unlock → pl011_console_write
+```
+
+约 **~1.9% `pl011_console_write`**（连带 printk 链约 **~2.8–2.9%**）。  
+对应 ipvlan 用临时名 `LinkAdd` 再 **rename 为 eth0** 时内核的 `netdev_info`——与 bridge 时代「锁内 printk→串口」同类放大器。
+
+采样时本机：
+
+```text
+/proc/sys/kernel/printk = 7 4 1 7   → console_loglevel=7，INFO 会上串口
+```
+
+其它 on-CPU：`rtnl_newlink` / `ipvlan_link_new`、`ipvlan_addr_busy` / `ipvlan_find_addr`、地址/路由 notifier 等，份额小于上述两条。
+
+#### 6.2.3 与「CPU 低但墙钟长」的统一解释
+
+```text
+墙钟 CNI ~数秒
+  ├─ off-CPU：ipvlan + loopback 排队（RTNL / futex / usleep）← 主体积
+  ├─ on-CPU：偶发持锁 → newlink / setlink(rename)
+  │            └─ rename 时 netdev_info → pl011 拉长持锁
+  └─ 争用者：mutex_spin 或继续睡 → TRACE 中 cni.setup 很长
+```
+
+| 现象 | 解释 |
 |------|------|
-| on-CPU | 样本稀、几乎看不到 ipvlan/loopback 热路径 |
-| off-CPU | containerd 大量 **futex 等待** |
+| 相对 bridge，ipvlan `%CPU` 往往更低 | 无 veth/挂桥/等端口，临界区更薄 |
+| 采准后 on-CPU 仍有 ~14% ipvlan | 锁内工作 + spin + printk 可见 |
+| 旧 off-CPU 图没有 ipvlan | **空采/目录混用**；新数据 ~23% ipvlan |
 
-符合模型：**CNI 插件在其它核上跑 / 在内核 RTNL 上睡，containerd 在等子进程退出**。若要继续下钻 ipvlan，应对 **ipvlan / loopback 插件进程** 做 `--perf_sandbox` 或按 PID 采样，而不是只看 containerd 的 1–4 核火焰图。
+读图时先点 **`ipvlan` / `loopback` 柱**，不要只看整图最大的 shim futex。
 
 ---
 
@@ -219,9 +296,12 @@ ipvlan ADD 热路径仍包括：建 netns、在 master 上创建 ipvlan 设备�
 128 并发 RunPodSandbox
         │
         ├─► attach loopback  ──┐
-        │                      ├──► 争用 RTNL / netlink（全局串行）
+        │                      ├──► 争用 rtnl_mutex / netlink（全局串行）
         └─► attach ipvlan L3 ──┘         │
-                                         ▼
+              │                          │
+              │  rename eth0 时           │
+              │  netdev_info→pl011        │  （console_loglevel 高时放大持锁）
+              ▼                          ▼
                               cni.setup ≈ 6.7s（~81% of run）
                                          │
                                          ▼
@@ -235,31 +315,35 @@ ipvlan ADD 热路径仍包括：建 netns、在 master 上创建 ipvlan 设备�
 |------|------|
 | 端到端 | **~8.3s / P95 ~11.1–11.4s**，吞吐 ~15/s |
 | 主瓶颈 | **CNI（ipvlan L3 ~6s + loopback ~2s 并行）** |
+| perf（有效） | off-CPU：**ipvlan ~23%** + loopback ~8%；on-CPU：ipvlan ~14%，含 **mutex_spin** 与 **pl011@rename** |
 | 已健康 | NewContainer / NewTask / runc / cgroup / bbolt wait |
 | 相对 bridge+v2 | 配网从 **0.1s 级回到数秒级**；其它阶段反而更轻 |
-| 根因类属 | 高并发建网的 **RTNL 类全局争用**，换 ipvlan **未消除** |
+| 根因类属 | **RTNL 串行** +（当前）**锁内 printk/串口**；换 ipvlan **未消除** RTNL |
 
 ---
 
 ## 8. 优化方向（按杠杆）
 
-1. **对 ipvlan / loopback 进程做 perf**  
-   确认是否仍是 `rtnl_mutex`、设备创建、地址/路由配置；检查 printk / 串口日志是否回潮放大持锁。
+1. **压 console / printk（优先对照）**  
+   将 console 调到 INFO 不上串口（或确认 `netdev_info` 不上 console），复测 `cni.setup` Avg——预期类似 bridge 关 printk 的收益。注意本机曾出现 `printk=7 4 1 7` 回潮。
 
 2. **量化 / 裁剪 loopback**  
    对照「仅 ipvlan」与「ipvlan+loopback」；评估测试场景能否去掉默认 lo，或走 CRI 内部 `bringUpLoopback`。
 
 3. **降并发验证锁模型**  
-   降低 worker 数看 `cni.setup` 是否近似线性下降；若是，则坐实全局串行，而非单次 ipvlan 用户态过重。
+   降低 worker 数看 `cni.setup` 是否近似线性下降；若是，则坐实全局串行。
 
-4. **保持 host-local 干净**  
+4. **减少 rename 触发的 `netdev_info`**  
+   评估 ipvlan 临时名→`eth0` 路径是否可避免/合并（插件或内核日志级别）。
+
+5. **保持 host-local 干净**  
    避免 `/12` 大网段 Walk / 无索引回潮叠在 RTNL 之上。
 
-5. **非 CNI 优化暂缓**  
+6. **非 CNI 优化暂缓**  
    本轮不必优先 bbolt `no_sync`、runc mounts、`CLONE_EMPTY_MNTNS`；等 CNI 回到百毫秒级后再打。
 
-6. **若必须坚持 ipvlan**  
-   考虑建网限流 / 批量 / 预热 netns，或评估其它不依赖每沙箱 RTNL 热路径的方案（需单独设计，超出本 profile 范围）。
+7. **采集注意**  
+   确认 `perf/metadata.txt` 时长与 `--duration` 一致，且与 TRACE/resources **同一时间窗**；`perf script -F comm | sort | uniq -c` 应能看到 `ipvlan`。整目录拷贝到 `profile/`，避免只覆盖部分子目录导致空采混入。
 
 ---
 
@@ -267,11 +351,14 @@ ipvlan ADD 热路径仍包括：建 netns、在 master 上创建 ipvlan 设备�
 
 ```bash
 # CNI：/etc/cni/net.d/10-mynet.conf 使用本文 §2.2 的 ipvlan-l3
-# 压测（示例参数与本轮一致）
-scripts/multi_single_cold_start.sh \
-  --profile --pprof --perf --resources \
-  --duration 60 --preconfig 50 \
-  # workers 128 @ 128-255，containerd @ 1-4（以脚本实际参数为准）
+bash scripts/multi_single_cold_start.sh 128-255 128 1 \
+  --profile --pprof --perf --resources -- \
+  --duration 60 --cpuset-cpus "0-255" --cpuset-mems "0-1" --preconfig 50
+
+# 采完自检
+cat results/multi/perf/metadata.txt    # 应为 60s，时间贴近 worker
+perf script -i results/multi/perf/perf_off_cpu.data -F comm \
+  | sort | uniq -c | sort -rn | head   # 应有 ipvlan / loopback
 ```
 
 结果目录命名约定：`profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255`。
@@ -282,4 +369,5 @@ scripts/multi_single_cold_start.sh \
 
 | 日期 | 说明 |
 |------|------|
-| 2026-07-22 | 初版：基于 `profile/ipvlan-l3-...` 的 TRACE / resources / pprof / perf 分析 |
+| 2026-07-22 | 初版：基于 `profile/ipvlan-l3-...` 的 TRACE / resources / pprof /（空）perf 分析 |
+| 2026-07-22 | 更新 §6.2/§7/§8：有效 perf（60s）显示 ipvlan off/on-CPU、RTNL spin、rename→pl011；修正「插件不在 1–4」表述 |
