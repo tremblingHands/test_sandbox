@@ -3,8 +3,12 @@
 # 从本地源码编译并安装 containerd / shim / runc / CNI
 #
 # 方法对齐 doc/sandbox-cold-start-bottleneck-analysis.md §13：
-#   debug   — 保留符号 + -gcflags 'all=-N -l'（perf / 分析用，更慢）
-#   release — 优化构建 + -ldflags '-s -w'（吞吐压测用）
+#   debug   — profile 分支 + -gcflags 'all=-N -l'（perf / 分析用，更慢）
+#   release — 正式 commit + -ldflags '-s -w'（吞吐压测用）
+#
+# 源码 ref:
+#   debug:   containerd:profile  runc:profile_cgroup-misc  plugins:profile
+#   release: containerd:b4ab8c05… runc:bb14dabe… plugins:33cc6bd6…
 #
 # 默认开源仓库（缺失时自动 git clone）:
 #   https://gitee.com/omnihorizon/containerd.git
@@ -34,10 +38,19 @@ CONTAINERD_REPO="${CONTAINERD_REPO:-https://gitee.com/omnihorizon/containerd.git
 RUNC_REPO="${RUNC_REPO:-https://gitee.com/omnihorizon/runc.git}"
 CNI_REPO="${CNI_REPO:-https://gitee.com/omnihorizon/plugins.git}"
 
+# profile（debug）：分支；正式（release）：钉死 commit
+CONTAINERD_REF_PROFILE="${CONTAINERD_REF_PROFILE:-profile}"
+RUNC_REF_PROFILE="${RUNC_REF_PROFILE:-profile_cgroup-misc}"
+CNI_REF_PROFILE="${CNI_REF_PROFILE:-profile}"
+CONTAINERD_REF_RELEASE="${CONTAINERD_REF_RELEASE:-b4ab8c0537d3178a4b88cbafb9eab8218606f337}"
+RUNC_REF_RELEASE="${RUNC_REF_RELEASE:-bb14dabeb7185bb72c8c86735d090dcb20f36587}"
+CNI_REF_RELEASE="${CNI_REF_RELEASE:-33cc6bd63968280b330b00468afbb66161aaa6bd}"
+
 MODE=""
 ONLY="containerd,shim,runc,cni"
 DO_RESTART=true
 DO_BACKUP=true
+FORCE_CHECKOUT=false
 TS="$(date +%Y%m%d%H%M%S)"
 
 RED='\033[0;31m'
@@ -60,13 +73,18 @@ usage() {
   https://gitee.com/omnihorizon/plugins.git
 
 用法:
-  ./scripts/build_install_runtime.sh --mode debug
-  ./scripts/build_install_runtime.sh --mode release
-  ./scripts/build_install_runtime.sh debug          # 等同 --mode debug
+  ./scripts/build_install_runtime.sh --mode debug     # profile 分支
+  ./scripts/build_install_runtime.sh --mode release   # 正式 commit
+  ./scripts/build_install_runtime.sh debug
   ./scripts/build_install_runtime.sh --mode debug --only cni
   ./scripts/build_install_runtime.sh --mode release --only containerd,runc,shim
   ./scripts/build_install_runtime.sh --mode debug --no-restart
   ./scripts/build_install_runtime.sh --mode release --no-backup
+  ./scripts/build_install_runtime.sh --mode debug --force-checkout
+
+模式与源码 ref:
+  debug   → containerd:profile  runc:profile_cgroup-misc  plugins:profile
+  release → containerd:b4ab8c05…  runc:bb14dabe…  plugins:33cc6bd6…
 
 选项:
   --mode debug|release   编译模式（必填，或用位置参数）
@@ -74,10 +92,13 @@ usage() {
   --src-root DIR         默认 /home/nathan
   --no-restart           装完不重启 containerd
   --no-backup            不备份将被覆盖的二进制
+  --force-checkout       工作区有改动时仍强制 checkout（git checkout -f）
 
 环境变量（可选覆盖）:
   CONTAINERD_REPO / RUNC_REPO / CNI_REPO
   CONTAINERD_SRC / RUNC_SRC / CNI_SRC / SRC_ROOT
+  CONTAINERD_REF_PROFILE / RUNC_REF_PROFILE / CNI_REF_PROFILE
+  CONTAINERD_REF_RELEASE / RUNC_REF_RELEASE / CNI_REF_RELEASE
 EOF
     exit 1
 }
@@ -105,6 +126,9 @@ while [[ $# -gt 0 ]]; do
         --no-backup)
             DO_BACKUP=false
             shift ;;
+        --force-checkout)
+            FORCE_CHECKOUT=true
+            shift ;;
         -h|--help)
             usage ;;
         *)
@@ -122,6 +146,17 @@ case "$MODE" in
         echo "ERROR: --mode 必须是 debug 或 release，收到: $MODE"
         exit 1 ;;
 esac
+
+# 按模式选定各仓 ref
+if [ "$MODE" = "debug" ]; then
+    CONTAINERD_REF="$CONTAINERD_REF_PROFILE"
+    RUNC_REF="$RUNC_REF_PROFILE"
+    CNI_REF="$CNI_REF_PROFILE"
+else
+    CONTAINERD_REF="$CONTAINERD_REF_RELEASE"
+    RUNC_REF="$RUNC_REF_RELEASE"
+    CNI_REF="$CNI_REF_RELEASE"
+fi
 
 want() {
     # $1 = component name
@@ -173,18 +208,86 @@ ensure_src() {
     pass "已 clone: $name → $dest"
 }
 
+# 拉取远端并 checkout 到指定分支/commit
+# $1=显示名 $2=目录 $3=ref
+checkout_ref() {
+    local name="$1" dest="$2" ref="$3"
+    local head short
+
+    if [ ! -d "$dest/.git" ]; then
+        fail "$name 不是 git 仓库: $dest"
+        exit 1
+    fi
+
+    echo "  checkout $name → $ref"
+    # 更新远端引用（分支 / 对象）
+    if ! git -C "$dest" fetch --tags origin 2>/dev/null; then
+        warn "git fetch origin 失败，尝试继续用本地已有对象"
+    fi
+    # 再试 fetch 该 ref（commit 或分支）
+    git -C "$dest" fetch origin "$ref" 2>/dev/null || true
+
+    if ! $FORCE_CHECKOUT; then
+        if [ -n "$(git -C "$dest" status --porcelain 2>/dev/null)" ]; then
+            fail "$name 工作区有未提交改动: $dest"
+            echo "  请提交/贮藏，或加 --force-checkout"
+            exit 1
+        fi
+    fi
+
+    local co_flags=()
+    $FORCE_CHECKOUT && co_flags+=(-f)
+
+    # 优先：远端分支 origin/<ref>；否则直接 ref（本地分支或 commit）
+    if git -C "$dest" rev-parse --verify -q "origin/$ref" >/dev/null; then
+        if ! git -C "$dest" checkout "${co_flags[@]}" -B "$ref" "origin/$ref"; then
+            fail "checkout 失败: $name origin/$ref"
+            exit 1
+        fi
+    elif git -C "$dest" rev-parse --verify -q "$ref" >/dev/null; then
+        if ! git -C "$dest" checkout "${co_flags[@]}" "$ref"; then
+            fail "checkout 失败: $name $ref"
+            exit 1
+        fi
+    else
+        fail "找不到 ref: $name $ref（fetch 后仍无）"
+        echo "  仓库: $(git -C "$dest" remote get-url origin 2>/dev/null || echo '?')"
+        exit 1
+    fi
+
+    head=$(git -C "$dest" rev-parse HEAD)
+    short=$(git -C "$dest" rev-parse --short HEAD)
+    pass "$name 已在 $short ($head)"
+    # 若期望是 commit SHA，核对 HEAD 是否指向该对象
+    if [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+        local want
+        want=$(git -C "$dest" rev-parse --verify "${ref}^{commit}" 2>/dev/null || true)
+        if [ -z "$want" ]; then
+            fail "$name 无法解析期望 commit: $ref"
+            exit 1
+        fi
+        if [ "$head" != "$want" ]; then
+            fail "$name HEAD($head) 与期望 commit($want) 不一致"
+            exit 1
+        fi
+    fi
+}
+
 ensure_needed_sources() {
     echo ""
     echo "=== 检查 / 拉取源码 ==="
     mkdir -p "$SRC_ROOT"
     if want containerd || want shim; then
         ensure_src "containerd" "$CONTAINERD_SRC" "$CONTAINERD_REPO" "cmd/containerd"
+        checkout_ref "containerd" "$CONTAINERD_SRC" "$CONTAINERD_REF"
     fi
     if want runc; then
         ensure_src "runc" "$RUNC_SRC" "$RUNC_REPO" "main.go"
+        checkout_ref "runc" "$RUNC_SRC" "$RUNC_REF"
     fi
     if want cni; then
         ensure_src "plugins (CNI)" "$CNI_SRC" "$CNI_REPO" "build_linux.sh"
+        checkout_ref "plugins" "$CNI_SRC" "$CNI_REF"
     fi
 }
 
@@ -464,13 +567,17 @@ main() {
     echo "  mode:        $MODE"
     echo "  only:        $ONLY"
     echo "  containerd:  $CONTAINERD_SRC"
-    echo "               $CONTAINERD_REPO"
+    echo "               repo $CONTAINERD_REPO"
+    echo "               ref  $CONTAINERD_REF"
     echo "  runc:        $RUNC_SRC"
-    echo "               $RUNC_REPO"
+    echo "               repo $RUNC_REPO"
+    echo "               ref  $RUNC_REF"
     echo "  cni:         $CNI_SRC → $CNI_BIN_DIR"
-    echo "               $CNI_REPO"
+    echo "               repo $CNI_REPO"
+    echo "               ref  $CNI_REF"
     echo "  backup:      $DO_BACKUP (ts=$TS)"
     echo "  restart:     $DO_RESTART"
+    echo "  force-co:    $FORCE_CHECKOUT"
     echo "  go:          $(go version)"
     echo "=============================================="
 
