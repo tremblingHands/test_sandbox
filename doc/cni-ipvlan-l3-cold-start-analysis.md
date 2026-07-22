@@ -288,6 +288,101 @@ rtnl_setlink → do_setlink → dev_change_name
 
 读图时先点 **`ipvlan` / `loopback` 柱**，不要只看整图最大的 shim futex。
 
+### 6.3 dmesg：满屏 `eth0: renamed from veth…` 的内核路径
+
+压测时 `dmesg` 几乎被同一条 INFO 占满（本机采样约 **988/999** 条为该类）：
+
+```text
+eth0: renamed from vethcceade63
+eth0: renamed from veth4a2f5d5a
+...
+```
+
+**不是**在创建 Linux veth 设备；`veth%x` 只是 CNI 插件生成的**临时接口名字符串**（见下节）。
+
+#### 6.3.1 内核打印点（`/home/nathan/linux`）
+
+`net/core/dev.c` → `dev_change_name()`：
+
+```c
+ASSERT_RTNL();   /* 已持 rtnl_mutex */
+memcpy(oldname, dev->name, IFNAMSIZ);
+err = dev_get_valid_name(net, dev, newname);  /* 此处已把 dev->name 写成 eth0 */
+...
+if (oldname[0] && !strchr(oldname, '%'))
+    netdev_info(dev, "renamed from %s\n", oldname);
+```
+
+因此日志前缀是**新名** `eth0:`，正文是**旧名** `veth…`。  
+`netdev_info` 为 **KERN_INFO**（`define_netdev_printk_level(netdev_info, KERN_INFO)`）。
+
+用户态改名经 rtnetlink：
+
+```text
+netlink.LinkSetName
+  → RTM_SETLINK → do_setlink()          /* net/core/rtnetlink.c */
+       if (ifi_index > 0 && ifname[0])
+         → dev_change_name()
+              → netdev_info → printk
+              → console_unlock → pl011_console_write   /* console_loglevel 高时 */
+```
+
+与 §6.2.2 on-CPU 栈一致；**持锁打串口**会拉长 `rtnl_mutex` 临界区。
+
+#### 6.3.2 谁触发：CNI ipvlan 临时名 → eth0
+
+`plugins/main/ipvlan/ipvlan.go` → `createIpvlan()`：
+
+```text
+tmpName = RandomVethName()     // "veth" + 随机 hex（字符串，非建 veth）
+LinkAdd(Name=tmpName, Namespace=容器 netns, type=ipvlan)
+RenameLink(tmpName → args.IfName)   // 通常 eth0 → 触发上面内核路径
+```
+
+`pkg/ip/link_linux.go` 中 `RandomVethName()` 注释写明：名字以 `veth` 开头是为让 NetworkManager 忽略，与网桥 veth 对无关。macvlan / vlan / tap 使用同一「临时名 + rename」模式。
+
+---
+
+### 6.4 是否一定要 rename？可以不 rename 吗？
+
+| 需求 | 是否必须 |
+|------|----------|
+| 最终接口名是 **`eth0`** | **对本 CRI 路径基本必须**（go-cni 默认 `ifName=eth0`；containerd `selectPodIPs` 读 `Interfaces["eth0"]`） |
+| 必须先 `veth*` 再 **rename** | **不是**硬性内核要求，是插件规避策略 |
+
+#### 6.4.1 插件为何写成临时名
+
+注释原文：
+
+```go
+// due to kernel bug we have to create with tmpname or it might
+// collide with the name on the host and error out
+```
+
+历史问题：若建链时在 **host / init_net** 视角做名字唯一性检查，宿主机已有 `eth0`，再创建名为 `eth0` 会 `-EEXIST`。故先用几乎不冲突的 `veth%x`，进入容器 ns 后再改成 CNI `ifName`。
+
+#### 6.4.2 本机内核 5.10：直接建 eth0 往往可行
+
+带 `IFLA_NET_NS_FD` 时，`__rtnl_newlink` 大致为：
+
+```text
+dest_net = 目标容器 netns
+rtnl_create_link(dest_net, ifname, ...)
+register_netdevice(dev)          // 在 dest_net 注册
+```
+
+名字校验落在**容器 netns**（通常仅有 `lo`），**一般不会与 host 的 `eth0` 冲突**。插件注释更偏历史/保守写法；在 5.10 + `Namespace: netns fd` 路径上可尝试去掉 rename。
+
+#### 6.4.3 可选做法
+
+| 方案 | 做法 | 效果 |
+|------|------|------|
+| **A. 创建即 eth0（推荐先试）** | `LinkAttrs.Name = ifName`，去掉 `RandomVethName` / `RenameLink`，仍带目标 netns | 少一次 `SETLINK`/`dev_change_name`；不再刷 rename dmesg；去掉锁内该条 `netdev_info→pl011` |
+| **B. 在容器 ns 内创建** | `netns.Do` 里 `LinkAdd(Name=eth0)`，不设 `Namespace` | 名字校验天然在容器内，效果类似 A |
+| **C. 保留临时名且不改成 eth0** | — | **不可行**（除非同步改 go-cni/CRI 的 ifName 约定） |
+
+注意：去掉 rename **只消除 rename 日志与一次 SETLINK**；`LinkAdd`、配地址等仍走 RTNL，端到端不会因此从数秒变毫秒，但可去掉一类持锁放大器。改插件后应先低并发验证，再跑 128 worker 对照。
+
 ---
 
 ## 7. 机制小结
@@ -299,8 +394,10 @@ rtnl_setlink → do_setlink → dev_change_name
         │                      ├──► 争用 rtnl_mutex / netlink（全局串行）
         └─► attach ipvlan L3 ──┘         │
               │                          │
-              │  rename eth0 时           │
-              │  netdev_info→pl011        │  （console_loglevel 高时放大持锁）
+              │  临时 veth* 名 LinkAdd     │
+              │  → RenameLink(eth0)       │
+              │  → dev_change_name        │
+              │  → netdev_info→pl011      │  （console_loglevel 高时放大持锁）
               ▼                          ▼
                               cni.setup ≈ 6.7s（~81% of run）
                                          │
@@ -316,9 +413,11 @@ rtnl_setlink → do_setlink → dev_change_name
 | 端到端 | **~8.3s / P95 ~11.1–11.4s**，吞吐 ~15/s |
 | 主瓶颈 | **CNI（ipvlan L3 ~6s + loopback ~2s 并行）** |
 | perf（有效） | off-CPU：**ipvlan ~23%** + loopback ~8%；on-CPU：ipvlan ~14%，含 **mutex_spin** 与 **pl011@rename** |
+| dmesg | 几乎全是 `dev_change_name` 的 `eth0: renamed from veth…`（插件临时名，非真 veth） |
+| rename | 最终要 **`eth0`**；**不必**临时名+rename——5.10 上可试直接创建 `eth0` |
 | 已健康 | NewContainer / NewTask / runc / cgroup / bbolt wait |
 | 相对 bridge+v2 | 配网从 **0.1s 级回到数秒级**；其它阶段反而更轻 |
-| 根因类属 | **RTNL 串行** +（当前）**锁内 printk/串口**；换 ipvlan **未消除** RTNL |
+| 根因类属 | **RTNL 串行** +（当前）**锁内 rename printk/串口**；换 ipvlan **未消除** RTNL |
 
 ---
 
@@ -327,22 +426,25 @@ rtnl_setlink → do_setlink → dev_change_name
 1. **压 console / printk（优先对照）**  
    将 console 调到 INFO 不上串口（或确认 `netdev_info` 不上 console），复测 `cni.setup` Avg——预期类似 bridge 关 printk 的收益。注意本机曾出现 `printk=7 4 1 7` 回潮。
 
-2. **量化 / 裁剪 loopback**  
+2. **去掉 ipvlan 临时名 rename（插件对照）**  
+   按 §6.4 方案 A/B：创建时即用 `eth0`，验证 5.10 无 `-EEXIST` 后做 128 并发对照；同时观察 dmesg 是否不再刷 rename、火焰图 `pl011@dev_change_name` 是否消失。
+
+3. **量化 / 裁剪 loopback**  
    对照「仅 ipvlan」与「ipvlan+loopback」；评估测试场景能否去掉默认 lo，或走 CRI 内部 `bringUpLoopback`。
 
-3. **降并发验证锁模型**  
+4. **降并发验证锁模型**  
    降低 worker 数看 `cni.setup` 是否近似线性下降；若是，则坐实全局串行。
 
-4. **减少 rename 触发的 `netdev_info`**  
-   评估 ipvlan 临时名→`eth0` 路径是否可避免/合并（插件或内核日志级别）。
+5. **内核侧减日志（备选）**  
+   将 `dev_change_name` 中 `netdev_info` 改为 `netdev_dbg` 或删除（需自维护补丁）；与关 console 正交。
 
-5. **保持 host-local 干净**  
+6. **保持 host-local 干净**  
    避免 `/12` 大网段 Walk / 无索引回潮叠在 RTNL 之上。
 
-6. **非 CNI 优化暂缓**  
+7. **非 CNI 优化暂缓**  
    本轮不必优先 bbolt `no_sync`、runc mounts、`CLONE_EMPTY_MNTNS`；等 CNI 回到百毫秒级后再打。
 
-7. **采集注意**  
+8. **采集注意**  
    确认 `perf/metadata.txt` 时长与 `--duration` 一致，且与 TRACE/resources **同一时间窗**；`perf script -F comm | sort | uniq -c` 应能看到 `ipvlan`。整目录拷贝到 `profile/`，避免只覆盖部分子目录导致空采混入。
 
 ---
@@ -359,7 +461,11 @@ bash scripts/multi_single_cold_start.sh 128-255 128 1 \
 cat results/multi/perf/metadata.txt    # 应为 60s，时间贴近 worker
 perf script -i results/multi/perf/perf_off_cpu.data -F comm \
   | sort | uniq -c | sort -rn | head   # 应有 ipvlan / loopback
+dmesg | grep -c 'renamed from'         # rename 热点量级
 ```
+
+内核树：`/home/nathan/linux`（`dev_change_name` / `rtnetlink` / `ipvlan_link_new`）。  
+CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
 
 结果目录命名约定：`profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255`。
 
@@ -371,3 +477,4 @@ perf script -i results/multi/perf/perf_off_cpu.data -F comm \
 |------|------|
 | 2026-07-22 | 初版：基于 `profile/ipvlan-l3-...` 的 TRACE / resources / pprof /（空）perf 分析 |
 | 2026-07-22 | 更新 §6.2/§7/§8：有效 perf（60s）显示 ipvlan off/on-CPU、RTNL spin、rename→pl011；修正「插件不在 1–4」表述 |
+| 2026-07-22 | 新增 §6.3/§6.4：dmesg↔`dev_change_name` 内核路径；论证最终需 eth0 但可不 rename，并更新 §8 对照项 |
