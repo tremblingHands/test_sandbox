@@ -866,6 +866,37 @@ check_kernel_params() {
 }
 
 # ============================================================
+# 输出 containerd 当前 CPU 亲和性（绑核）
+# ============================================================
+print_containerd_cpus() {
+    echo ""
+    echo "--- containerd CPU 亲和性 ---"
+
+    local pid
+    pid=$(pgrep -nx containerd 2>/dev/null || true)
+    if [ -z "$pid" ]; then
+        warn "未找到运行中的 containerd 进程"
+        return 0
+    fi
+
+    local affinity
+    affinity=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $NF}')
+    if [ -z "$affinity" ]; then
+        warn "无法读取 containerd(pid=$pid) 的 CPU 亲和性"
+        return 0
+    fi
+
+    pass "containerd pid=$pid 所在 CPU 核心: $affinity"
+    # systemd 单元里的 CPUAffinity（若有）一并打印，便于对照
+    local unit_cpus
+    unit_cpus=$(systemctl show -p CPUAffinity --value containerd 2>/dev/null || true)
+    if [ -n "$unit_cpus" ] && [ "$unit_cpus" != "[]" ] && [ "$unit_cpus" != "" ]; then
+        echo "  systemd CPUAffinity: $unit_cpus"
+    fi
+    return 0
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 main() {
@@ -904,6 +935,9 @@ main() {
         echo "请根据上述提示修复后重新运行"
     fi
     echo "=============================================="
+
+    print_containerd_cpus
+
     echo ""
     echo "下一步:"
     echo "  # 单发冷启动测试"

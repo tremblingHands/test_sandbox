@@ -6,13 +6,14 @@
 
 在 bridge CNI + cgroup v2 工作点下，同配置冷启动已到 `cri.sandbox.run` Avg **~3.36s** / P95 **~3.71s**，其中 `cni.setup` 仅 **~111ms**（见 `doc/sandbox-cold-start-bottleneck-analysis.md` §8.6）。为验证「去掉 bridge / 无 veth 对」能否进一步压低配网，将业务网切到 **ipvlan mode l3**，并在同 worker / 同绑核条件下复测。
 
-**结论先行**：ipvlan-l3 **未能**改善端到端冷启动；瓶颈从「NewContainer / bbolt」重新回到 **CNI**，`cni.setup` Avg **~6.73s**（约占 `cri.sandbox.run` 的 **81%**），端到端 Avg **~8.3s** / P95 **~11.1–11.4s**。
+**结论先行**：ipvlan-l3 **未能**改善端到端冷启动；瓶颈从「NewContainer / bbolt」重新回到 **CNI**。基线 `cni.setup` Avg **~6.73s**（约占 run **81%**），端到端 **~8.3s** / P95 **~11.1–11.4s**。注释 rename `netdev_info` 后（§3.3）run Avg **~6.81s**、setup **~5.90s**；内置 loopback 端到端几乎无收益。containerd 配网路径对 bridge/ipvlan **相同**，差异在插件与 netlink（§4.6）；单次 ipvlan ADD 约 **5～6 次 RTNL 写**（§4.4），高并发下全局串行排队；仍远慢于 bridge+v2（setup ~111ms）。上游 7.2 **无**并行建链红利；tgt_net 查重名可支撑免 rename，但须改插件（§4.5）。
 
 ### 1.2 数据来源
 
 | 类型 | 路径 |
 |------|------|
-| 结果根目录 | `profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255/` |
+| 结果根目录（基线） | `profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255/` |
+| 关 rename INFO 对照 | `..._disable-printk/`（§3.3；须 `proc_count=128`） |
 | TRACE 汇总 | `.../profile` |
 | pprof | `.../pprof/`（含 `pprof_analysis.txt`） |
 | perf | `.../perf/`（containerd 核 1–4 on/off-CPU） |
@@ -25,8 +26,10 @@
 | 文档 | 关系 |
 |------|------|
 | `doc/sandbox-cold-start-bottleneck-analysis.md` | 总瓶颈阶梯；§8.6 为 bridge+v2 对照基线 |
-| `doc/cni-bridge-network-analysis.md` | bridge / host-local / loopback 行为与 RTNL 路径 |
+| `doc/cni-bridge-network-analysis.md` | bridge / host-local / loopback 行为与 RTNL 路径；与本文 **§4.6** 对照 |
 | `doc/sandbox-ready-and-startup-latency.md` | Ready / 启动时延语义 |
+| `/home/nathan/linux-upstream-v1` | 上游 7.2 对照；ipvlan/RTNL 可用性见本文 **§4.5** |
+| `/home/nathan/containerd`、`/home/nathan/plugins` | CRI / go-cni / bridge·ipvlan 源码；差异表见 **§4.6** |
 
 ---
 
@@ -120,7 +123,35 @@ cri.sandbox.run ≈ 8.30s
 
 > **Cnt 说明**：并行 attach / journal 折叠会导致 ipvlan 与 loopback、树内与独立林 Cnt 不一致。读 **Avg + `cni.setup` 总墙钟** 即可，不必纠结绝对计数。
 
-### 3.3 与 bridge + cgroup v2（§8.6）对照
+### 3.3 注释 `dev_change_name`/`netdev_info` 后对照（128 worker）
+
+数据目录：`profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255_disable-printk/`  
+同配置 **128 workers**（勿与误跑的 256 worker 中间结果混淆）。  
+内核提交：`7632b645eab4`（注释 `netdev_info("renamed from %s")`），已装载复测（~12:07）。
+
+| 指标 | 关前（§3.1 基线） | **关后** | 变化 |
+|------|-------------------|----------|------|
+| resources P50 / P95 | 8199 / 11075 ms | **7671 / 9868 ms** | P95 **约 −11%** |
+| 总沙箱数（~60s 窗） | ~1004 | **~1087** | 吞吐略升 |
+| `cri.sandbox.run` Avg | **8.30s** | **6.81s** | **约 −18%** |
+| `cni.setup` Avg | **6.73s** | **5.90s** | **约 −12%** |
+| ipvlan（树内 / 独立林 Avg） | 5.90s / 7.51s | 6.48s / **5.36s** | 林侧更好；树内 Cnt 较少有噪声 |
+| loopback Avg | ~2.7s | **~2.4–2.6s** | 略降或持平 |
+| NewContainer / NewTask | 78ms / 207ms | 39ms / 151ms | 仍非主头 |
+
+关后 `cni.setup` 仍约占 run 的 **~87%**，阶段结构未变。
+
+**机制侧（perf / 日志）**：
+
+| 信号 | 关前 | 关后 |
+|------|------|------|
+| on-CPU `pl011` / `printk` / `netdev_info` | ~2.8–2.9% | **0%** |
+| on-CPU `dev_change_name` / `rtnl_setlink` | ~3%（含打印） | **≈0%** |
+| 测试窗 kernel `renamed from` | 大量 | **0** |
+
+解读：去掉 rename 路径 INFO→串口放大后，持锁变短、排队略松，端到端有一截收益；**主瓶颈仍是 ipvlan+loopback 的 RTNL 争用**。下一步优先 **内置 loopback**（§8）。
+
+### 3.4 与 bridge + cgroup v2（总分析文档 §8.6）对照
 
 同配置：128 workers、containerd 绑核 1–4、`--duration 60`、内核 5.10。
 
@@ -144,9 +175,10 @@ cri.sandbox.run ≈ 8.30s
 CRI `setup_serially = false` 时走 `cni.attach_networks_parallel`：
 
 - 网络 A：业务网 → **`cni.plugin.ipvlan`**
-- 网络 B：默认 loopback → **`cni.plugin.loopback`**
+- 网络 B（`use_internal_loopback=false`）：默认 loopback → **`cni.plugin.loopback`**
+- `use_internal_loopback=true`：不挂 CNI lo；`setupPodNetwork` 内先 **`bringUpLoopback`**，再只 Setup 业务网（§4.4.2）
 
-`cni.setup_pod_network` 墙钟 ≈ **max(ipvlan, loopback) + 调度/收尾**。本轮 ipvlan 更长，故 setup ≈ 6–7s；loopback 仍是 **2s+** 的第二段重载，即使将来 ipvlan 单独优化，并行墙钟也会被 loopback 托住一截，除非去掉或轻量化 lo。
+默认并行时：`cni.setup_pod_network` 墙钟 ≈ **max(ipvlan, loopback) + 调度/收尾**。本轮（基线）ipvlan 更长，故 setup ≈ 6–7s；loopback 仍是 **2s+** 的第二段重载。内置 lo 后墙钟仍由 ipvlan 主导（§8）。
 
 ### 4.2 ipvlan L3 为何没有「绕开」全局锁
 
@@ -158,17 +190,460 @@ CRI `setup_serially = false` 时走 `cni.attach_networks_parallel`：
 | 无 bridge 转发 / 无 iptables masq | 未见 xtables 主导；**主耗时仍在建网** |
 | 共用 `eth0` master | 高并发下大量 ipvlan slave 仍挤在同一条 **RTNL / netlink** 路径 |
 
-ipvlan ADD 热路径仍包括：建 netns、在 master 上创建 ipvlan 设备、移入 netns、配地址与路由。这些操作与 bridge 一样依赖内核 **RTNL 全局串行**（见总分析文档 §7 / §16.5）。换插件类型 **没有改变**「高并发建网要抢全局 netlink」这一本质。
+ipvlan ADD 热路径仍包括：建链、rename、配地址与路由（代码级清单见 **§4.4**）。这些操作与 bridge 一样依赖内核 **RTNL 全局串行**（见总分析文档 §7 / §16.5）。换插件类型 **没有改变**「高并发建网要抢全局 netlink」这一本质。
 
-本轮 CNI Avg（~6.7s）与早期「bridge + printk 开」时 CNI ~5–6s **同量级**，说明瓶颈类属回归到配网争用，而非 ipvlan 独有的用户态逻辑。
+本轮 CNI Avg（~6.7s）与早期「bridge + printk 开」时 CNI ~5–6s **同量级**，说明瓶颈类属回归到配网争用，而非 ipvlan 独有的用户态逻辑。配置与 netlink 逐步对照见 **§4.6**。
 
 ### 4.3 host-local
 
 仍使用 `10.0.0.0/12` + host-local。本轮 TRACE 上 IPAM 未单独露出为数秒级 span；主头在插件级 ipvlan/loopback。仍建议保持 `by_id` 目录干净、旁路索引可用，避免 Walk 回潮叠加在 RTNL 争用之上。
 
----
+`ipam.ExecAdd("host-local", …)` 主要是文件系统上的 IP 分配（目录/锁文件），**一般不发 RTNL**；RTNL 写操作集中在 ipvlan 插件自身的 `createIpvlan` + `ConfigureIface`（§4.4）。
 
-## 5. 非 CNI 路径为何显得健康
+### 4.4 ipvlan ADD 路径上的 RTNL 操作（代码级）
+
+源码位置：
+
+| 组件 | 路径 |
+|------|------|
+| CRI 配网入口 | `/home/nathan/containerd/internal/cri/server/sandbox_run.go` → `setupPodNetwork` |
+| 内置 lo | `…/sandbox_run_linux.go` → `bringUpLoopback` |
+| ipvlan 插件 | `/home/nathan/plugins/plugins/main/ipvlan/ipvlan.go` |
+| rename 封装 | `/home/nathan/plugins/pkg/ip/link_linux.go` → `RenameLink` / `RandomVethName` / `DelLinkByName` |
+| 配 IP/路由 | `/home/nathan/plugins/pkg/ipam/ipam_linux.go` → `ConfigureIface` |
+
+用户态统一经 `github.com/vishvananda/netlink` → netlink socket → 内核 `rtnetlink`；**改链路 / 地址 / 路由**的消息在内核持 **`rtnl_mutex`**（火焰图：`rtnetlink_rcv` / `mutex_lock` / `mutex_spin_on_owner`）。
+
+#### 4.4.1 调用总览
+
+```text
+containerd setupPodNetwork
+  ├─ [use_internal_loopback=true] bringUpLoopback
+  │     LinkByName("lo") + LinkSetUp(lo)          // 容器 ns；串行，在业务网之前
+  └─ go-cni Setup → exec /opt/cni/bin/ipvlan
+        cmdAdd
+          ├─ createIpvlan
+          │     LinkByName(master)                 // host：取 parent index
+          │     RandomVethName()                   // 仅字符串，无 RTNL
+          │     LinkAdd(ipvlan, Name=tmp, NsFd)    // NEWLINK → 容器 ns
+          │     RenameLink(tmp → eth0)             // LinkByName + LinkSetName
+          │     LinkByName(eth0)                   // 取 MAC
+          ├─ ipam.ExecAdd(host-local)              // 通常无 RTNL
+          └─ netns.Do → ConfigureIface
+                LinkByName(eth0)
+                AddrAdd × N
+                LinkSetUp(eth0)
+                RouteAddEcmp × M                   // 本机 conf 通常 M=1
+```
+
+`use_internal_loopback=false`（默认）时：不走 `bringUpLoopback`，改为并行 exec `/opt/cni/bin/loopback`（其内部亦为 `LinkByName("lo")` + `LinkSetUp`），与 ipvlan 同时抢 RTNL。
+
+#### 4.4.2 containerd：`bringUpLoopback`（内置 lo）
+
+`setupPodNetwork` 在调用 go-cni **之前**：
+
+```go
+// sandbox_run.go
+if c.config.UseInternalLoopback {
+    err := c.bringUpLoopback(path)  // path = sandbox NetNS
+}
+```
+
+```go
+// sandbox_run_linux.go
+func (c *criService) bringUpLoopback(netns string) error {
+    return ns.WithNetNSPath(netns, func(_ ns.NetNS) error {
+        link, err := netlink.LinkByName("lo")
+        if err != nil { return err }
+        return netlink.LinkSetUp(link)
+    })
+}
+```
+
+| 调用 | netns | RTNL | 说明 |
+|------|-------|------|------|
+| `LinkByName("lo")` | 容器 | 读 | |
+| `LinkSetUp(lo)` | 容器 | **写** | 与业务网串行；TRACE 上可表现为 `cni.setup` > `cni.plugin_setup` |
+
+#### 4.4.3 `cmdAdd` 骨架
+
+```go
+// ipvlan.go
+func cmdAdd(args *skel.CmdArgs) error {
+    n, cniVersion, err := loadConf(args, false)
+    netns, err := ns.GetNS(args.Netns)
+    ipvlanInterface, err := createIpvlan(n, args.IfName, netns)  // IfName 通常 eth0
+
+    r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)         // host-local
+    result, err = current.NewResultFromResult(r)
+    // … 把 IP 绑到 interface 0，填 result.Interfaces …
+
+    return netns.Do(func(_ ns.NetNS) error {
+        _, _ = sysctl.Sysctl("net/ipv4/conf/"+args.IfName+"/arp_notify", "1")  // /proc，非 RTNL
+        _, _ = sysctl.Sysctl("net/ipv6/conf/"+args.IfName+"/ndisc_notify", "1")
+        return ipam.ConfigureIface(args.IfName, result)
+    })
+}
+```
+
+#### 4.4.4 `createIpvlan`：建链 + rename（写路径核心）
+
+```go
+// ipvlan.go — createIpvlan（LinkContNs=false 时，本机默认）
+m, err = netlinksafe.LinkByName(conf.Master)   // host eth0
+
+tmpName, err := ip.RandomVethName()            // "veth" + 随机 hex；注释：避 NM，非建 veth
+
+linkAttrs.Name = tmpName
+linkAttrs.ParentIndex = m.Attrs().Index
+linkAttrs.Namespace = netlink.NsFd(int(netns.Fd()))
+
+netlink.LinkAdd(&netlink.IPVlan{LinkAttrs: linkAttrs, Mode: mode})
+
+netns.Do(func(_ ns.NetNS) error {
+    ip.RenameLink(tmpName, ifName)             // → eth0
+    contIpvlan, err := netlinksafe.LinkByName(ipvlan.Name)
+    ipvlan.Mac = contIpvlan.Attrs().HardwareAddr.String()
+    return nil
+})
+```
+
+```go
+// pkg/ip/link_linux.go
+func RenameLink(curName, newName string) error {
+    link, err := netlinksafe.LinkByName(curName)
+    if err == nil {
+        err = netlink.LinkSetName(link, newName)  // → 内核 dev_change_name
+    }
+    return err
+}
+```
+
+插件注释：
+
+```go
+// due to kernel bug we have to create with tmpname or it might
+// collide with the name on the host and error out
+```
+
+本机验证见 §6.4.2：host 侧 `LinkAdd(Name=eth0)` 会在 `__rtnl_newlink` 用 **sock_net=host** 查名 → 撞物理 eth0 → `-EEXIST`；临时名 + 容器内 rename **必要**。
+
+| # | 调用 | netns | 内核侧 | 说明 |
+|---|------|-------|--------|------|
+| 1 | `LinkByName(master)` | **host** | 读 | 取 parent index |
+| 2 | `LinkAdd(ipvlan)` | sock=host，`IFLA_NET_NS_FD`→容器 | **NEWLINK，持锁** | 临时名 `veth%x`，parent=host eth0 |
+| 3 | `LinkByName(tmp)` | **容器** | 读 | rename 前查找 |
+| 4 | `LinkSetName(→eth0)` | **容器** | **SETLINK / `dev_change_name`，持锁** | 曾触发 `netdev_info`→pl011（§6.3） |
+| 5 | `LinkByName(eth0)` | **容器** | 读 | 取 MAC |
+
+#### 4.4.5 `ConfigureIface`：地址 / UP / 路由
+
+仍在 **容器 netns**（`cmdAdd` 的 `netns.Do`）：
+
+```go
+// pkg/ipam/ipam_linux.go
+func ConfigureIface(ifName string, res *current.Result) error {
+    link, err := netlinksafe.LinkByName(ifName)
+    for _, ipc := range res.IPs {
+        // … IPv6 时可能 sysctl disable_ipv6 / keep_addr_on_down（非 RTNL）…
+        netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipc.Address})
+    }
+    netlink.LinkSetUp(link)
+    for _, r := range res.Routes {
+        netlink.RouteAddEcmp(&netlink.Route{
+            Dst: &r.Dst, LinkIndex: link.Attrs().Index, Gw: gw, ...
+        })
+    }
+    return nil
+}
+```
+
+本机典型 conf（1×IPv4 + 1×默认路由 `0.0.0.0/0`）：
+
+| # | 调用 | RTNL |
+|---|------|------|
+| 6 | `LinkByName(eth0)` | 读 |
+| 7 | `AddrAdd` ×1 | **写** |
+| 8 | `LinkSetUp(eth0)` | **写** |
+| 9 | `RouteAddEcmp` ×1 | **写** |
+
+#### 4.4.6 DEL（冷启动次要，仍抢同一把锁）
+
+```go
+// ipvlan.go cmdDel
+ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+    return ip.DelLinkByName(args.IfName)  // LinkByName + LinkDel
+})
+```
+
+边建边清时，`LinkDel` 与 ADD 的 NEWLINK/SETLINK 等 **共用 `rtnl_mutex`**。
+
+#### 4.4.7 单次成功 ADD 的 RTNL **写**操作清单（本机）
+
+| 顺序 | 来源 | 写操作 |
+|------|------|--------|
+| 0 | containerd `bringUpLoopback`（若开启） | `LinkSetUp(lo)` |
+| 1 | `createIpvlan` | `LinkAdd`（临时名 ipvlan） |
+| 2 | `createIpvlan` | `LinkSetName`（→ eth0） |
+| 3 | `ConfigureIface` | `AddrAdd` |
+| 4 | `ConfigureIface` | `LinkSetUp(eth0)` |
+| 5 | `ConfigureIface` | `RouteAddEcmp` |
+
+外加若干 `LinkByName` 读。成功路径约 **5～6 次写**抢全局 RTNL；128 worker 同时 ADD → 排队，墙钟到数秒。
+
+与 perf 对齐：off-CPU 上 `ipvlan` 柱大、`rtnetlink`/`mutex_lock` 帧仅约 **~3%**——多数时间在 **等锁 / 等 netlink 回包（futex）**，而不是一直跑在 `rtnl_*` 符号上。
+
+#### 4.4.8 与「能否减少 RTNL」的对应
+
+| 操作 | 能否去掉 / 减弱 |
+|------|-----------------|
+| `LinkAdd` | **否**（建网本体） |
+| `LinkSetName` | **5.10** 现 host 插件路径 **否**（§6.4.2）；**上游 7.2** 起 CREATE\|EXCL 在 **tgt_net** 查重名，具备「目标 ns 内直接 eth0 + LINK_NETNSID」免 rename 的内核前提（§4.5），需改插件并复测 |
+| `AddrAdd` / `LinkSetUp` / `RouteAdd` | 可尝试合并 netlink 消息；单次次数有限，难单独把数秒压到百毫秒 |
+| `bringUpLoopback` | 已开；仍 1 次 `LinkSetUp(lo)`，且在 ipvlan **前串行**（实测端到端几乎无收益，§8） |
+| 读 `LinkByName(master)` | 可缓存 ifindex，收益小 |
+| **升上游内核 alone** | **不能**自动把 setup 打到 bridge ~100ms；无并行建链 / 批量 NEWLINK（§4.5） |
+| **降并发 / 换 bridge+v2** | 不减单次次数，但减排队或换已验证更快的工作点 |
+
+### 4.5 上游内核（linux-upstream-v1 / 7.2）对当前场景的可用性
+
+对照树：
+
+| 树 | 版本 | 路径 |
+|----|------|------|
+| 本机运行 / 分析基线 | **5.10.229+debug+** | `/home/nathan/linux` |
+| 上游对照 | **7.2.0-rc4** | `/home/nathan/linux-upstream-v1` |
+
+**结论先行**：上游 **没有**「高并发建 ipvlan slave 不再抢全局 RTNL / 批量建链」类特性，**不能指望升内核后 `cni.setup` 自动接近 bridge ~111ms**。与冷启动相关的实质变化主要是 **NEWLINK 重名查找网**，为「去掉 rename」提供内核前提（仍须改 CNI 插件并复测）。
+
+#### 4.5.1 与建链相关的实质变化：`CREATE|EXCL` 按目标 netns 查名
+
+**5.10**（本机已实测，§6.4.2）：host socket 发 NEWLINK、`Name=eth0` 时，用 **`sock_net`（host）** 做存在性检查 → 撞物理 eth0 → `-EEXIST`。
+
+**上游**（2025-02，`ec061546c6cf` *rtnetlink: Lookup device in target netns when creating link*）：
+
+```c
+/* net/core/rtnetlink.c — 创建路径 */
+/* When creating, lookup for existing device in target net namespace */
+device_net = (nlh->nlmsg_flags & NLM_F_CREATE) &&
+             (nlh->nlmsg_flags & NLM_F_EXCL) ?
+             tgt_net : net;
+```
+
+即：带 `NLM_F_CREATE|NLM_F_EXCL` 时，ifname 冲突在 **`tgt_net`（容器 netns）** 内判断，而不是默认按发送 netlink 的 host 网。
+
+同时 ipvlan `newlink` 用 `rtnl_newlink_link_net(params)` 在 **link_net** 解析 parent（`IFLA_LINK` / `IFLA_LINK_NETNSID`），host 上的物理 eth0 仍可正确作为 master：
+
+```c
+/* drivers/net/ipvlan/ipvlan_main.c — 上游 */
+int ipvlan_link_new(struct net_device *dev, struct rtnl_newlink_params *params, ...)
+{
+        struct net *link_net = rtnl_newlink_link_net(params);
+        ...
+        phy_dev = __dev_get_by_index(link_net, nla_get_u32(tb[IFLA_LINK]));
+```
+
+| 项 | 说明 |
+|----|------|
+| 能做什么 | 在 **7.2+** 上改插件：目标 netns 内 `Name=eth0` + `IFLA_LINK`/`LINK_NETNSID`→host eth0，**理论上少 1 次 `LinkSetName`** |
+| 不能自动得到 | 现成 CNI ipvlan **仍是** `RandomVethName` + `RenameLink`；升内核 alone 无用户态收益 |
+| 预期收益 | 少一次 RTNL 写；**128 worker 下很难单独把数秒压到百毫秒** |
+
+配套整理：`cf517ac16ad9` *Use link/peer netns in newlink()*（`rtnl_newlink_link_net` / `peer_net` 回退逻辑），属 API 清晰化，与上条同一方向。
+
+#### 4.5.2 上游 ipvlan 其它改动（与冷启动弱相关）
+
+| 方向 | 例（`git log` on `drivers/net/ipvlan/`） | 对冷启动 |
+|------|------------------------------------------|----------|
+| 数据面锁 | `d3ba32162488` addrs_lock per-port；组播队列减 spin | **几乎无关**（跑包 / 地址事件，非 CREATE 热路径） |
+| 正确性 / 事件 | bonding 事件、L3S、UAF、header linear、NETDEV_DOWN 等 | 稳定，不减 RTNL 次数 |
+| API | `newlink` 参数打包、`ida_alloc_*` 替代 `ida_simple_*` | 建链语义同构：仍是 `register_netdevice` → ida → `netdev_upper_dev_link` → `ipvlan_set_port_mode` |
+
+上游 `ipvlan_link_new` **仍在全局设备 RTNL 下串行**；fib/nexthop/ethtool 等路径上的 **per-netns RTNL** **不**覆盖 ipvlan NEWLINK。
+
+#### 4.5.3 对当前场景的建议
+
+1. **不要指望**「升到 7.2 → ipvlan 冷启动自动接近 bridge+v2」。  
+2. **若坚持 ipvlan且愿意改插件**：在 upstream 树上验证「目标 ns 内直接 eth0 + LINK_NETNSID」能否稳定免临时名（落地 §8 P3）。  
+3. **端到端要快**：仍优先 bridge 调优工作点或降并发。  
+4. 升内核若只为 ipvlan：主要红利是 **可尝试少 rename** + 数据面/正确性修补，**不是** RTNL 并行化。
+
+### 4.6 containerd / CNI：bridge vs ipvlan 配置与 netlink 差异
+
+源码位置：
+
+| 组件 | 路径 |
+|------|------|
+| CRI 配网 | `/home/nathan/containerd/internal/cri/server/sandbox_run.go` → `setupPodNetwork` |
+| CNI Load 选项 | `…/service_linux.go` → `cniLoadOptions` |
+| bridge 插件 | `/home/nathan/plugins/plugins/main/bridge/bridge.go` |
+| ipvlan 插件 | `/home/nathan/plugins/plugins/main/ipvlan/ipvlan.go` |
+| 共用配 IP | `/home/nathan/plugins/pkg/ipam/ipam_linux.go` → `ConfigureIface` |
+| veth 辅助 | `/home/nathan/plugins/pkg/ip/link_linux.go` → `SetupVeth` / `makeVethPair` |
+
+#### 4.6.1 containerd 层：路径相同，只换 conf / 二进制
+
+```text
+RunPodSandbox
+  → setupPodNetwork
+       → [可选] bringUpLoopback          // use_internal_loopback
+       → netPlugin.Setup / SetupSerially // go-cni
+            → 按已 Load 的 networks 并行/串行 ADD
+                 networks[0] = lo（WithLoNetwork，除非 internal）
+                 networks[1] = conf_dir 第一份 conf → type 决定插件
+```
+
+```go
+// service_linux.go
+func (c *criService) cniLoadOptions() []cni.Opt {
+    if c.config.UseInternalLoopback {
+        return []cni.Opt{cni.WithDefaultConf}
+    }
+    return []cni.Opt{cni.WithLoNetwork, cni.WithDefaultConf}
+}
+```
+
+| 项 | bridge | ipvlan |
+|----|--------|--------|
+| `setupPodNetwork` / go-cni Setup | **相同** | **相同** |
+| `CNI_PATH` / `CNI_NETNS` / `CNI_IFNAME=eth0` | **相同** | **相同** |
+| `WithLoNetwork` / internal lo | **相同机制** | **相同机制** |
+| `bin_dirs` 里执行的二进制 | `/opt/cni/bin/bridge` | `/opt/cni/bin/ipvlan` |
+| stdin JSON | `type: bridge` + bridge 字段 | `type: ipvlan` + master/mode |
+| IPAM | 通常同为 `host-local`（本机） | 同左 |
+| Result → `Interfaces["eth0"]` 取 Pod IP | **相同**（`defaultIfName`） | **相同** |
+
+**结论**：containerd **不**因 bridge/ipvlan 分叉业务逻辑；差异几乎全部在 **CNI 配置 + 插件 ADD/DEL + 内核路径**。
+
+#### 4.6.2 配置差异（本机 `/etc/cni/net.d/10-mynet.conf`）
+
+**bridge（调优工作点示例）**：
+
+```json
+{
+  "cniVersion": "0.3.1",
+  "name": "mynet",
+  "type": "bridge",
+  "bridge": "cni0",
+  "isGateway": true,
+  "ipMasq": false,
+  "ipam": { "type": "host-local", "subnet": "10.0.0.0/12", "routes": [{ "dst": "0.0.0.0/0" }] }
+}
+```
+
+**ipvlan-l3（本文）**：
+
+```json
+{
+  "cniVersion": "0.3.1",
+  "name": "mynet",
+  "type": "ipvlan",
+  "master": "eth0",
+  "mode": "l3",
+  "ipam": { "type": "host-local", "subnet": "10.0.0.0/12", "routes": [{ "dst": "0.0.0.0/0" }] }
+}
+```
+
+| 字段 | bridge | ipvlan |
+|------|--------|--------|
+| `type` | `bridge` | `ipvlan` |
+| 上层设备 | 软件桥 `cni0`（可跨沙箱复用） | 物理/宿主 `master`（本机 eth0） |
+| L2/L3 | 桥 + 网关（`isGateway`） | `mode: l2/l3/l3s` |
+| `ipMasq` | 可选 per-sandbox iptables（本机调优为 false） | **无**（插件不解释该字段） |
+| IPAM / routes | host-local + 默认路由 | **同结构** |
+
+#### 4.6.3 插件 ADD 热路径对照（用户态）
+
+**bridge `cmdAdd`**（`bridge.go`）：
+
+```text
+setupBridge / ensureBridge(cni0)     // 已存在则复用；否则 LinkAdd(type=bridge)
+setupVeth(netns, br, ifName=eth0)
+  └─ 容器 ns: LinkAdd(veth 对) → 容器端名=eth0；host 端移回 host ns
+host: LinkSetMaster(hostVeth → cni0)
+      LinkSetHairpin / LinkSetIsolated …
+ipam.ExecAdd(host-local)
+netns.Do → ConfigureIface(eth0)      // AddrAdd + LinkSetUp + RouteAdd*
+[isGateway] ensureAddr(cni0, gw) …   // 网关地址多跨沙箱复用
+[ipMasq] SetupIPMasq…                // iptables，非 RTNL
+轮询 hostVeth OperUp（0/50/500/… ms sleep）
+```
+
+**ipvlan `cmdAdd`**（`ipvlan.go`，细节 §4.4）：
+
+```text
+createIpvlan
+  LinkByName(master=eth0)            // host
+  LinkAdd(ipvlan, Name=tmp, NsFd)    // 临时名，parent=eth0
+  Rename → eth0                      // 容器 ns
+ipam.ExecAdd(host-local)
+netns.Do → ConfigureIface(eth0)
+```
+
+| 步骤 | bridge | ipvlan |
+|------|--------|--------|
+| 复用基础设施 | **`cni0` 跨沙箱复用** | 每沙箱在 **同一 phy eth0** 上新建 slave |
+| 容器口 eth0 如何出现 | veth 创建时直接 `CNI_IFNAME` | **临时名 + `RenameLink`**（5.10 必要） |
+| 挂上层 | `LinkSetMaster` → 桥端口 | `LinkAdd` 时 `ParentIndex` + 内核 `netdev_upper_dev_link` |
+| 共用配 IP | **同一** `ConfigureIface` | **同一** |
+| 额外 | STP/FDB、OperUp 等待、可选 masq | 无 STP；有 rename |
+
+#### 4.6.4 netlink / RTNL 写操作差异（成功 ADD，本机典型 conf）
+
+两边都经 `vishvananda/netlink` → 内核 `rtnetlink`，**同一把全局 `rtnl_mutex`**。
+
+**ipvlan（约 5～6 次写，+ 可选 lo）**— 见 §4.4.7：
+
+| # | 操作 | 内核侧（摘要） |
+|---|------|----------------|
+| 0 | `LinkSetUp(lo)`（internal） | 容器 lo UP |
+| 1 | `LinkAdd(ipvlan)` | `ipvlan_link_new`：`register_netdevice` + upper_link + port/ida |
+| 2 | `LinkSetName→eth0` | `dev_change_name` |
+| 3–5 | `AddrAdd` / `LinkSetUp` / `RouteAdd` | 容器 eth0 配址 |
+
+**bridge（每沙箱；不含首次建 cni0）**：
+
+| # | 操作 | 内核侧（摘要） |
+|---|------|----------------|
+| — | `ensureBridge` 已存在 | 多为查桥，**无**新建 |
+| 1 | `LinkAdd(veth)` | `veth_newlink`：**两次** `register_netdevice`（peer+本地） |
+| 2 | ns 移动 / `LinkSetUp(hostVeth)` 等 | SETLINK / 改 ns（SetupVeth 路径） |
+| 3 | `LinkSetMaster` | `do_set_master` → `br_add_if`（rx_handler、FDB、STP enable） |
+| 4–6 | `ConfigureIface` | 与 ipvlan **相同**三类写 |
+| ※ | 首次 `LinkAdd(bridge)` | `br_dev_newlink`（摊销到第一次） |
+| ※ | `ensureAddr(cni0)` | 网关已在则轻；否则 `AddrAdd` on bridge |
+| ※ | OperUp 轮询 | 多次 `LinkByName` **读** + **用户态 sleep**（可拉长墙钟，但不一定是「多持锁」） |
+
+要点：
+
+1. **次数上 bridge 往往不少于 ipvlan**（还多 veth 双端注册 + setmaster），因此「ipvlan 更慢」**不是**因为 netlink 调用更少。  
+2. **结构上**：bridge 热路径是「veth 对 + 奴役进**复用的 cni0**」；ipvlan 是「在**共享物理 eth0** 上叠 slave + rename」。  
+3. **调优杠杆不同**：bridge 曾靠关 STP `br_info`→串口、关 per-sandbox `ipMasq` 把临界区/附加成本砍短 → setup ~**111ms**；ipvlan 关 rename `netdev_info` 后仍数秒（§3.3），缺同等「一刀见血」。  
+4. **未调优时** bridge CNI 也曾到 **~5–6s**（与 ipvlan 同量级），说明主矛盾是 **高并发 RTNL 排队 + 锁内放大**，而非「选了 ipvlan 类型」本身。
+
+#### 4.6.5 内核路径一句话对照
+
+| | bridge | ipvlan |
+|--|--------|--------|
+| NEWLINK kind | `veth`（+ 偶发 `bridge`） | `ipvlan` |
+| 挂主设备 | `ndo_add_slave` → `br_add_if` | `ipvlan_link_new` 内 `netdev_upper_dev_link(phy, slave)` |
+| 共享资源 | 软件桥 `cni0` + 每端口独立 veth | **同一 phy** 上的 ipvlan port / ida / 地址表 |
+| 特有子系统 | STP、FDB、桥通知 | L3 NOARP / 地址哈希；**无 STP** |
+| 历史锁内日志 | `br_set_state` → `br_info`（本机已关） | `dev_change_name` → `netdev_info`（本机已关） |
+
+更细的内核展开见 `doc/cni-bridge-network-analysis.md` 与本文 §4.4；本节聚焦 **containerd 不分叉 + 插件/netlink 差异表**。
+
+#### 4.6.6 与实测的对应
+
+| 工作点 | `cni.setup` Avg | 含义 |
+|--------|-----------------|------|
+| bridge + 关 printk + `ipMasq:false` + cgroup v2 | **~111ms** | 排队被打穿 |
+| ipvlan-l3 + 关 rename INFO | **~5.9s** | 仍卡在 RTNL 排队（slave@eth0 + rename） |
+| bridge 早期（放大器开） | **~5–6s** | 与 ipvlan **同量级** |
+
+因此：换 ipvlan **并未**减少 containerd 开销，也 **未**自动比「未调优 bridge」更轻；相对「已调优 bridge」回退，是因为 **插件/内核路径不同 + 调优不对等**，不是 go-cni 多跑了一层。
+
+---
 
 高并发下队头在 CNI 时：
 
@@ -316,7 +791,7 @@ if (oldname[0] && !strchr(oldname, '%'))
 因此日志前缀是**新名** `eth0:`，正文是**旧名** `veth…`。  
 `netdev_info` 为 **KERN_INFO**（`define_netdev_printk_level(netdev_info, KERN_INFO)`）。
 
-**本机源码改动（2026-07-22）**：上述 `netdev_info` 已在树内**注释掉**（rename 行为保留，仅去掉 INFO）。需**重新编译并安装内核**后生效；生效前 dmesg / 火焰图仍可能走 pl011。
+**本机源码改动（2026-07-22）**：上述 `netdev_info` 已在树内**注释掉**（`7632b645eab4`）。**128 worker 复测见 §3.3**（run/setup 下降，火焰图无 pl011）。
 
 用户态改名经 rtnetlink：
 
@@ -333,12 +808,12 @@ netlink.LinkSetName
 
 #### 6.3.2 谁触发：CNI ipvlan 临时名 → eth0
 
-`plugins/main/ipvlan/ipvlan.go` → `createIpvlan()`：
+完整 ADD/RTNL 清单见 **§4.4**。此处只强调 rename 触发点：`createIpvlan()` 中：
 
 ```text
 tmpName = RandomVethName()     // "veth" + 随机 hex（字符串，非建 veth）
 LinkAdd(Name=tmpName, Namespace=容器 netns, type=ipvlan)
-RenameLink(tmpName → args.IfName)   // 通常 eth0 → 触发上面内核路径
+RenameLink(tmpName → args.IfName)   // 通常 eth0 → LinkSetName → 上面内核路径
 ```
 
 `pkg/ip/link_linux.go` 中 `RandomVethName()` 注释写明：名字以 `veth` 开头是为让 NetworkManager 忽略，与网桥 veth 对无关。macvlan / vlan / tap 使用同一「临时名 + rename」模式。
@@ -403,9 +878,9 @@ rename 能成功，是因为 `dev_change_name` 在**容器 netns** 内做名字�
 | **B. 临时名 + rename（现状）** | `RandomVethName` → `RenameLink(eth0)` | **可行且必要**（当前插件路径） |
 | **C. 保留临时名且不改成 eth0** | — | **不可行**（CRI 要 `Interfaces["eth0"]`） |
 | **D. 减日志 / 压 console** | 关 INFO 上串口，或 `netdev_info`→`netdev_dbg` | **可行**；不改插件也能砍掉 pl011 放大 |
-| **E. 其它建链路径（进阶）** | 例如在容器 netns 内发 netlink 建链（sock_net≠host），并正确指定 host 上的 parent（`IFLA_LINK_NETNSID` 等） | 理论上可避免「按 host 名查找 eth0」，但 ipvlan 要挂 host master，实现复杂，**未在本环境验证** |
+| **E. 其它建链路径（进阶）** | 目标 netns 内 NEWLINK、`IFLA_LINK_NETNSID` 指 host master；或升 **7.2+** 后利用 tgt_net 查重名直接 `Name=eth0`（§4.5） | **5.10**：host 侧 Name=eth0 不可行。**上游**：内核前提已改善；插件未改、**未在本环境验证** |
 
-结论：**在现有「宿主机执行 ipvlan 插件」模型下，rename 去不掉**；优化应优先 **D（printk/console）**，而不是删 rename。
+结论：**在现有「5.10 + 宿主机执行 ipvlan 插件」模型下，rename 去不掉**；优化应优先 **D（printk/console）**。免 rename 需 **升内核 + 改插件**（§4.5），不能单靠删 rename。
 
 ---
 
@@ -503,42 +978,46 @@ host-device 等把宿主机网卡迁入容器、目标名已是 eth0 时，容�
 
 | 层级 | 结论 |
 |------|------|
-| 端到端 | **~8.3s / P95 ~11.1–11.4s**，吞吐 ~15/s |
-| 主瓶颈 | **CNI（ipvlan L3 ~6s + loopback ~2s 并行）** |
+| 端到端（基线） | **~8.3s / P95 ~11.1s**；关 rename INFO 后 **~6.8s / P95 ~9.9s**（§3.3） |
+| 主瓶颈 | **CNI（ipvlan + loopback 并行）**；关 printk 后仍占 ~87% |
 | perf（有效） | off-CPU：**ipvlan ~23%** + loopback ~8%；on-CPU：ipvlan ~14%，含 **mutex_spin** 与 **pl011@rename** |
 | dmesg | 几乎全是 `dev_change_name` 的 `eth0: renamed from veth…`（插件临时名，非真 veth） |
 | rename | 最终要 **`eth0`**；从宿主机直接 `LinkAdd(Name=eth0)` **会撞 host eth0（已实测）**，临时名+rename **必要** |
 | 多网卡 | go-cni 用 eth0/eth1…；主 IP 只认 eth0；容器内已有 eth0 再抢 eth0 → ADD 失败、无 Pod IP（§6.5） |
 | 已健康 | NewContainer / NewTask / runc / cgroup / bbolt wait |
 | 相对 bridge+v2 | 配网从 **0.1s 级回到数秒级**；其它阶段反而更轻 |
-| 根因类属 | **RTNL 串行** +（当前）**锁内 rename printk/串口**；换 ipvlan **未消除** RTNL |
+| 根因类属 | **RTNL 串行**（单次 ADD 约 5～6 次写，§4.4）+ 曾有锁内 rename printk；换 ipvlan **未消除** RTNL |
 
 ---
 
 ## 8. 优化方向（按杠杆）— 剩余可行方案
 
-> **已否证**：从宿主机 `LinkAdd(Name=eth0)` 去掉临时名+rename（撞 host eth0，§6.4.2）。
+> **已否证（5.10）**：从宿主机 `LinkAdd(Name=eth0)` 去掉临时名+rename（撞 host eth0，§6.4.2）。  
+> **上游 7.2**：CREATE\|EXCL 按 tgt_net 查名，免 rename **具备内核前提**，仍须改插件（§4.5）；**未复测**。
 
 ### 8.1 方案总表
 
 | 优先级 | 方案 | 做法 | 预期 / 状态 |
 |--------|------|------|-------------|
 | P0 | **关 console INFO** | `printk`/console_loglevel 使 INFO 不上串口；防回潮 `7 4 1 7` | 去掉 pl011 持锁放大（类 bridge 关 printk） |
-| P0 | **注释 rename 的 netdev_info** | `/home/nathan/linux/net/core/dev.c` `dev_change_name` 中注释掉该 `netdev_info` | **已改源码**；需重编/装内核后复测 `cni.setup` |
-| P1 | **裁剪 / 内置 loopback** | 去掉默认 CNI loopback，或 CRI `UseInternalLoopback` | 少一路并行抢 RTNL |
-| P1 | **降并发建网** | 少 worker / 限流同时 ADD | 缓解 `rtnl_mutex` 排队；可验证锁模型 |
+| P0 | **注释 rename 的 netdev_info** | `/home/nathan/linux` `dev_change_name` 注释该打印 | **已复测（§3.3）**：run Avg 8.30→**6.81s**，setup 6.73→**5.90s**；pl011 消失 |
+| P1 | **裁剪 / 内置 loopback** | CRI `use_internal_loopback=true` | **已复测**：TRACE 无 `cni.plugin.loopback`；run 7.08→**7.39s**、setup 5.85→**6.18s**（略差）。墙钟本就被 ipvlan 撑住；lo 改串行 `bringUpLoopback` 后 setup−plugin 仍差 ~1s |
+| P1 | **降并发建网** | 少 worker / 限流同时 ADD | 缓解 `rtnl_mutex` 排队；可验证锁模型（§4.4） |
 | P2 | **回到 bridge+v2 工作点** | 关 printk + `ipMasq:false` + cgroup v2 | 已知 `cni.setup` ~100ms；ipvlan 未赢 |
+| P2 | **插件少 netlink round-trip** | 缓存 master ifindex、合并 Addr/Route 等 | 单次次数有限（§4.4.8）；难单独压到百毫秒 |
 | P2 | **其它少 netlink 的配网** | 预建网 / 池化等 | 需单独设计 |
-| P3 | **容器 ns 内建链免 rename** | sock_net=容器 + `IFLA_LINK_NETNSID` 指 host master | 理论可少 rename；未实测、实现复杂 |
+| P3 | **升 7.2+ 并免 rename 建链** | 利用 tgt_net 查重名 + `IFLA_LINK_NETNSID`；改 ipvlan 插件去掉临时名 | 内核前提见 **§4.5**；少 1 次 `LinkSetName`；**未复测**；难单独到百毫秒 |
+| P3 | **容器 ns 内建链免 rename（5.10）** | sock_net=容器 + `IFLA_LINK_NETNSID` | 与上条同属进阶；5.10 上 host Name=eth0 已否证 |
+| — | **仅升上游内核、不改插件** | 装 7.2 ipvlan | **无端到端红利预期**（§4.5）；无并行建链 |
 | — | **改 go-cni/CRI 不用 eth0** | 改 prefix / `defaultIfName` | 牵动面大，一般不划算 |
 | 延后 | **bbolt / mounts 等** | `no_sync`、`CLONE_EMPTY_MNTNS`、裁剪 readonly/mask | CNI 仍占 ~80% 时优先级低 |
 
 ### 8.2 建议落地顺序
 
-1. 装上已注释 `netdev_info` 的内核（或同时压 console）→ 复测 ipvlan `cni.setup` / dmesg / 火焰图 `pl011`  
-2. 评估 loopback 去掉或内置  
-3. 仍不够 → 降并发，或回到 bridge+v2  
-4. 进阶再探「容器内建链」
+1. ~~注释 `netdev_info` 并复测~~ → **已完成（§3.3）**  
+2. ~~内置 loopback~~ → **已复测：端到端几乎无收益（§8.1）**  
+3. 仍不够 → **降并发**验证排队，或 **回到 bridge+v2**  
+4. 进阶：插件合并 netlink；或 **升 7.2 + 改插件免 rename**（§4.5）
 
 ### 8.3 其它注意
 
@@ -562,10 +1041,16 @@ perf script -i results/multi/perf/perf_off_cpu.data -F comm \
 dmesg | grep -c 'renamed from'         # rename 热点量级
 ```
 
-内核树：`/home/nathan/linux`（`dev_change_name` / `rtnetlink` / `ipvlan_link_new`）。  
-CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
+内核树：`/home/nathan/linux`（5.10；`dev_change_name` / `rtnetlink` / `ipvlan_link_new`）。  
+上游对照：`/home/nathan/linux-upstream-v1`（7.2.0-rc4；可用性见 **§4.5**）。  
+CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`；RTNL 清单 **§4.4**）。  
+containerd：`/home/nathan/containerd`（`bringUpLoopback` / `setupPodNetwork`）。
 
-结果目录命名约定：`profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255`。
+结果目录：
+- 基线：`profile/ipvlan-l3-containerd-1-4_workers-cores-128-255_workers-nums-128_sandbox-0-255`
+- 关 rename INFO：`..._disable-printk`（须确认 `proc_count=128`，且 containerd 实际亲和 1–4）
+
+`use_internal_loopback`：`/etc/containerd/config.toml` → `[plugins.'io.containerd.cri.v1.runtime'.cni]` → `use_internal_loopback = true`，然后 `systemctl restart containerd` 并 `taskset -pc $(pgrep -nx containerd)` 确认 1–4。
 
 ---
 
@@ -579,3 +1064,7 @@ CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
 | 2026-07-22 | **修正 §6.4**：本机实测从 host 直接建 `eth0` 因撞宿主机网卡失败；rename 在现路径下必要 |
 | 2026-07-22 | 新增 §6.5：多网卡命名、RunPodSandbox 只认 eth0、容器内已有 eth0 再建网的行为 |
 | 2026-07-22 | §8 重写为剩余方案总表；记录已注释 `dev_change_name` 的 `netdev_info`（需重编内核） |
+| 2026-07-22 | 新增 §3.3：128 worker 关 rename INFO 对照（run 8.30→6.81s）；更新 §7/§8 状态 |
+| 2026-07-22 | 新增 **§4.4**：结合 containerd/ipvlan/`ConfigureIface` 源码的 RTNL 写操作清单；更新 §4.1/§8（内置 lo 已复测无端到端收益） |
+| 2026-07-22 | 新增 **§4.5**：对照 `linux-upstream-v1`（7.2）：无并行建链红利；`ec061546c6cf` tgt_net 查重名可支撑免 rename；更新 §6.4/§8 |
+| 2026-07-22 | 新增 **§4.6**：结合 containerd + CNI 源码对照 bridge vs ipvlan 的配置、ADD 热路径与 netlink/RTNL 差异；更新 §1.1/§1.3 |
