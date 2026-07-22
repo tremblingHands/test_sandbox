@@ -316,6 +316,8 @@ if (oldname[0] && !strchr(oldname, '%'))
 因此日志前缀是**新名** `eth0:`，正文是**旧名** `veth…`。  
 `netdev_info` 为 **KERN_INFO**（`define_netdev_printk_level(netdev_info, KERN_INFO)`）。
 
+**本机源码改动（2026-07-22）**：上述 `netdev_info` 已在树内**注释掉**（rename 行为保留，仅去掉 INFO）。需**重新编译并安装内核**后生效；生效前 dmesg / 火焰图仍可能走 pl011。
+
 用户态改名经 rtnetlink：
 
 ```text
@@ -513,31 +515,35 @@ host-device 等把宿主机网卡迁入容器、目标名已是 eth0 时，容�
 
 ---
 
-## 8. 优化方向（按杠杆）
+## 8. 优化方向（按杠杆）— 剩余可行方案
 
-1. **压 console / printk（优先对照）**  
-   将 console 调到 INFO 不上串口（或确认 `netdev_info` 不上 console），复测 `cni.setup` Avg——预期类似 bridge 关 printk 的收益。注意本机曾出现 `printk=7 4 1 7` 回潮。
+> **已否证**：从宿主机 `LinkAdd(Name=eth0)` 去掉临时名+rename（撞 host eth0，§6.4.2）。
 
-2. **不要指望删掉 rename（本机已否证方案 A）**  
-   从宿主机创建名为 `eth0` 会因查找落在 host net 而 `-EEXIST`（§6.4.2）。现路径下临时名+rename 保留。
+### 8.1 方案总表
 
-3. **量化 / 裁剪 loopback**  
-   对照「仅 ipvlan」与「ipvlan+loopback」；评估测试场景能否去掉默认 lo，或走 CRI 内部 `bringUpLoopback`。
+| 优先级 | 方案 | 做法 | 预期 / 状态 |
+|--------|------|------|-------------|
+| P0 | **关 console INFO** | `printk`/console_loglevel 使 INFO 不上串口；防回潮 `7 4 1 7` | 去掉 pl011 持锁放大（类 bridge 关 printk） |
+| P0 | **注释 rename 的 netdev_info** | `/home/nathan/linux/net/core/dev.c` `dev_change_name` 中注释掉该 `netdev_info` | **已改源码**；需重编/装内核后复测 `cni.setup` |
+| P1 | **裁剪 / 内置 loopback** | 去掉默认 CNI loopback，或 CRI `UseInternalLoopback` | 少一路并行抢 RTNL |
+| P1 | **降并发建网** | 少 worker / 限流同时 ADD | 缓解 `rtnl_mutex` 排队；可验证锁模型 |
+| P2 | **回到 bridge+v2 工作点** | 关 printk + `ipMasq:false` + cgroup v2 | 已知 `cni.setup` ~100ms；ipvlan 未赢 |
+| P2 | **其它少 netlink 的配网** | 预建网 / 池化等 | 需单独设计 |
+| P3 | **容器 ns 内建链免 rename** | sock_net=容器 + `IFLA_LINK_NETNSID` 指 host master | 理论可少 rename；未实测、实现复杂 |
+| — | **改 go-cni/CRI 不用 eth0** | 改 prefix / `defaultIfName` | 牵动面大，一般不划算 |
+| 延后 | **bbolt / mounts 等** | `no_sync`、`CLONE_EMPTY_MNTNS`、裁剪 readonly/mask | CNI 仍占 ~80% 时优先级低 |
 
-4. **降并发验证锁模型**  
-   降低 worker 数看 `cni.setup` 是否近似线性下降；若是，则坐实全局串行。
+### 8.2 建议落地顺序
 
-5. **内核侧减日志（备选，与关 console 正交）**  
-   将 `dev_change_name` 中 `netdev_info` 改为 `netdev_dbg` 或删除（需自维护补丁）。
+1. 装上已注释 `netdev_info` 的内核（或同时压 console）→ 复测 ipvlan `cni.setup` / dmesg / 火焰图 `pl011`  
+2. 评估 loopback 去掉或内置  
+3. 仍不够 → 降并发，或回到 bridge+v2  
+4. 进阶再探「容器内建链」
 
-6. **保持 host-local 干净**  
-   避免 `/12` 大网段 Walk / 无索引回潮叠在 RTNL 之上。
+### 8.3 其它注意
 
-7. **非 CNI 优化暂缓**  
-   本轮不必优先 bbolt `no_sync`、runc mounts、`CLONE_EMPTY_MNTNS`；等 CNI 回到百毫秒级后再打。
-
-8. **采集注意**  
-   确认 `perf/metadata.txt` 时长与 `--duration` 一致，且与 TRACE/resources **同一时间窗**；`perf script -F comm | sort | uniq -c` 应能看到 `ipvlan`。整目录拷贝到 `profile/`，避免只覆盖部分子目录导致空采混入。
+- **host-local**：保持 `/12` 目录干净、旁路索引可用。  
+- **采集**：`perf/metadata.txt` 时长与 `--duration` 对齐；`perf script -F comm` 应见 `ipvlan`；整目录拷贝到 `profile/`。
 
 ---
 
@@ -572,3 +578,4 @@ CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
 | 2026-07-22 | 新增 §6.3/§6.4：dmesg↔`dev_change_name` 内核路径；讨论可否去 rename |
 | 2026-07-22 | **修正 §6.4**：本机实测从 host 直接建 `eth0` 因撞宿主机网卡失败；rename 在现路径下必要 |
 | 2026-07-22 | 新增 §6.5：多网卡命名、RunPodSandbox 只认 eth0、容器内已有 eth0 再建网的行为 |
+| 2026-07-22 | §8 重写为剩余方案总表；记录已注释 `dev_change_name` 的 `netdev_info`（需重编内核） |
