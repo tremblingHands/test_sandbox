@@ -361,27 +361,49 @@ RenameLink(tmpName → args.IfName)   // 通常 eth0 → 触发上面内核路�
 
 历史问题：若建链时在 **host / init_net** 视角做名字唯一性检查，宿主机已有 `eth0`，再创建名为 `eth0` 会 `-EEXIST`。故先用几乎不冲突的 `veth%x`，进入容器 ns 后再改成 CNI `ifName`。
 
-#### 6.4.2 本机内核 5.10：直接建 eth0 往往可行
+#### 6.4.2 本机实测：从宿主机直接建名为 `eth0` **不可行**
 
-带 `IFLA_NET_NS_FD` 时，`__rtnl_newlink` 大致为：
+宿主机确有物理 `eth0`。在 **5.10.229** 上用与 CNI 相同的「host 侧 netlink + `netns <容器>`」方式验证：
 
 ```text
-dest_net = 目标容器 netns
-rtnl_create_link(dest_net, ifname, ...)
-register_netdevice(dev)          // 在 dest_net 注册
+ip link add link eth0 name eth0 netns <ns> type ipvlan mode l3
+→ RTNETLINK answers: File exists     # 失败
+
+ip link add link eth0 name zztest1 netns <ns> type ipvlan mode l3
+→ OK
+ip netns exec <ns> ip link set zztest1 name eth0
+→ OK   # 容器内 eth0 与宿主机 eth0 可并存
 ```
 
-名字校验落在**容器 netns**（通常仅有 `lo`），**一般不会与 host 的 `eth0` 冲突**。插件注释更偏历史/保守写法；在 5.10 + `Namespace: netns fd` 路径上可尝试去掉 rename。
+**原因不在「名字全局唯一」，而在 `__rtnl_newlink` 的查找网：**
 
-#### 6.4.3 可选做法
+```c
+/* net/core/rtnetlink.c — net = sock_net(skb->sk)，即发 netlink 的命名空间 = 宿主机 */
+dev = rtnl_dev_get(net, ..., ifname);   /* 用 ifname=eth0 在 HOST 上查找 */
+if (dev) {
+    if (nlh->nlmsg_flags & NLM_F_EXCL)
+        return -EEXIST;                 /* 命中宿主机 eth0 → 直接失败 */
+    ...
+}
+/* 后面才会用 IFLA_NET_NS_FD 得到 dest_net 并在容器里 register */
+```
 
-| 方案 | 做法 | 效果 |
-|------|------|------|
-| **A. 创建即 eth0（推荐先试）** | `LinkAttrs.Name = ifName`，去掉 `RandomVethName` / `RenameLink`，仍带目标 netns | 少一次 `SETLINK`/`dev_change_name`；不再刷 rename dmesg；去掉锁内该条 `netdev_info→pl011` |
-| **B. 在容器 ns 内创建** | `netns.Do` 里 `LinkAdd(Name=eth0)`，不设 `Namespace` | 名字校验天然在容器内，效果类似 A |
-| **C. 保留临时名且不改成 eth0** | — | **不可行**（除非同步改 go-cni/CRI 的 ifName 约定） |
+因此：即使目标 netns 里没有 `eth0`，只要 **在宿主机上发起**、且请求名是 `eth0`，就会撞上宿主机那块网卡。  
+插件注释里的 “kernel bug / collide with the name on the host” **在本机成立**；临时名 + rename 是必要规避，不是多余步骤。
 
-注意：去掉 rename **只消除 rename 日志与一次 SETLINK**；`LinkAdd`、配地址等仍走 RTNL，端到端不会因此从数秒变毫秒，但可去掉一类持锁放大器。改插件后应先低并发验证，再跑 128 worker 对照。
+rename 能成功，是因为 `dev_change_name` 在**容器 netns** 内做名字唯一性检查——那里还没有 `eth0`，与宿主机 `eth0` 无关。完成后两边可以各有一个 `eth0`（不同 netns）。
+
+#### 6.4.3 可选做法（修正）
+
+| 方案 | 做法 | 本机结论 |
+|------|------|----------|
+| **A. 创建即 eth0（host netlink + netns fd）** | `Name=eth0` + `Namespace=容器`，去掉 rename | **不可行**（实测 `-EEXIST`，撞宿主机 eth0） |
+| **B. 临时名 + rename（现状）** | `RandomVethName` → `RenameLink(eth0)` | **可行且必要**（当前插件路径） |
+| **C. 保留临时名且不改成 eth0** | — | **不可行**（CRI 要 `Interfaces["eth0"]`） |
+| **D. 减日志 / 压 console** | 关 INFO 上串口，或 `netdev_info`→`netdev_dbg` | **可行**；不改插件也能砍掉 pl011 放大 |
+| **E. 其它建链路径（进阶）** | 例如在容器 netns 内发 netlink 建链（sock_net≠host），并正确指定 host 上的 parent（`IFLA_LINK_NETNSID` 等） | 理论上可避免「按 host 名查找 eth0」，但 ipvlan 要挂 host master，实现复杂，**未在本环境验证** |
+
+结论：**在现有「宿主机执行 ipvlan 插件」模型下，rename 去不掉**；优化应优先 **D（printk/console）**，而不是删 rename。
 
 ---
 
@@ -414,7 +436,7 @@ register_netdevice(dev)          // 在 dest_net 注册
 | 主瓶颈 | **CNI（ipvlan L3 ~6s + loopback ~2s 并行）** |
 | perf（有效） | off-CPU：**ipvlan ~23%** + loopback ~8%；on-CPU：ipvlan ~14%，含 **mutex_spin** 与 **pl011@rename** |
 | dmesg | 几乎全是 `dev_change_name` 的 `eth0: renamed from veth…`（插件临时名，非真 veth） |
-| rename | 最终要 **`eth0`**；**不必**临时名+rename——5.10 上可试直接创建 `eth0` |
+| rename | 最终要 **`eth0`**；从宿主机直接 `LinkAdd(Name=eth0)` **会撞 host eth0（已实测）**，临时名+rename **必要** |
 | 已健康 | NewContainer / NewTask / runc / cgroup / bbolt wait |
 | 相对 bridge+v2 | 配网从 **0.1s 级回到数秒级**；其它阶段反而更轻 |
 | 根因类属 | **RTNL 串行** +（当前）**锁内 rename printk/串口**；换 ipvlan **未消除** RTNL |
@@ -426,8 +448,8 @@ register_netdevice(dev)          // 在 dest_net 注册
 1. **压 console / printk（优先对照）**  
    将 console 调到 INFO 不上串口（或确认 `netdev_info` 不上 console），复测 `cni.setup` Avg——预期类似 bridge 关 printk 的收益。注意本机曾出现 `printk=7 4 1 7` 回潮。
 
-2. **去掉 ipvlan 临时名 rename（插件对照）**  
-   按 §6.4 方案 A/B：创建时即用 `eth0`，验证 5.10 无 `-EEXIST` 后做 128 并发对照；同时观察 dmesg 是否不再刷 rename、火焰图 `pl011@dev_change_name` 是否消失。
+2. **不要指望删掉 rename（本机已否证方案 A）**  
+   从宿主机创建名为 `eth0` 会因查找落在 host net 而 `-EEXIST`（§6.4.2）。现路径下临时名+rename 保留。
 
 3. **量化 / 裁剪 loopback**  
    对照「仅 ipvlan」与「ipvlan+loopback」；评估测试场景能否去掉默认 lo，或走 CRI 内部 `bringUpLoopback`。
@@ -435,8 +457,8 @@ register_netdevice(dev)          // 在 dest_net 注册
 4. **降并发验证锁模型**  
    降低 worker 数看 `cni.setup` 是否近似线性下降；若是，则坐实全局串行。
 
-5. **内核侧减日志（备选）**  
-   将 `dev_change_name` 中 `netdev_info` 改为 `netdev_dbg` 或删除（需自维护补丁）；与关 console 正交。
+5. **内核侧减日志（备选，与关 console 正交）**  
+   将 `dev_change_name` 中 `netdev_info` 改为 `netdev_dbg` 或删除（需自维护补丁）。
 
 6. **保持 host-local 干净**  
    避免 `/12` 大网段 Walk / 无索引回潮叠在 RTNL 之上。
@@ -477,4 +499,5 @@ CNI 插件：`/home/nathan/plugins`（`plugins/main/ipvlan/ipvlan.go`）。
 |------|------|
 | 2026-07-22 | 初版：基于 `profile/ipvlan-l3-...` 的 TRACE / resources / pprof /（空）perf 分析 |
 | 2026-07-22 | 更新 §6.2/§7/§8：有效 perf（60s）显示 ipvlan off/on-CPU、RTNL spin、rename→pl011；修正「插件不在 1–4」表述 |
-| 2026-07-22 | 新增 §6.3/§6.4：dmesg↔`dev_change_name` 内核路径；论证最终需 eth0 但可不 rename，并更新 §8 对照项 |
+| 2026-07-22 | 新增 §6.3/§6.4：dmesg↔`dev_change_name` 内核路径；讨论可否去 rename |
+| 2026-07-22 | **修正 §6.4**：本机实测从 host 直接建 `eth0` 因撞宿主机网卡失败；rename 在现路径下必要 |
