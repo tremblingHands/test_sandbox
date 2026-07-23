@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
-# 宿主机创建 N 个 ipvlan（仅 ip link add）耗时；可选在 bench 窗口抓 on/off-CPU 火焰图
+# 宿主机创建 N 个 ipvlan（仅 ip link add）耗时；可选火焰图 / 内核函数时延
+#
+# 绑核与 perf 分开：
+#   --cpus CPUS   创建循环 taskset 绑核
+#   --perf        开启 on/off-CPU 火焰图（采样核默认跟 --cpus）
+#
 # 用法:
-#   sudo $0 [个数N] [master]
-#   sudo $0 100 eth0 --perf-cpus 0-3
-#   sudo $0 100 eth0 --perf-cpus 1 --perf-freq 99 --output results/ipvlan_add_perf
+#   sudo $0 100 eth0 --cpus 128
+#   sudo $0 100 eth0 --cpus 128 --perf
+#   sudo $0 200 eth0 --cpus 128 --ktrace
+#   sudo $0 200 eth0 --cpus 128 --perf --ktrace
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PERF_SCRIPT="${SCRIPT_DIR}/../containerd_perf.sh"
+KTRACE_SCRIPT="${SCRIPT_DIR}/ipvlan_kfunc_trace.sh"
 
 N=100
 MASTER=""
-PERF_CPUS=""
+CPUS=""
+PERF=0
 PERF_FREQ=99
 PERF_CALL_GRAPH=fp
 OUT_DIR=""
+KTRACE=0
+KTRACE_FUNCS=""
+KTRACE_CPUS=""
 
 usage() {
     cat <<EOF
@@ -25,27 +36,44 @@ usage() {
   master                ipvlan master（默认: default route 的 dev / eth0）
 
 选项:
-  --perf-cpus CPUS      bench 前后启动 capture-live，按 -C 采 on/off-CPU 火焰图
+  --cpus CPUS           创建循环绑核（taskset）；perf/ktrace 未另指定时也用作采样核
+  --perf                开启 bench 窗口 on/off-CPU 火焰图（需同时给 --cpus）
   --perf-freq HZ        on-CPU 采样频率（默认: ${PERF_FREQ}）
   --perf-call-graph M   on-CPU call-graph: fp|dwarf|...（默认: ${PERF_CALL_GRAPH}）
-  --output DIR          perf 输出目录（默认: results/ipvlan_host_netlink_add/<ts>/perf）
+  --ktrace              bench 窗口抓内核函数时延（调用 ipvlan_kfunc_trace.sh）
+  --ktrace-funcs LIST   逗号分隔函数名（默认见 ipvlan_kfunc_trace.sh）
+  --ktrace-cpus CPUS    ktrace 采样核（默认跟 --cpus）
+  --output DIR          输出根目录（默认: results/ipvlan_host_netlink_add/<ts>）
   -h, --help            帮助
 
+兼容（旧）:
+  --perf-cpus CPUS      等价于 --cpus CPUS --perf
+
 示例:
-  sudo $0 100 eth0
-  sudo $0 200 eth0 --perf-cpus 0-3
+  sudo \$0 100 eth0 --cpus 128
+  sudo \$0 200 eth0 --cpus 128 --perf
+  sudo \$0 200 eth0 --cpus 128 --ktrace
+  sudo \$0 200 eth0 --cpus 128 --perf --ktrace
 EOF
 }
 
-# 先吃掉位置参数，再解析选项
 POS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --perf-cpus)      PERF_CPUS="$2"; shift 2 ;;
-        --perf-freq)      PERF_FREQ="$2"; shift 2 ;;
+        --cpus)            CPUS="$2"; shift 2 ;;
+        --perf)            PERF=1; shift ;;
+        --perf-cpus)       # 兼容旧用法
+            CPUS="$2"
+            PERF=1
+            shift 2
+            ;;
+        --perf-freq)       PERF_FREQ="$2"; shift 2 ;;
         --perf-call-graph) PERF_CALL_GRAPH="$2"; shift 2 ;;
-        --output)         OUT_DIR="$2"; shift 2 ;;
-        -h|--help)        usage; exit 0 ;;
+        --ktrace)          KTRACE=1; shift ;;
+        --ktrace-funcs)    KTRACE_FUNCS="$2"; KTRACE=1; shift 2 ;;
+        --ktrace-cpus)     KTRACE_CPUS="$2"; KTRACE=1; shift 2 ;;
+        --output)          OUT_DIR="$2"; shift 2 ;;
+        -h|--help)         usage; exit 0 ;;
         --*)
             echo "错误: 未知参数: $1" >&2
             usage >&2
@@ -73,6 +101,16 @@ if ! [[ "$N" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+if [[ "$PERF" -eq 1 && -z "$CPUS" ]]; then
+    echo "错误: --perf 需要同时指定 --cpus（作为 -C 采样核）" >&2
+    exit 2
+fi
+
+# ktrace 采样核：显式 --ktrace-cpus > --cpus
+if [[ "$KTRACE" -eq 1 && -z "$KTRACE_CPUS" && -n "$CPUS" ]]; then
+    KTRACE_CPUS=$CPUS
+fi
+
 cleanup() {
     ip -o link 2>/dev/null | awk -F': ' '$2 ~ /^ivlb/ {print $2}' |
         while read -r n; do ip link del "${n%%@*}" 2>/dev/null || true; done
@@ -90,11 +128,10 @@ start_perf() {
         echo "错误: 未找到 perf" >&2
         return 1
     fi
-    echo "[perf] capture-live -C ${PERF_CPUS} → ${dir}"
-    # 新 session，避免本脚本收到信号时连带打乱 stop 流程
-    setsid bash "$PERF_SCRIPT" capture-live \
+    echo "[perf] capture-live -C ${CPUS}（脚本绑核 0）→ ${dir}"
+    setsid taskset -c 0 bash "$PERF_SCRIPT" capture-live \
         --output-dir "$dir" \
-        --cpus "$PERF_CPUS" \
+        --cpus "$CPUS" \
         --frequency "$PERF_FREQ" \
         --call-graph "$PERF_CALL_GRAPH" \
         --offcpu-method perf \
@@ -125,9 +162,7 @@ stop_perf() {
     fi
     if kill -0 "$PERF_PID" 2>/dev/null; then
         echo "[perf] 停止 capture-live（生成 on/off SVG）..."
-        # 只信号 bash 脚本，由其 trap 对 perf 发 SIGINT
         kill -TERM "$PERF_PID" 2>/dev/null || true
-        # 生成 SVG 可能较慢
         local w=0
         while kill -0 "$PERF_PID" 2>/dev/null && (( w < 300 )); do
             sleep 1
@@ -142,21 +177,94 @@ stop_perf() {
     PERF_PID=""
 }
 
+start_ktrace() {
+    local dir=$1
+    mkdir -p "$dir"
+    rm -f "${dir}/capture.ready"
+    if [[ ! -x "$KTRACE_SCRIPT" && ! -f "$KTRACE_SCRIPT" ]]; then
+        echo "错误: 未找到 $KTRACE_SCRIPT" >&2
+        return 1
+    fi
+    local -a args=(capture-live --output-dir "$dir" --affinity 0)
+    if [[ -n "$KTRACE_FUNCS" ]]; then
+        args+=(--funcs "$KTRACE_FUNCS")
+    fi
+    if [[ -n "$KTRACE_CPUS" ]]; then
+        args+=(--cpus "$KTRACE_CPUS")
+    fi
+    echo "[ktrace] ${KTRACE_SCRIPT} ${args[*]}"
+    setsid bash "$KTRACE_SCRIPT" "${args[@]}" </dev/null &
+    KTRACE_PID=$!
+    local ready_deadline=$(( $(date +%s) + 30 ))
+    while (( $(date +%s) < ready_deadline )); do
+        if ! kill -0 "$KTRACE_PID" 2>/dev/null; then
+            echo "错误: ktrace 提前退出" >&2
+            wait "$KTRACE_PID" || true
+            return 1
+        fi
+        if [[ -f "${dir}/capture.ready" ]]; then
+            echo "[ktrace] ready (pid=${KTRACE_PID})"
+            return 0
+        fi
+        sleep 0.1
+    done
+    kill -TERM "$KTRACE_PID" 2>/dev/null || true
+    echo "错误: 等待 ktrace ready 超时" >&2
+    return 1
+}
+
+stop_ktrace() {
+    if [[ -z "${KTRACE_PID:-}" ]]; then
+        return 0
+    fi
+    if kill -0 "$KTRACE_PID" 2>/dev/null; then
+        echo "[ktrace] 停止（导出 function_graph / summary）..."
+        kill -TERM "$KTRACE_PID" 2>/dev/null || true
+        local w=0
+        while kill -0 "$KTRACE_PID" 2>/dev/null && (( w < 120 )); do
+            sleep 1
+            w=$((w + 1))
+        done
+        if kill -0 "$KTRACE_PID" 2>/dev/null; then
+            echo "[ktrace] 警告: 超时，强制结束" >&2
+            kill -KILL "$KTRACE_PID" 2>/dev/null || true
+        fi
+        wait "$KTRACE_PID" 2>/dev/null || true
+    fi
+    KTRACE_PID=""
+}
+
+stop_all_capture() {
+    stop_perf
+    stop_ktrace
+}
+
 PERF_PID=""
-trap 'stop_perf' EXIT
+KTRACE_PID=""
+trap 'stop_all_capture' EXIT
 
 cleanup
 
-if [[ -n "$PERF_CPUS" ]]; then
+BASE_OUT=""
+if [[ "$PERF" -eq 1 || "$KTRACE" -eq 1 ]]; then
     if [[ -z "$OUT_DIR" ]]; then
-        OUT_DIR="results/ipvlan_host_netlink_add/$(date +%Y%m%d%H%M%S)/perf"
+        BASE_OUT="results/ipvlan_host_netlink_add/$(date +%Y%m%d%H%M%S)"
+    else
+        BASE_OUT=$OUT_DIR
     fi
-    start_perf "$OUT_DIR"
+    mkdir -p "$BASE_OUT"
+fi
+
+if [[ "$PERF" -eq 1 ]]; then
+    start_perf "${BASE_OUT}/perf"
+fi
+if [[ "$KTRACE" -eq 1 ]]; then
+    start_ktrace "${BASE_OUT}/ktrace"
 fi
 
 ok=0
 fail=0
-echo "开始测试 (N=${N}, master=${MASTER})"
+echo "开始测试 (N=${N}, master=${MASTER}${CPUS:+, cpus=${CPUS}})"
 start=$(date +%s%N)
 
 run_adds() {
@@ -172,12 +280,10 @@ run_adds() {
     done
 }
 
-# 有 --perf-cpus 时把创建绑到采样核上，否则火焰图几乎采不到本脚本的 ip
-if [[ -n "$PERF_CPUS" ]] && command -v taskset &>/dev/null; then
-    echo "[perf] taskset -c ${PERF_CPUS} 绑定 bench"
-    # taskset 起子 shell 时 ok/fail 在子进程，需用临时文件回传
+if [[ -n "$CPUS" ]] && command -v taskset &>/dev/null; then
+    echo "[bench] taskset -c ${CPUS}"
     _r=$(mktemp)
-    taskset -c "$PERF_CPUS" bash -c '
+    taskset -c "$CPUS" bash -c '
         set -euo pipefail
         N=$1; MASTER=$2
         ok=0; fail=0
@@ -199,8 +305,7 @@ else
 fi
 end=$(date +%s%N)
 
-# 必须在 post 清理前停 perf，避免把 DEL 采进去
-stop_perf
+stop_all_capture
 trap - EXIT
 
 echo "测试结束，开始清理"
@@ -214,15 +319,21 @@ awk -v ok="$ok" -v fail="$fail" -v a="$start" -v b="$end" \
     printf "\n"
   }'
 
-if [[ -n "$PERF_CPUS" && -n "$OUT_DIR" ]]; then
-    echo "perf → ${OUT_DIR}"
-    shopt -s nullglob
-    svgs=("$OUT_DIR"/*.svg)
-    shopt -u nullglob
-    if (( ${#svgs[@]} > 0 )); then
-        printf '  %s\n' "${svgs[@]}"
-    else
-        echo "  (无 SVG，可检查 FlameGraph / perf 数据)"
+if [[ -n "$BASE_OUT" ]]; then
+    echo "output → ${BASE_OUT}"
+    if [[ "$PERF" -eq 1 && -d "${BASE_OUT}/perf" ]]; then
+        shopt -s nullglob
+        svgs=("${BASE_OUT}/perf"/*.svg)
+        shopt -u nullglob
+        if (( ${#svgs[@]} > 0 )); then
+            printf '  perf: %s\n' "${svgs[@]}"
+        else
+            echo "  perf: (无 SVG)"
+        fi
+    fi
+    if [[ "$KTRACE" -eq 1 && -f "${BASE_OUT}/ktrace/summary.txt" ]]; then
+        echo "  ktrace summary:"
+        sed 's/^/    /' "${BASE_OUT}/ktrace/summary.txt"
     fi
 fi
 
