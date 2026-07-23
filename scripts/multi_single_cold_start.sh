@@ -213,6 +213,61 @@ RESULT_DIR="results/multi"
 rm -rf "$RESULT_DIR"
 mkdir -p "$RESULT_DIR"
 
+# 强制清理所有 pod：rmp 明细写日志，不打到串口；以 pods 数量为准多轮重试
+CLEANUP_ROUNDS="${CLEANUP_ROUNDS:-8}"
+CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-60s}"
+CLEANUP_SLEEP="${CLEANUP_SLEEP:-2}"
+
+pod_count() {
+    crictl -t "$CLEANUP_TIMEOUT" pods -q 2>/dev/null | grep -c . || true
+}
+
+# $1 = 标签（pre/post），仅少量进度打到终端
+cleanup_all_pods() {
+    local label="$1"
+    local logfile="${RESULT_DIR}/cleanup_${label}.log"
+    local round=1 remain
+
+    : > "$logfile"
+    remain=$(pod_count)
+    echo "[${label}] pod 残留: ${remain}（最多 ${CLEANUP_ROUNDS} 轮, -t ${CLEANUP_TIMEOUT}; 明细 → ${logfile}）"
+
+    if [ "${remain:-0}" -eq 0 ]; then
+        echo "[${label}] 无需清理"
+        return 0
+    fi
+
+    while [ "$round" -le "$CLEANUP_ROUNDS" ]; do
+        remain=$(pod_count)
+        if [ "${remain:-0}" -eq 0 ]; then
+            echo "[${label}] 第 ${round} 轮前已清零"
+            break
+        fi
+        echo "[${label}] 第 ${round}/${CLEANUP_ROUNDS} 轮: 残留 ${remain}，rmp -a -f ..."
+        {
+            echo "===== round ${round} $(date '+%Y-%m-%d %H:%M:%S') remain=${remain} ====="
+            if ! crictl -t "$CLEANUP_TIMEOUT" rmp -a -f; then
+                crictl -t "$CLEANUP_TIMEOUT" rmp --all --force || true
+            fi
+        } >>"$logfile" 2>&1
+        sleep "$CLEANUP_SLEEP"
+        remain=$(pod_count)
+        echo "[${label}] 第 ${round} 轮后残留: ${remain}"
+        if [ "${remain:-0}" -eq 0 ]; then
+            break
+        fi
+        round=$((round + 1))
+    done
+
+    remain=$(pod_count)
+    if [ "${remain:-0}" -eq 0 ]; then
+        echo "[${label}] 清理完成（0 残留）"
+        return 0
+    fi
+    echo "[${label}] 仍有 ${remain} 个残留（见 ${logfile}；可手动: crictl -t ${CLEANUP_TIMEOUT} rmp -a -f）"
+    return 1
+}
+
 # pprof 时长: 优先用户指定的，否则与 test duration 对齐
 if $PPROF; then
     if [ -z "$PPROF_CPU_SECONDS" ]; then
@@ -321,6 +376,12 @@ if $RESOURCES; then
     echo "           采样时长: ${RESOURCE_DURATION}s, 间隔: ${RESOURCE_INTERVAL}s"
 fi
 echo "=================================================="
+echo ""
+
+# ============================================================
+# 测试前：若有残留 pod 则先清掉（rmp 输出进日志，不打串口）
+# ============================================================
+cleanup_all_pods pre || true
 echo ""
 
 # ============================================================
@@ -650,47 +711,7 @@ else:
 #
 # 各 worker 带 --no-batch-cleanup，运行中除非透传 --cleanup，否则沙箱会堆积。
 # 单次 crictl rmp -fa 在高负载下常 DeadlineExceeded，且默认连接超时仅 ~2s，
-# 需加长 -t 并多次重试。
+# 需加长 -t 并多次重试。rmp 明细写入结果目录日志，避免刷串口。
 # ============================================================
 echo ""
-echo "[post] 清理所有残留 pod..."
-
-CLEANUP_ROUNDS="${CLEANUP_ROUNDS:-8}"
-CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-60s}"
-CLEANUP_SLEEP="${CLEANUP_SLEEP:-2}"
-
-pod_count() {
-    crictl -t "$CLEANUP_TIMEOUT" pods -q 2>/dev/null | grep -c . || true
-}
-
-round=1
-remain=$(pod_count)
-echo "[post] 清理前残留: ${remain} 个（最多 ${CLEANUP_ROUNDS} 轮, crictl -t ${CLEANUP_TIMEOUT}）"
-
-while [ "$round" -le "$CLEANUP_ROUNDS" ]; do
-    remain=$(pod_count)
-    if [ "${remain:-0}" -eq 0 ]; then
-        echo "[post] 第 ${round} 轮前已无残留 pod"
-        break
-    fi
-    echo "[post] 第 ${round}/${CLEANUP_ROUNDS} 轮: 残留 ${remain}，执行 crictl rmp -a -f ..."
-    # 不吞 stderr：便于看到 DeadlineExceeded；失败不退出，靠重试
-    if ! crictl -t "$CLEANUP_TIMEOUT" rmp -a -f; then
-        # 兼容旧 crictl 长选项
-        crictl -t "$CLEANUP_TIMEOUT" rmp --all --force || true
-    fi
-    sleep "$CLEANUP_SLEEP"
-    remain=$(pod_count)
-    echo "[post] 第 ${round} 轮后残留: ${remain}"
-    if [ "${remain:-0}" -eq 0 ]; then
-        break
-    fi
-    round=$((round + 1))
-done
-
-remain=$(pod_count)
-if [ "${remain:-0}" -eq 0 ]; then
-    echo "[post] 清理完成（0 残留）"
-else
-    echo "[post] 清理结束仍有 ${remain} 个 pod 残留（可手动: crictl -t ${CLEANUP_TIMEOUT} rmp -a -f）"
-fi
+cleanup_all_pods post || true
