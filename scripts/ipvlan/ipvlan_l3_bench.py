@@ -9,6 +9,8 @@ ipvlan-l3 CNI 热路径 benchmark（对齐沙箱冷启动配网，不跑完整 s
   --precreate-netns [N]  预创建 N 个 netns（省略 N 时 = -c），均分给 M=-c 个 worker；
                          热路径跳过「建 ns」，其余与不配一致（含 --with-lo 每轮配 lo）；
                          份用尽后现场新建 ns，并打日志提示
+  --no-netns             不创建 netns，在宿主机直接建 ipvlan（仅 --mode netlink；
+                         每轮唯一 ifname；不配默认路由，避免污染宿主机）
 
   --mode cni      真插件 /opt/cni/bin/ipvlan + host-local（贴近沙箱）
   --mode netlink  用 ip/netlink 重放同序操作（无插件/IPAM，对照 RTNL）
@@ -42,6 +44,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DEFAULT_CNI_BIN = "/opt/cni/bin"
 DEFAULT_SUBNET = "10.88.0.0/16"  # 独立网段，避免与生产 mynet /12 冲突
 DEFAULT_IFNAME = "eth0"
+HOST_NETNS_PATH = "/proc/1/ns/net"  # --no-netns：在宿主机 netns 内配 ipvlan
+HOST_IF_PREFIX = "ivlb"  # 宿主机侧接口名前缀（IFNAMSIZ=15）
 
 _stop = threading.Event()
 _ip_alloc_lock = threading.Lock()
@@ -94,7 +98,7 @@ def percentile(sorted_vals, p):
     return float(sorted_vals[idx])
 
 
-def build_netconf(master, subnet, data_dir, no_ipam=False):
+def build_netconf(master, subnet, data_dir, no_ipam=False, with_default_route=True):
     conf = {
         "cniVersion": "0.3.1",
         "name": "ipvlan-l3-bench",
@@ -109,8 +113,9 @@ def build_netconf(master, subnet, data_dir, no_ipam=False):
             "type": "host-local",
             "subnet": subnet,
             "dataDir": data_dir,
-            "routes": [{"dst": "0.0.0.0/0"}],
         }
+        if with_default_route:
+            conf["ipam"]["routes"] = [{"dst": "0.0.0.0/0"}]
     return conf
 
 
@@ -163,6 +168,11 @@ def delete_netns(name):
 def random_tmp_ifname():
     # IFNAMSIZ=15；对齐 CNI 临时名风格
     return "ip" + uuid.uuid4().hex[:8]
+
+
+def alloc_host_ifname(seq):
+    """宿主机侧唯一接口名：ivlb + 8 hex（总长 12 < 15）。"""
+    return "{}{:08x}".format(HOST_IF_PREFIX, seq & 0xFFFFFFFF)
 
 
 def init_ip_allocator(subnet):
@@ -229,13 +239,67 @@ def netlink_del_ipvlan(ns_name, ifname):
     _run(["ip", "-n", ns_name, "link", "delete", ifname], check=False)
 
 
-def strip_iface(args, conf_bytes, cid, ns_name, ifname):
-    """卸掉 ns 内业务网卡。"""
+def netlink_add_ipvlan_host(master, ifname, subnet):
+    """
+    无 netns：在宿主机直接建 ipvlan（不 move、不配默认路由，避免污染主机路由）。
+      LinkAdd → AddrAdd → LinkSetUp
+    """
+    _run(
+        [
+            "ip",
+            "link",
+            "add",
+            "link",
+            master,
+            "name",
+            ifname,
+            "type",
+            "ipvlan",
+            "mode",
+            "l3",
+        ]
+    )
+    try:
+        addr = alloc_addr_cidr(subnet)
+        _run(["ip", "addr", "add", addr, "dev", ifname])
+        _run(["ip", "link", "set", ifname, "up"])
+    except Exception:
+        _run(["ip", "link", "delete", ifname], check=False)
+        raise
+    return addr
+
+
+def netlink_del_ipvlan_host(ifname):
+    _run(["ip", "link", "delete", ifname], check=False)
+
+
+def strip_iface(args, conf_bytes, cid, ns_name, ifname, host=False):
+    """卸掉业务网卡。host=True 表示宿主机 netns（--no-netns）。"""
+    if host:
+        if args.mode == "cni":
+            cni_del_ipvlan(args.cni_bin, conf_bytes, cid, HOST_NETNS_PATH, ifname)
+        else:
+            netlink_del_ipvlan_host(ifname)
+        return
     netns_path = "/var/run/netns/" + ns_name
     if args.mode == "cni":
         cni_del_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, ifname)
     else:
         netlink_del_ipvlan(ns_name, ifname)
+
+
+def cleanup_host_ifaces(prefix=HOST_IF_PREFIX):
+    """清理本 bench 在宿主机留下的 ipvlan（--no-netns）。"""
+    p = _run(["ip", "-o", "link", "show"], check=False)
+    text = (p.stdout or b"").decode()
+    for line in text.splitlines():
+        # 2: ivlb00000001: <...>
+        parts = line.split(":", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().split("@")[0]
+        if name.startswith(prefix):
+            netlink_del_ipvlan_host(name)
 
 
 def precreate_netns_list(count, args):
@@ -267,19 +331,26 @@ def split_netns_shares(items, m):
 
 
 def one_op(args, conf_bytes, seq, owned_ns=None):
-    """执行一次 ADD。owned_ns 非空时跳过建 ns；--with-lo 行为与不配预创建一致。"""
+    """执行一次 ADD。owned_ns 非空时跳过建 ns；--no-netns 时在宿主机配 ipvlan。"""
     if _stop.is_set():
         return None
 
     mode = args.mode
+    no_netns = bool(args.no_netns)
     precreated = owned_ns is not None
     cid = "ivlbench-{}-{}".format(os.getpid(), uuid.uuid4().hex[:12])
     ns_name = None
+    ifname = args.ifname
     t0 = time.perf_counter()
     phases = {}
 
     try:
-        if precreated:
+        if no_netns:
+            # 宿主机 netns：跳过建 ns / lo；每轮唯一 ifname
+            ifname = alloc_host_ifname(seq)
+            netns_path = HOST_NETNS_PATH
+            phases["netns_ms"] = 0.0
+        elif precreated:
             ns_name = owned_ns["ns"]
             netns_path = owned_ns["path"]
             phases["netns_ms"] = 0.0
@@ -289,7 +360,7 @@ def one_op(args, conf_bytes, seq, owned_ns=None):
             netns_path = ensure_netns(ns_name)
             phases["netns_ms"] = (time.perf_counter() - t) * 1000
 
-        if args.with_lo:
+        if args.with_lo and not no_netns:
             t = time.perf_counter()
             if mode == "cni":
                 cni_add_loopback(args.cni_bin, cid, netns_path)
@@ -298,25 +369,35 @@ def one_op(args, conf_bytes, seq, owned_ns=None):
             phases["lo_ms"] = (time.perf_counter() - t) * 1000
 
         t = time.perf_counter()
-        if mode == "cni":
-            cni_add_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, args.ifname)
+        if no_netns:
+            if mode == "cni":
+                cni_add_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, ifname)
+            else:
+                netlink_add_ipvlan_host(args.master, ifname, args.subnet)
+        elif mode == "cni":
+            cni_add_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, ifname)
         else:
-            netlink_add_ipvlan(args.master, ns_name, args.ifname, args.subnet)
+            netlink_add_ipvlan(args.master, ns_name, ifname, args.subnet)
         phases["add_ms"] = (time.perf_counter() - t) * 1000
 
         if args.cleanup_each and not precreated:
             t = time.perf_counter()
-            if mode == "cni":
-                cni_del_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, args.ifname)
+            if no_netns:
+                strip_iface(args, conf_bytes, cid, None, ifname, host=True)
             else:
-                netlink_del_ipvlan(ns_name, args.ifname)
-            delete_netns(ns_name)
+                if mode == "cni":
+                    cni_del_ipvlan(args.cni_bin, conf_bytes, cid, netns_path, ifname)
+                else:
+                    netlink_del_ipvlan(ns_name, ifname)
+                delete_netns(ns_name)
             phases["del_ms"] = (time.perf_counter() - t) * 1000
             ns_name = None
             phases["ns"] = None
+            phases["iface"] = None
         else:
-            # 保留 iface + netns，结束后统一清理
-            phases["ns"] = ns_name
+            # 保留 iface（+ netns），结束后统一清理
+            phases["ns"] = None if no_netns else ns_name
+            phases["iface"] = ifname if no_netns else None
 
         phases["total_ms"] = (time.perf_counter() - t0) * 1000
         phases["ok"] = True
@@ -325,12 +406,17 @@ def one_op(args, conf_bytes, seq, owned_ns=None):
             phases["ns"] = ns_name
         phases["mode"] = mode
         phases["precreated"] = precreated
+        phases["no_netns"] = no_netns
         return phases
     except Exception as e:
-        # 预创建 ns 留给结束后统一清；现场新建的则尽量删掉
-        if not precreated and ns_name:
+        if no_netns:
             try:
-                strip_iface(args, conf_bytes, cid, ns_name, args.ifname)
+                strip_iface(args, conf_bytes, cid, None, ifname, host=True)
+            except Exception:
+                pass
+        elif not precreated and ns_name:
+            try:
+                strip_iface(args, conf_bytes, cid, ns_name, ifname)
             except Exception:
                 pass
             delete_netns(ns_name)
@@ -341,8 +427,10 @@ def one_op(args, conf_bytes, seq, owned_ns=None):
             "total_ms": (time.perf_counter() - t0) * 1000,
             "cid": cid,
             "ns": ns_name if precreated else None,
+            "iface": None,
             "mode": mode,
             "precreated": precreated,
+            "no_netns": no_netns,
         }
 
 
@@ -517,6 +605,7 @@ def main():
   python3 scripts/ipvlan/ipvlan_l3_bench.py -c 64 --duration 30 --master eth0
   python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 --mode netlink
   python3 scripts/ipvlan/ipvlan_l3_bench.py -c 8 --duration 30 --precreate-netns 800 --with-lo
+  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 32 --duration 30 --no-netns --mode netlink
   numactl -C 1-4 python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 \
       --precreate-netns 1024 --perf-cpus 1-4
 """,
@@ -564,6 +653,12 @@ def main():
         "热路径跳过建 ns，--with-lo 仍每轮执行；份用尽后现场新建并告警",
     )
     ap.add_argument(
+        "--no-netns",
+        action="store_true",
+        help="不创建 netns，在宿主机直接建 ipvlan（仅 --mode netlink；"
+        "唯一 ifname；不配默认路由；与 --precreate-netns/--with-lo 互斥）",
+    )
+    ap.add_argument(
         "--data-dir",
         type=str,
         default=None,
@@ -597,11 +692,30 @@ def main():
     )
     args = ap.parse_args()
     args.cleanup_each = bool(args.cleanup_each)
+    args.no_netns = bool(args.no_netns)
     args.no_ipam = False
 
     if args.duration is None or args.duration <= 0:
         print("错误: --duration 须 > 0", file=sys.stderr)
         sys.exit(2)
+
+    if args.no_netns:
+        if args.mode != "netlink":
+            print(
+                "错误: --no-netns 仅支持 --mode netlink"
+                "（CNI ipvlan 禁止 CNI_NETNS 与插件所在 ns 相同）",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.precreate_netns is not None:
+            print("错误: --no-netns 与 --precreate-netns 不能同时使用", file=sys.stderr)
+            sys.exit(2)
+        if args.with_lo:
+            print(
+                "警告: --no-netns 下忽略 --with-lo（宿主机 lo 已存在）",
+                file=sys.stderr,
+            )
+            args.with_lo = False
 
     precreate_n = None
     if args.precreate_netns is not None:
@@ -640,7 +754,13 @@ def main():
     conf_bytes = b"{}"
     if args.mode == "cni":
         os.makedirs(data_dir, exist_ok=True)
-        conf = build_netconf(master, args.subnet, data_dir, no_ipam=args.no_ipam)
+        conf = build_netconf(
+            master,
+            args.subnet,
+            data_dir,
+            no_ipam=args.no_ipam,
+            with_default_route=not args.no_netns,
+        )
         conf_bytes = json.dumps(conf).encode()
     else:
         init_ip_allocator(args.subnet)
@@ -668,6 +788,7 @@ def main():
         print("  cni-bin:     {}".format(args.cni_bin))
         print("  dataDir:     {}".format(data_dir))
     print("  with-lo:     {}".format(args.with_lo))
+    print("  no-netns:    {}".format(args.no_netns))
     print("  cleanup:     {}".format("each" if args.cleanup_each else "end (default)"))
     print(
         "  precreate:   {}".format(
@@ -700,6 +821,8 @@ def main():
             sys.exit(1)
 
     cleanup_leftovers()
+    if args.no_netns:
+        cleanup_host_ifaces()
 
     results = []
     lock = threading.Lock()
@@ -788,11 +911,18 @@ def main():
 
     # 统一 DEL iface + 删 ns（含预创建未用完的空 ns）
     leftover_ns = []
+    leftover_host = []
     with lock:
         for r in results:
             if r.get("ns"):
                 leftover_ns.append((r.get("cid"), r["ns"]))
+            if r.get("iface"):
+                leftover_host.append((r.get("cid"), r["iface"]))
     used_ns = {ns for _, ns in leftover_ns}
+    if leftover_host:
+        print("[post] 统一清理 {} 个宿主机 ipvlan ...".format(len(leftover_host)))
+        for cid, ifname in leftover_host:
+            strip_iface(args, conf_bytes, cid, None, ifname, host=True)
     if leftover_ns:
         print("[post] 统一清理 {} 个已配置 netns ...".format(len(leftover_ns)))
         for cid, ns in leftover_ns:
@@ -810,6 +940,8 @@ def main():
             for item in unused:
                 delete_netns(item["ns"])
     cleanup_leftovers()
+    if args.no_netns:
+        cleanup_host_ifaces()
 
     ok = [r for r in results if r.get("ok")]
     fail = [r for r in results if not r.get("ok")]
@@ -830,7 +962,7 @@ def main():
     if precreate_n and overflow[0]:
         print("  overflow: {} (现场新建 netns)".format(overflow[0]))
     print("  throughput: {:.2f} ADD/s".format(tps))
-    if not precreate_n or overflow[0]:
+    if not args.no_netns and (not precreate_n or overflow[0]):
         # 有现场新建时 netns 阶段有数据；纯预创建且无溢出则全是 0，略过
         if any(v > 0 for v in netns_ms) or not precreate_n:
             print_stats("netns", netns_ms)
@@ -852,6 +984,7 @@ def main():
             "subnet": args.subnet,
             "cni_bin": args.cni_bin if args.mode == "cni" else None,
             "with_lo": args.with_lo,
+            "no_netns": args.no_netns,
             "cleanup_each": args.cleanup_each,
             "precreate_netns": precreate_n,
             "perf_cpus": args.perf_cpus,
