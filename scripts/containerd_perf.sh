@@ -549,20 +549,212 @@ EOF
 }
 
 # ============================================================
+# capture-live：采样直到 SIGTERM/SIGINT（供 bench 只包住 wall 窗口）
+# ============================================================
+cmd_capture_live() {
+    local OUTPUT_DIR=""
+    local FREQUENCY="$DEFAULT_FREQUENCY"
+    local OFFCPU_METHOD="$DEFAULT_OFFCPU_METHOD"
+    local CALL_GRAPH="$DEFAULT_CALL_GRAPH"
+    local CPUS=""
+    local TITLE_PREFIX="perf"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output-dir)      OUTPUT_DIR="$2";    shift 2 ;;
+            --frequency)       FREQUENCY="$2";     shift 2 ;;
+            --call-graph)      CALL_GRAPH="$2";    shift 2 ;;
+            --offcpu-method)   OFFCPU_METHOD="$2"; shift 2 ;;
+            --cpus)            CPUS="$2";          shift 2 ;;
+            --title-prefix)    TITLE_PREFIX="$2";  shift 2 ;;
+            *)
+                echo "错误: 未知参数: $1"
+                echo "用法: $0 capture-live --output-dir DIR --cpus CPUS [OPTIONS]"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$OUTPUT_DIR" ]; then
+        echo "错误: capture-live 需要 --output-dir"
+        exit 1
+    fi
+    if [ -z "$CPUS" ]; then
+        echo "错误: capture-live 需要 --cpus（按核采样；勿用 containerd 默认 CPU）"
+        exit 1
+    fi
+    if [ "$OFFCPU_METHOD" != "ebpf" ] && [ "$OFFCPU_METHOD" != "perf" ]; then
+        echo "错误: --offcpu-method 必须是 ebpf 或 perf，当前值: $OFFCPU_METHOD"
+        exit 1
+    fi
+    if [ "$OFFCPU_METHOD" = "ebpf" ]; then
+        echo "错误: capture-live 仅支持 --offcpu-method perf（按 -C 采；ebpf 绑 containerd PID 不适用）"
+        exit 1
+    fi
+
+    case "$CALL_GRAPH" in
+        fp|lbr|dwarf|dwarf,*|fp,dwarf|fp,dwarf,*) ;;
+        *)
+            echo "错误: --call-graph 无效: $CALL_GRAPH"
+            exit 1
+            ;;
+    esac
+    CALL_GRAPH=$(normalize_call_graph "$CALL_GRAPH")
+
+    check_prereqs "$OFFCPU_METHOD" || exit 1
+    mkdir -p "$OUTPUT_DIR"
+
+    local CONTAINERD_CPUS="$CPUS"
+    local DURATION="live"
+
+    cat > "${OUTPUT_DIR}/metadata.txt" <<EOF
+抓取时间: $(date '+%Y-%m-%d %H:%M:%S')
+模式: capture-live（采样至 SIGTERM/SIGINT）
+CPUs: $CONTAINERD_CPUS
+采样频率: ${FREQUENCY} Hz
+On-CPU call-graph: ${CALL_GRAPH}
+Off-CPU 方法: perf record -C ${CONTAINERD_CPUS} sched events + inject -s
+Title prefix: ${TITLE_PREFIX}
+内核版本: $(uname -r)
+EOF
+
+    local -a oncpu_cg_args
+    if [ "$CALL_GRAPH" = "fp" ]; then
+        oncpu_cg_args=(-g)
+    else
+        oncpu_cg_args=(--call-graph "$CALL_GRAPH")
+    fi
+
+    echo "[perf] capture-live 启动（CPUs=$CONTAINERD_CPUS，直到收到停止信号）"
+    echo "[perf] 输出: $OUTPUT_DIR"
+
+    # 超长 sleep：由 SIGINT 提前结束，对齐 benchmark 窗口
+    local LIVE_SLEEP=86400
+
+    echo "[perf] 启动 on-CPU perf record..."
+    perf record \
+        -F "$FREQUENCY" \
+        "${oncpu_cg_args[@]}" \
+        -C "$CONTAINERD_CPUS" \
+        -o "${OUTPUT_DIR}/perf_on_cpu.data" \
+        -- sleep "$LIVE_SLEEP" &
+    ONCPU_PID=$!
+    echo "[perf]   on-CPU  PID: $ONCPU_PID"
+
+    if [ -w /proc/sys/kernel/sched_schedstats ]; then
+        echo 1 > /proc/sys/kernel/sched_schedstats
+    fi
+    if [ -w /proc/sys/kernel/perf_event_mlock_kb ]; then
+        echo 262144 > /proc/sys/kernel/perf_event_mlock_kb 2>/dev/null || true
+    fi
+
+    echo "[perf] 启动 off-CPU perf record..."
+    perf record \
+        -g \
+        -m 4096 \
+        -C "$CONTAINERD_CPUS" \
+        -e sched:sched_stat_sleep \
+        -e sched:sched_stat_iowait \
+        -e sched:sched_stat_blocked \
+        -e sched:sched_switch \
+        -e sched:sched_process_exit \
+        -o "${OUTPUT_DIR}/perf_off_cpu.raw" \
+        -- sleep "$LIVE_SLEEP" &
+    OFFCPU_PID=$!
+    echo "[perf]   off-CPU PID: $OFFCPU_PID"
+
+    echo "$ONCPU_PID" > "${OUTPUT_DIR}/oncpu.pid"
+    echo "$OFFCPU_PID" > "${OUTPUT_DIR}/offcpu.pid"
+    date +%s > "${OUTPUT_DIR}/capture.ready"
+
+    _live_stopping=0
+    _live_stop() {
+        if [ "$_live_stopping" -eq 1 ]; then
+            return
+        fi
+        _live_stopping=1
+        echo "[perf] capture-live 收到停止信号，结束采样..."
+        kill -INT "$ONCPU_PID" 2>/dev/null || true
+        kill -INT "$OFFCPU_PID" 2>/dev/null || true
+    }
+    trap '_live_stop' INT TERM
+
+    # 等到子进程结束（被 INT）或本进程被 signal
+    wait "$ONCPU_PID" 2>/dev/null || true
+    wait "$OFFCPU_PID" 2>/dev/null || true
+    trap - INT TERM
+
+    echo "[perf]   on-CPU  data: $(du -h "${OUTPUT_DIR}/perf_on_cpu.data" 2>/dev/null | cut -f1 || echo '?')"
+    if [ -s "${OUTPUT_DIR}/perf_off_cpu.raw" ]; then
+        echo "[perf]   perf inject -s..."
+        if perf inject -v -s -i "${OUTPUT_DIR}/perf_off_cpu.raw" \
+            -o "${OUTPUT_DIR}/perf_off_cpu.data" 2>/dev/null; then
+            rm -f "${OUTPUT_DIR}/perf_off_cpu.raw"
+        else
+            echo "[perf]   警告: perf inject 失败，保留 raw"
+            mv "${OUTPUT_DIR}/perf_off_cpu.raw" "${OUTPUT_DIR}/perf_off_cpu.data"
+        fi
+    fi
+
+    echo "[perf] 生成火焰图..."
+    local cpus_file_name
+    cpus_file_name=$(echo "$CONTAINERD_CPUS" | tr ',' '-')
+    local wall_note="bench-window"
+
+    if [ -f "${OUTPUT_DIR}/perf_on_cpu.data" ] && [ -s "${OUTPUT_DIR}/perf_on_cpu.data" ]; then
+        local on_svg="${OUTPUT_DIR}/on_cpu_${cpus_file_name}.svg"
+        echo "[perf]   $(basename "$on_svg") ..."
+        if generate_oncpu_flamegraph "${OUTPUT_DIR}/perf_on_cpu.data" \
+            "${TITLE_PREFIX} on-CPU (CPUs $CONTAINERD_CPUS, ${wall_note}, ${FREQUENCY}Hz)" \
+            "$on_svg" "hot"; then
+            echo "[perf]     OK ($(du -h "$on_svg" | cut -f1))"
+        else
+            echo "[perf]     警告: on-CPU SVG 生成失败"
+        fi
+    fi
+
+    local off_svg="${OUTPUT_DIR}/off_cpu_${cpus_file_name}.svg"
+    if [ -f "${OUTPUT_DIR}/perf_off_cpu.data" ] && [ -s "${OUTPUT_DIR}/perf_off_cpu.data" ]; then
+        echo "[perf]   $(basename "$off_svg") ..."
+        if generate_offcpu_flamegraph_perf "${OUTPUT_DIR}/perf_off_cpu.data" \
+            "${TITLE_PREFIX} off-CPU (CPUs $CONTAINERD_CPUS, ${wall_note})" \
+            "$off_svg"; then
+            echo "[perf]     OK ($(du -h "$off_svg" | cut -f1))"
+        else
+            echo "[perf]     警告: off-CPU SVG 生成失败"
+        fi
+    fi
+
+    rm -f "${OUTPUT_DIR}/capture.ready" "${OUTPUT_DIR}/oncpu.pid" "${OUTPUT_DIR}/offcpu.pid"
+    echo "[perf] capture-live 完成 → $OUTPUT_DIR"
+}
+
+# ============================================================
 # 主入口
 # ============================================================
 usage() {
     echo "用法: $0 <command> [options]"
     echo ""
     echo "命令:"
-    echo "  capture   抓取 on/off CPU 火焰图"
-    echo "  analyze   从已有数据生成 SVG"
+    echo "  capture        抓取 on/off CPU 火焰图（固定 --duration）"
+    echo "  capture-live   抓取直到 SIGTERM/SIGINT（供 bench 对齐 wall 窗口）"
+    echo "  analyze        从已有数据生成 SVG"
     echo ""
     echo "capture 选项:"
     echo "  --output-dir DIR          输出目录（默认: results/perf）"
     echo "  --duration SEC            采样时长（默认: $DEFAULT_DURATION）"
     echo "  --frequency HZ            on-CPU 采样频率（默认: $DEFAULT_FREQUENCY）"
-    echo "  --offcpu-method METHOD    off-CPU 抓取方式: perf（默认）| perf"
+    echo "  --cpus CPUS               采样 CPU 列表（默认: 从 containerd.service 解析）"
+    echo "  --call-graph MODE         on-CPU 回溯: fp|dwarf|...（默认: $DEFAULT_CALL_GRAPH）"
+    echo "  --offcpu-method METHOD    off-CPU: perf（默认）| ebpf"
+    echo ""
+    echo "capture-live 选项:"
+    echo "  --output-dir DIR          输出目录（必需）"
+    echo "  --cpus CPUS               采样 CPU（必需）"
+    echo "  --frequency HZ            on-CPU 采样频率"
+    echo "  --call-graph MODE         on-CPU 回溯"
+    echo "  --offcpu-method perf      仅支持 perf（按 -C）"
+    echo "  --title-prefix STR        火焰图标题前缀（默认: perf）"
     echo ""
     echo "analyze 用法:"
     echo "  $0 analyze <OUTPUT_DIR>"
@@ -577,8 +769,9 @@ COMMAND="$1"
 shift
 
 case "$COMMAND" in
-    capture)  cmd_capture "$@" ;;
-    analyze)  cmd_analyze "$@" ;;
+    capture)       cmd_capture "$@" ;;
+    capture-live)  cmd_capture_live "$@" ;;
+    analyze)       cmd_analyze "$@" ;;
     -h|--help|help) usage ;;
     *)
         echo "错误: 未知命令 '$COMMAND'"
