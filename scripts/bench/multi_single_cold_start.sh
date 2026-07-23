@@ -39,8 +39,8 @@
 #
 # 前置条件:
 #     - numactl 已安装
-#     - scripts/single_cold_start.py 可用
-#     - scripts/setup.sh 已执行
+#     - scripts/bench/single_cold_start.py 可用
+#     - scripts/setup/setup.sh 已执行
 #
 
 set -euo pipefail
@@ -190,6 +190,7 @@ fi
 
 # 定位 single_cold_start.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE_DIR="$(cd "${SCRIPT_DIR}/../profile" && pwd)"
 SINGLE_PY="${SCRIPT_DIR}/single_cold_start.py"
 if [ ! -f "$SINGLE_PY" ]; then
     echo "错误: 未找到 $SINGLE_PY"
@@ -278,7 +279,7 @@ if $PPROF; then
         fi
     fi
     PPROF_SERIES_DURATION="$PPROF_CPU_SECONDS"
-    PPROF_SCRIPT="${SCRIPT_DIR}/containerd_pprof.sh"
+    PPROF_SCRIPT="${PROFILE_DIR}/containerd_pprof.sh"
     if [ ! -f "$PPROF_SCRIPT" ]; then
         echo "错误: 未找到 pprof 脚本: $PPROF_SCRIPT"
         exit 1
@@ -295,7 +296,7 @@ if $PERF; then
             PERF_DURATION=30
         fi
     fi
-    PERF_SCRIPT="${SCRIPT_DIR}/containerd_perf.sh"
+    PERF_SCRIPT="${PROFILE_DIR}/containerd_perf.sh"
     if [ ! -f "$PERF_SCRIPT" ]; then
         echo "错误: 未找到 perf 脚本: $PERF_SCRIPT"
         exit 1
@@ -315,7 +316,7 @@ if $PERF_SANDBOX; then
             PERF_DURATION=30
         fi
     fi
-    PERF_SANDBOX_SCRIPT="${SCRIPT_DIR}/containerd_perf.sh"
+    PERF_SANDBOX_SCRIPT="${PROFILE_DIR}/containerd_perf.sh"
     if [ ! -f "$PERF_SANDBOX_SCRIPT" ]; then
         echo "错误: 未找到 perf 脚本: $PERF_SANDBOX_SCRIPT"
         exit 1
@@ -330,7 +331,7 @@ if $RESOURCES; then
     else
         RESOURCE_DURATION=30
     fi
-    RESOURCES_SCRIPT="${SCRIPT_DIR}/system_resources.sh"
+    RESOURCES_SCRIPT="${PROFILE_DIR}/system_resources.sh"
     if [ ! -f "$RESOURCES_SCRIPT" ]; then
         echo "错误: 未找到资源采集脚本: $RESOURCES_SCRIPT"
         exit 1
@@ -550,7 +551,7 @@ if $RESOURCES && [ -n "$RESOURCE_PID" ]; then
         "${RESOURCES_SCRIPT}" summarize "${RESOURCE_OUTPUT_DIR}" || \
             echo "[resources] ⚠ 汇总过程中出现问题"
         echo "[resources] 开始关联分析..."
-        python3 "${SCRIPT_DIR}/resource_analyzer.py" "${RESULT_DIR}" || \
+        python3 "${PROFILE_DIR}/resource_analyzer.py" "${RESULT_DIR}" || \
             echo "[resources] ⚠ 关联分析过程中出现问题"
     else
         echo "[resources] ⚠ 采样失败 (exit=$?)"
@@ -637,7 +638,7 @@ if $PROFILE; then
 
     if [ "$log_size" -gt 0 ]; then
         echo ""
-        python3 "${SCRIPT_DIR}/trace_analyzer.py" "$PROFILE_LOG" --summary-tree || \
+        python3 "${PROFILE_DIR}/trace_analyzer.py" "$PROFILE_LOG" --summary-tree || \
             echo "[profile] ⚠ 未在日志中找到 trace span（containerd 可能未配置 TRACE 级别日志）"
     else
         echo "[profile] ⚠ containerd 日志为空（可能未开启 TRACE 级别日志）"

@@ -613,7 +613,7 @@ DEL：`Delete` POSTROUTING 跳转 → `ClearChain` → `DeleteChain`。
 转发（isGateway）≠ 出网伪装（ipMasq）
 ```
 
-关 `ipMasq` 后若仍要出网，本仓库用 **节点级一条** 规则替代 per-sandbox 链（`scripts/setup.sh --ip-masq false`）：
+关 `ipMasq` 后若仍要出网，本仓库用 **节点级一条** 规则替代 per-sandbox 链（`scripts/setup/setup.sh --ip-masq false`）：
 
 ```text
 -A POSTROUTING -s 10.0.0.0/12 ! -o cni0 -j MASQUERADE
@@ -661,9 +661,9 @@ containerd 侧 **看不到** `ipMasq` 开关；trace 上只表现为 `cni.plugin
 复现：
 
 ```bash
-bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
+bash scripts/setup/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
 # 或改回 per-sandbox：
-bash scripts/setup.sh --cni-type bridge --ip-masq true
+bash scripts/setup/setup.sh --cni-type bridge --ip-masq true
 ```
 
 ---

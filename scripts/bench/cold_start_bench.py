@@ -6,7 +6,7 @@ Pod 沙箱冷启动时延测试（基于 crictl）
 
 用法:
     # 首次使用先准备环境
-    ./scripts/setup.sh
+    ./scripts/setup/setup.sh
 
     # 运行测试
     python3 cold_start_bench.py --runs 50 --output cold_start_report.json
@@ -27,10 +27,12 @@ import os
 import datetime
 import math
 
-# 允许 import 同目录下的 trace_analyzer
+# 允许 import scripts/profile/trace_analyzer
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-if _script_dir not in sys.path:
-    sys.path.insert(0, _script_dir)
+_profile_dir = os.path.normpath(os.path.join(_script_dir, "..", "profile"))
+for _p in (_script_dir, _profile_dir):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import trace_analyzer
 
 

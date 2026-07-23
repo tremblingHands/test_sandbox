@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PERF_SCRIPT="${SCRIPT_DIR}/../containerd_perf.sh"
+PERF_SCRIPT="${SCRIPT_DIR}/../../profile/containerd_perf.sh"
 KTRACE_SCRIPT="${SCRIPT_DIR}/ipvlan_kfunc_trace.sh"
 
 N=100

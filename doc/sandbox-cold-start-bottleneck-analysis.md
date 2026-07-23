@@ -23,7 +23,7 @@
 | perf | `.../perf/` | containerd CPU 1–4 on/off-CPU 火焰图 |
 | resources | `.../resources/` | 系统资源时序与延迟关联报告 |
 
-采集入口：`scripts/multi_single_cold_start.sh`（`--profile --pprof --perf --resources`）。
+采集入口：`scripts/bench/multi_single_cold_start.sh`（`--profile --pprof --perf --resources`）。
 
 ---
 
@@ -469,7 +469,7 @@ sudo dmesg -n 7
 
 #### 对照实验：`ipMasq: false`（关 printk 之上，已完成）
 
-在 **`0d91342dba12` 关 printk** 不变的前提下，仅将 CNI 配置改为 `"ipMasq": false`（`scripts/setup.sh --cni-type bridge --ip-masq false`），去掉每沙箱 `SetupIPMasq` → `iptables`/`nft` 写 NAT。数据目录：
+在 **`0d91342dba12` 关 printk** 不变的前提下，仅将 CNI 配置改为 `"ipMasq": false`（`scripts/setup/setup.sh --cni-type bridge --ip-masq false`），去掉每沙箱 `SetupIPMasq` → `iptables`/`nft` 写 NAT。数据目录：
 
 | 场景 | 路径 |
 |------|------|
@@ -541,7 +541,7 @@ N 个沙箱 → N 条 POSTROUTING 跳转 + N 条 `CNI-*` 链；DEL 时拆除。�
 复现 / 日常配置：
 
 ```bash
-bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
+bash scripts/setup/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
 ```
 
 脚本会：① 把 `/etc/cni/net.d/10-mynet.conf` 的 `"ipMasq"` 设为 `false`；② 若不存在则添加上述节点级规则；③ 若改回 `--ip-masq true` 则删除该节点级规则，改由 CNI 维护。重启后 iptables 可能丢失，需重跑 `setup.sh` 或自行做 iptables 持久化。
@@ -550,7 +550,7 @@ bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
 
 关 printk + `ipMasq: false` 后，`cni.setup` Avg 可降到 **~386ms**，CNI 不再是头号阶段。但本机 IPAM 是 **host-local**：自动分配时在目录 flock 内对 `/var/lib/cni/networks/mynet/` 做 **`GetByID` → `filepath.Walk` + 逐文件 `ReadFile`**（防重复分配），复杂度随**已占用 IP 文件数**增长（详见 `doc/cni-bridge-network-analysis.md` §9）。
 
-用 `scripts/hostlocal_prefill.sh` 预填占位文件，使 Walk 基数固定，与「目录较干净」的关 masq 基线对照：
+用 `scripts/net/hostlocal_prefill.sh` 预填占位文件，使 Walk 基数固定，与「目录较干净」的关 masq 基线对照：
 
 | 场景 | 路径 |
 |------|------|
@@ -577,12 +577,12 @@ bash scripts/setup.sh --cni-type bridge --snapshotter overlayfs --ip-masq false
 
 ```bash
 # 空目录对照（建议补跑并带 --resources 算吞吐）
-bash scripts/hostlocal_prefill.sh clear
+bash scripts/net/hostlocal_prefill.sh clear
 # … 再跑 multi_single_cold_start …
 
 # 预填 5000
-bash scripts/hostlocal_prefill.sh clear
-bash scripts/hostlocal_prefill.sh prefill 5000
+bash scripts/net/hostlocal_prefill.sh clear
+bash scripts/net/hostlocal_prefill.sh prefill 5000
 # … 同配置压测，结果目录带 hostlocal-prefill5000 …
 ```
 
@@ -686,7 +686,7 @@ off-CPU 上 `loopback_net_init → register_netdev → rtnl_lock_killable` 对�
 | `shim.cgroup.load` | create 后 `loadProcessCgroup` | 按 init pid 加载 cgroup 句柄 |
 | `shim.manager.start` / `binary.exec.*` | 启 shim 进程 | `exec.start` + **`exec.wait`**（等就绪） |
 
-进一步可在 `/home/nathan/runc` 打同格式 TRACE，拆开 `runc.create` 内部（见 §13）。安装带 TRACE 的 **shim + runc** 后，`--profile` 会合并 journal 与 `/tmp/runc-trace.log`，再用 `scripts/trace_analyzer.py --summary-tree` 看子阶段。亦可继续用 `--perf_sandbox` 交叉验证。
+进一步可在 `/home/nathan/runc` 打同格式 TRACE，拆开 `runc.create` 内部（见 §13）。安装带 TRACE 的 **shim + runc** 后，`--profile` 会合并 journal 与 `/tmp/runc-trace.log`，再用 `scripts/profile/trace_analyzer.py --summary-tree` 看子阶段。亦可继续用 `--perf_sandbox` 交叉验证。
 
 ### 8.3 小结（瓶颈 B）
 
@@ -1120,7 +1120,7 @@ wait.for_ready ~1.2s  →  pivotRoot(~0.4s)
 | C. **仅关 `ipMasq`**（已做） | 去掉本配置的 xtables 叠加；出网改节点级 MASQ | 在关 printk 上：吞吐 **15.1→17.3/s**；`cni.setup` **1.21s→386ms**；iptables on-CPU **~25%→0%**；`setup.sh --ip-masq false` 自动加 `-s 10.0.0.0/12 ! -o cni0`（见 §7.5） |
 | C2. `dmesg -n 4`（压测前） | 抑制 bridge STP INFO 上串口 | `pl011_console_write` / `printk` 帧大降；`br_info` 仍执行，RTNL 仍在 |
 | C3. **内核关 netlink/`br_info` printk**（`0d91342dba12`，已做） | 从源码去掉配网热路径 `printk` | 吞吐 **~12.8→15.1/s**；`cni.setup` Avg **5.15→1.21s**；`rtnl_setlink` **~7.3%→0.4%**（见 §7.5） |
-| C4. **host-local 预填 5000**（已做） | 量化 `GetByID` Walk | 关 masq 上：`cni.setup` **386ms→8.83s**（约 ×23）；`scripts/hostlocal_prefill.sh`（见 §7.5） |
+| C4. **host-local 预填 5000**（已做） | 量化 `GetByID` Walk | 关 masq 上：`cni.setup` **386ms→8.83s**（约 ×23）；`scripts/net/hostlocal_prefill.sh`（见 §7.5） |
 | C5. **host-local 旁路索引 `by_id.idx`**（已做） | 去掉/缩短脏目录 Walk | **相对干净目录基线端到端未见效果**：run ~7.5s、`cni.setup` ~342ms vs 基线 386ms；NewTask 仍主导（见 §7.5） |
 | C6. **runc：缺失控制器跳过 mountinfo**（已做） | `subsys.misc` 扫 mountinfo | `initPaths` **~870ms→~28ms**；`runc.create` **~1.9s→~694ms**；run ~6.45s；当时头号换 **NewContainer**（见 §8.4） |
 | C7. **细粒度 TRACE 复测**（已做，2026-07-21） | 拆 NewTask / runc / bbolt | run ~6.36s；**NewTask ~3.77s 再成头号**；暴露 `cgroup.apply` / `shim.cgroup.load` / `init.sync` wait（见 §8.5） |
@@ -1379,7 +1379,7 @@ done
 
 ```bash
 cd /home/nathan/sandbox-tests
-./scripts/multi_single_cold_start.sh 128-131 4 1 --profile -- \
+./scripts/bench/multi_single_cold_start.sh 128-131 4 1 --profile -- \
   --duration 15 --preconfig 5 --cleanup
 ```
 
@@ -1391,11 +1391,11 @@ cd /home/nathan/sandbox-tests
 
 ```bash
 # 直接抓取
-sudo ./scripts/containerd_perf.sh capture \
+sudo ./scripts/profile/containerd_perf.sh capture \
   --output-dir /tmp/perf-dwarf --duration 30 --call-graph dwarf,65528
 
 # 压测入口
-./scripts/multi_single_cold_start.sh 128-131 4 1 \
+./scripts/bench/multi_single_cold_start.sh 128-131 4 1 \
   --profile --perf --perf-call-graph dwarf,65528 --perf_sandbox -- \
   --duration 30 --cpuset-cpus 128-131 --cleanup
 ```
@@ -1422,17 +1422,17 @@ RESULT=tmp/containerd-0-127_workers-cores-128-255_workers-nums-127_sandbox-0-255
 
 cat "$RESULT/profile"
 cat "$RESULT/resources/report.md"
-python3 scripts/resource_analyzer.py "$RESULT"
+python3 scripts/profile/resource_analyzer.py "$RESULT"
 
 less "$RESULT/pprof/pprof_analysis.txt"
-scripts/containerd_pprof.sh analyze "$RESULT/pprof"
+scripts/profile/containerd_pprof.sh analyze "$RESULT/pprof"
 go tool pprof -http=:8080 "$RESULT/pprof/cpu.pprof"
 
 ls "$RESULT/perf"/*.svg
 ```
 
 ```bash
-./scripts/multi_single_cold_start.sh 128-255 128 1 \
+./scripts/bench/multi_single_cold_start.sh 128-255 128 1 \
   --profile --pprof --perf --resources \
   -- --duration 60 --cpuset-cpus 0-255 --cpuset-mems 0-1 --preconfig 50
 ```

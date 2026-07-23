@@ -10,7 +10,7 @@
     python3 single_cold_start.py --duration 60 --cleanup --cpuset-cpus 0-3
 
 前置条件:
-    ./scripts/setup.sh
+    ./scripts/setup/setup.sh
 """
 
 import time

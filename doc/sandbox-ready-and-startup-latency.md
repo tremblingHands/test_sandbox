@@ -256,7 +256,7 @@ done
 | 统计 | p50 / p95 / p99，去掉首尾异常值 |
 | 注意 | 第一次可能含镜像拉取，需预热或剔除 |
 
-本仓库压测脚本（高并发）：`scripts/multi_single_cold_start.sh`。
+本仓库压测脚本（高并发）：`scripts/bench/multi_single_cold_start.sh`。
 
 ### 4.3 方案 B：分阶段拆解（定位瓶颈）
 

@@ -19,7 +19,7 @@
 | perf | `.../perf/`（containerd 核 1–4 on/off-CPU） |
 | resources | `.../resources/`（`report.md` / `summary.json` / `metadata.json`） |
 
-采集入口：`scripts/multi_single_cold_start.sh`（`--profile --pprof --perf --resources`）。
+采集入口：`scripts/bench/multi_single_cold_start.sh`（`--profile --pprof --perf --resources`）。
 
 ### 1.3 相关文档
 
@@ -1030,7 +1030,7 @@ host-device 等把宿主机网卡迁入容器、目标名已是 eth0 时，容�
 
 ```bash
 # CNI：/etc/cni/net.d/10-mynet.conf 使用本文 §2.2 的 ipvlan-l3
-bash scripts/multi_single_cold_start.sh 128-255 128 1 \
+bash scripts/bench/multi_single_cold_start.sh 128-255 128 1 \
   --profile --pprof --perf --resources -- \
   --duration 60 --cpuset-cpus "0-255" --cpuset-mems "0-1" --preconfig 50
 

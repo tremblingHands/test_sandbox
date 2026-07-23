@@ -14,7 +14,7 @@ Pod 沙箱最大并发数评估（基于 crictl）
     python3 max_concurrency.py              # 无上限，直到失败
 
 前置条件:
-    ./scripts/setup.sh
+    ./scripts/setup/setup.sh
 """
 
 import time

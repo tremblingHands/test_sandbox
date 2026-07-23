@@ -4,10 +4,10 @@
 # host-local IPAM 目录预填 / 清空，用于量化 GetByID filepath.Walk 成本。
 #
 # 用法:
-#   ./scripts/hostlocal_prefill.sh status
-#   ./scripts/hostlocal_prefill.sh clear
-#   ./scripts/hostlocal_prefill.sh prefill 5000
-#   ./scripts/hostlocal_prefill.sh prefill 5000 --start 10.0.0.2
+#   ./scripts/net/hostlocal_prefill.sh status
+#   ./scripts/net/hostlocal_prefill.sh clear
+#   ./scripts/net/hostlocal_prefill.sh prefill 5000
+#   ./scripts/net/hostlocal_prefill.sh prefill 5000 --start 10.0.0.2
 #
 # 说明:
 #   - 数据目录默认 /var/lib/cni/networks/mynet（与 setup.sh bridge 一致）
@@ -34,12 +34,12 @@ usage() {
 示例（Walk 对照）:
   # A: 空目录
   $0 clear
-  bash scripts/multi_single_cold_start.sh 128-255 128 1 --profile -- \\
+  bash scripts/bench/multi_single_cold_start.sh 128-255 128 1 --profile -- \\
     -- --duration 60 --cpuset-cpus 0-255 --cpuset-mems 0-1 --preconfig 50
 
   # B: 预填 5000 后再压
   $0 clear && $0 prefill 5000
-  bash scripts/multi_single_cold_start.sh 128-255 128 1 --profile -- \\
+  bash scripts/bench/multi_single_cold_start.sh 128-255 128 1 --profile -- \\
     -- --duration 60 --cpuset-cpus 0-255 --cpuset-mems 0-1 --preconfig 50
 EOF
 }

@@ -5,7 +5,7 @@
 遍历并发线程数 (1,2,4,8,...N), 每级运行固定时间, 测量吞吐量和延迟。
 
 用法:
-    python3 scripts/scale_bench.py --max-concurrency 256 --duration 30
+    python3 scripts/bench/scale_bench.py --max-concurrency 256 --duration 30
 """
 
 import time

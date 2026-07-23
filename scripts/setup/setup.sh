@@ -941,10 +941,10 @@ main() {
     echo ""
     echo "下一步:"
     echo "  # 单发冷启动测试"
-    echo "  python3 scripts/cold_start_bench.py --runs 50"
+    echo "  python3 scripts/bench/cold_start_bench.py --runs 50"
     echo ""
     echo "  # 并发冷启动测试"
-    echo "  ./scripts/concurrent_cold_start.sh 10 3"
+    echo "  ./scripts/bench/concurrent_cold_start.py 10 3"
     echo ""
     if [ "$CNI_TYPE" = "bridge" ] && [ "$IP_MASQ" = "false" ]; then
         echo "提示: bridge + ipMasq=false 已由本脚本配置节点级出网规则:"

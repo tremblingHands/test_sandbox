@@ -10,7 +10,7 @@
 #   multi_single 的 NUMA（membind）= --worker-numa
 #
 # 用法:
-#   ./scripts/throughput_sweep.sh \
+#   ./scripts/bench/throughput_sweep.sh \
 #     --containerd-cpus 2,4,8 \
 #     --worker-cpus 64,128 \
 #     --worker-numa 0,1 \
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MULTI_SCRIPT="${SCRIPT_DIR}/multi_single_cold_start.sh"
 
 HOST_CPUS=""
@@ -70,7 +70,7 @@ usage() {
 不够则 skip。workers 与 containerd 永不重叠。
 
 示例:
-  ./scripts/throughput_sweep.sh \
+  ./scripts/bench/throughput_sweep.sh \
     --containerd-cpus 2,4,8 \
     --worker-cpus 64,128 \
     --worker-numa 0,1 \
@@ -79,7 +79,7 @@ usage() {
     --duration 30 --preconfig 50
 
   # 只打印组合、不压测:
-  ./scripts/throughput_sweep.sh \
+  ./scripts/bench/throughput_sweep.sh \
     --containerd-cpus 2,4 --worker-cpus 64,128 \
     --worker-numa 0,1 --workers 64,128 --dry-run
 EOF

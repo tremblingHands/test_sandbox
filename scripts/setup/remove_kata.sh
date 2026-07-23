@@ -3,8 +3,8 @@
 # 删除 kata-runtime — 清理 kata 二进制与 containerd 配置
 #
 # 用法:
-#   ./scripts/remove_kata.sh           # 完整删除
-#   ./scripts/remove_kata.sh --dry-run # 仅展示将要删除的内容
+#   ./scripts/setup/remove_kata.sh           # 完整删除
+#   ./scripts/setup/remove_kata.sh --dry-run # 仅展示将要删除的内容
 # ============================================================
 set -euo pipefail
 

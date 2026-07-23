@@ -230,10 +230,10 @@
 
 ```bash
 # 完整安装
-./scripts/setup.sh
+./scripts/setup/setup.sh
 
 # 或仅检查不安装
-./scripts/setup.sh --check-only
+./scripts/setup/setup.sh --check-only
 ```
 
 脚本自动检查以下 5 项：
@@ -246,13 +246,13 @@
 | crictl 连接 containerd | 写入 `/etc/crictl.yaml` |
 | pause 镜像缓存 | `crictl pull` |
 
-#### 4.2.2 单发冷启动测试 → [`scripts/cold_start_bench.py`](scripts/cold_start_bench.py)
+#### 4.2.2 单发冷启动测试 → [`scripts/bench/cold_start_bench.py`](scripts/bench/cold_start_bench.py)
 
 逐次创建 Pod 沙箱，测量 `RunPodSandbox` API 响应时间（t_runp）和就绪等待时间（t_ready），输出 P50/P95/P99 统计报告。
 
 ```bash
 # 用法
-python3 scripts/cold_start_bench.py --runs 50 --output cold_start_report.json
+python3 scripts/bench/cold_start_bench.py --runs 50 --output cold_start_report.json
 ```
 
 核心流程：
@@ -261,17 +261,17 @@ python3 scripts/cold_start_bench.py --runs 50 --output cold_start_report.json
 3. 轮询 `crictl inspectp` 直到 `SANDBOX_READY` → 计时 t_ready
 4. `crictl stopp` / `crictl rmp` → 清理，进入下一轮
 
-#### 4.2.3 并发冷启动测试 → [`scripts/concurrent_cold_start.sh`](scripts/concurrent_cold_start.sh)
+#### 4.2.3 并发冷启动测试 → [`scripts/bench/concurrent_cold_start.py`](scripts/bench/concurrent_cold_start.py)
 
 同时发起 N 个 `crictl runp`，测量并发下的单次延迟分布和挂钟总耗时。
 
 ```bash
 # 用法
-./scripts/concurrent_cold_start.sh <并发数> <轮次>
+./scripts/bench/concurrent_cold_start.py <并发数> <轮次>
 
 # 示例
-./scripts/concurrent_cold_start.sh 10 3     # 10 并发，3 轮
-./scripts/concurrent_cold_start.sh 50       # 50 并发，默认 3 轮
+./scripts/bench/concurrent_cold_start.py 10 3     # 10 并发，3 轮
+./scripts/bench/concurrent_cold_start.py 50       # 50 并发，默认 3 轮
 ```
 
 核心流程：

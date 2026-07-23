@@ -16,12 +16,12 @@
 #   https://gitee.com/omnihorizon/plugins.git
 #
 # 用法:
-#   ./scripts/build_install_runtime.sh --mode debug
-#   ./scripts/build_install_runtime.sh --mode release
-#   ./scripts/build_install_runtime.sh --mode debug --only cni
-#   ./scripts/build_install_runtime.sh --mode release --only containerd,runc
-#   ./scripts/build_install_runtime.sh --mode debug --no-restart
-#   ./scripts/build_install_runtime.sh --mode release --no-backup
+#   ./scripts/setup/build_install_runtime.sh --mode debug
+#   ./scripts/setup/build_install_runtime.sh --mode release
+#   ./scripts/setup/build_install_runtime.sh --mode debug --only cni
+#   ./scripts/setup/build_install_runtime.sh --mode release --only containerd,runc
+#   ./scripts/setup/build_install_runtime.sh --mode debug --no-restart
+#   ./scripts/setup/build_install_runtime.sh --mode release --no-backup
 #
 # 默认源码根: /home/nathan/{containerd,runc,plugins}
 # ============================================================
@@ -73,14 +73,14 @@ usage() {
   https://gitee.com/omnihorizon/plugins.git
 
 用法:
-  ./scripts/build_install_runtime.sh --mode debug     # profile 分支
-  ./scripts/build_install_runtime.sh --mode release   # 正式 commit
-  ./scripts/build_install_runtime.sh debug
-  ./scripts/build_install_runtime.sh --mode debug --only cni
-  ./scripts/build_install_runtime.sh --mode release --only containerd,runc,shim
-  ./scripts/build_install_runtime.sh --mode debug --no-restart
-  ./scripts/build_install_runtime.sh --mode release --no-backup
-  ./scripts/build_install_runtime.sh --mode debug --force-checkout
+  ./scripts/setup/build_install_runtime.sh --mode debug     # profile 分支
+  ./scripts/setup/build_install_runtime.sh --mode release   # 正式 commit
+  ./scripts/setup/build_install_runtime.sh debug
+  ./scripts/setup/build_install_runtime.sh --mode debug --only cni
+  ./scripts/setup/build_install_runtime.sh --mode release --only containerd,runc,shim
+  ./scripts/setup/build_install_runtime.sh --mode debug --no-restart
+  ./scripts/setup/build_install_runtime.sh --mode release --no-backup
+  ./scripts/setup/build_install_runtime.sh --mode debug --force-checkout
 
 模式与源码 ref:
   debug   → containerd:profile  runc:profile_cgroup-misc  plugins:profile

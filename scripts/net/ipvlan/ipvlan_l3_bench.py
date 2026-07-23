@@ -16,11 +16,11 @@ ipvlan-l3 CNI 热路径 benchmark（对齐沙箱冷启动配网，不跑完整 s
   --mode netlink  用 ip/netlink 重放同序操作（无插件/IPAM，对照 RTNL）
 
 用法:
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 60
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 64 --duration 30 --master eth0
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 8 --duration 30 --precreate-netns 800 --with-lo
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 128 --duration 60
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 64 --duration 30 --master eth0
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 8 --duration 30 --precreate-netns 800 --with-lo
   # 仅在 benchmark 窗口调用 containerd_perf.sh 采 on/off-CPU 火焰图:
-  numactl -C 1-4 python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 \
+  numactl -C 1-4 python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 \
       --precreate-netns 1024 --perf-cpus 1-4
 """
 
@@ -507,7 +507,7 @@ def which(cmd):
 
 def _perf_script_path():
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "..", "containerd_perf.sh")
+    return os.path.join(here, "..", "..", "profile", "containerd_perf.sh")
 
 
 def start_perf_capture_live(cpus, out_dir, freq=99, call_graph="fp"):
@@ -601,12 +601,12 @@ def main():
         formatter_class=_HelpFormatter,
         epilog="""
 示例:
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 60
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 64 --duration 30 --master eth0
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 --mode netlink
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 8 --duration 30 --precreate-netns 800 --with-lo
-  python3 scripts/ipvlan/ipvlan_l3_bench.py -c 32 --duration 30 --no-netns --mode netlink
-  numactl -C 1-4 python3 scripts/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 \
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 128 --duration 60
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 64 --duration 30 --master eth0
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 --mode netlink
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 8 --duration 30 --precreate-netns 800 --with-lo
+  python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 32 --duration 30 --no-netns --mode netlink
+  numactl -C 1-4 python3 scripts/net/ipvlan/ipvlan_l3_bench.py -c 128 --duration 30 \
       --precreate-netns 1024 --perf-cpus 1-4
 """,
     )

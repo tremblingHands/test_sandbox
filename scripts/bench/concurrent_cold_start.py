@@ -22,7 +22,7 @@
         --concurrency 5 --duration 30 --rounds 3 --mode continuous
 
 前置条件:
-    ./scripts/setup.sh
+    ./scripts/setup/setup.sh
 """
 
 import time
