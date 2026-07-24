@@ -8,7 +8,8 @@
 # 用法:
 #   sudo $0 100 eth0 --cpus 128
 #   sudo $0 100 eth0 --cpus 128 --perf
-#   sudo $0 200 eth0 --cpus 128 --ktrace
+#   sudo $0 1000 eth0 --cpus 128 --ktrace --ktrace-mode filter \
+#       --ktrace-funcs '*netlink*,*ipvlan*,*netdev*' --ktrace-funcs-max 512
 #   sudo $0 200 eth0 --cpus 128 --perf --ktrace
 set -euo pipefail
 
@@ -25,7 +26,9 @@ PERF_CALL_GRAPH=fp
 OUT_DIR=""
 KTRACE=0
 KTRACE_FUNCS=""
+KTRACE_FUNCS_MAX=""
 KTRACE_CPUS=""
+KTRACE_MODE=""
 
 usage() {
     cat <<EOF
@@ -41,8 +44,10 @@ usage() {
   --perf-freq HZ        on-CPU 采样频率（默认: ${PERF_FREQ}）
   --perf-call-graph M   on-CPU call-graph: fp|dwarf|...（默认: ${PERF_CALL_GRAPH}）
   --ktrace              bench 窗口抓内核函数时延（调用 ipvlan_kfunc_trace.sh）
-  --ktrace-funcs LIST   逗号分隔函数名（默认见 ipvlan_kfunc_trace.sh）
+  --ktrace-funcs LIST   逗号分隔；精确名或 ftrace glob（如 ipvlan_*；默认见 ktrace 脚本）
+  --ktrace-funcs-max N  展开后函数数上限（默认见 ipvlan_kfunc_trace.sh --funcs-max）
   --ktrace-cpus CPUS    ktrace 采样核（默认跟 --cpus）
+  --ktrace-mode MODE    graph|filter（默认 graph；见 ipvlan_kfunc_trace.sh --mode）
   --output DIR          输出根目录（默认: results/ipvlan_host_netlink_add/<ts>）
   -h, --help            帮助
 
@@ -52,8 +57,9 @@ usage() {
 示例:
   sudo \$0 100 eth0 --cpus 128
   sudo \$0 200 eth0 --cpus 128 --perf
-  sudo \$0 200 eth0 --cpus 128 --ktrace
-  sudo \$0 200 eth0 --cpus 128 --perf --ktrace
+  sudo \$0 1000 eth0 --cpus 128 --ktrace --ktrace-mode filter \\
+      --ktrace-funcs '*netlink*,*ipvlan*,*netdev*' --ktrace-funcs-max 512
+  sudo \$0 200 eth0 --cpus 128 --perf --ktrace --ktrace-mode graph
 EOF
 }
 
@@ -71,7 +77,9 @@ while [[ $# -gt 0 ]]; do
         --perf-call-graph) PERF_CALL_GRAPH="$2"; shift 2 ;;
         --ktrace)          KTRACE=1; shift ;;
         --ktrace-funcs)    KTRACE_FUNCS="$2"; KTRACE=1; shift 2 ;;
+        --ktrace-funcs-max) KTRACE_FUNCS_MAX="$2"; KTRACE=1; shift 2 ;;
         --ktrace-cpus)     KTRACE_CPUS="$2"; KTRACE=1; shift 2 ;;
+        --ktrace-mode)     KTRACE_MODE="$2"; KTRACE=1; shift 2 ;;
         --output)          OUT_DIR="$2"; shift 2 ;;
         -h|--help)         usage; exit 0 ;;
         --*)
@@ -109,6 +117,10 @@ fi
 # ktrace 采样核：显式 --ktrace-cpus > --cpus
 if [[ "$KTRACE" -eq 1 && -z "$KTRACE_CPUS" && -n "$CPUS" ]]; then
     KTRACE_CPUS=$CPUS
+fi
+if [[ -n "$KTRACE_MODE" && "$KTRACE_MODE" != "graph" && "$KTRACE_MODE" != "filter" ]]; then
+    echo "错误: --ktrace-mode 须为 graph 或 filter" >&2
+    exit 2
 fi
 
 cleanup() {
@@ -189,8 +201,14 @@ start_ktrace() {
     if [[ -n "$KTRACE_FUNCS" ]]; then
         args+=(--funcs "$KTRACE_FUNCS")
     fi
+    if [[ -n "$KTRACE_FUNCS_MAX" ]]; then
+        args+=(--funcs-max "$KTRACE_FUNCS_MAX")
+    fi
     if [[ -n "$KTRACE_CPUS" ]]; then
         args+=(--cpus "$KTRACE_CPUS")
+    fi
+    if [[ -n "$KTRACE_MODE" ]]; then
+        args+=(--mode "$KTRACE_MODE")
     fi
     echo "[ktrace] ${KTRACE_SCRIPT} ${args[*]}"
     setsid bash "$KTRACE_SCRIPT" "${args[@]}" </dev/null &
@@ -218,7 +236,7 @@ stop_ktrace() {
         return 0
     fi
     if kill -0 "$KTRACE_PID" 2>/dev/null; then
-        echo "[ktrace] 停止（导出 function_graph / summary）..."
+        echo "[ktrace] 停止（导出 function_graph / summary[/tree]）..."
         kill -TERM "$KTRACE_PID" 2>/dev/null || true
         local w=0
         while kill -0 "$KTRACE_PID" 2>/dev/null && (( w < 120 )); do
@@ -334,6 +352,10 @@ if [[ -n "$BASE_OUT" ]]; then
     if [[ "$KTRACE" -eq 1 && -f "${BASE_OUT}/ktrace/summary.txt" ]]; then
         echo "  ktrace summary:"
         sed 's/^/    /' "${BASE_OUT}/ktrace/summary.txt"
+    fi
+    if [[ "$KTRACE" -eq 1 && -f "${BASE_OUT}/ktrace/summary_tree.txt" ]]; then
+        echo "  ktrace summary_tree:"
+        sed 's/^/    /' "${BASE_OUT}/ktrace/summary_tree.txt"
     fi
 fi
 
