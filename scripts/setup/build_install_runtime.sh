@@ -49,6 +49,9 @@ CNI_BIN_DIR="${CNI_BIN_DIR:-/opt/cni/bin}"
 GO_VERSION="${GO_VERSION:-1.26.3}"
 GO_PREFIX="${GO_PREFIX:-/opt}"
 
+# 仅用于拉取官方 containerd.service（与 setup.sh 对齐；与源码编译 ref 无关）
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.6.32}"
+
 # 脚本运行依赖（yum 包名；pkg-config 由 pkgconf-pkg-config 提供）
 BUILD_DEP_PKGS=(make gcc pkg-config libseccomp-devel)
 BUILD_DEPS_DIR="${BUILD_DEPS_DIR:-${INSTALL_FILES_DIR}/build-deps}"
@@ -120,6 +123,7 @@ usage() {
   CONTAINERD_REF_PROFILE / RUNC_REF_PROFILE / CNI_REF_PROFILE
   CONTAINERD_REF_RELEASE / RUNC_REF_RELEASE / CNI_REF_RELEASE
   INSTALL_FILES_DIR / GO_VERSION / GO_PREFIX / BUILD_DEPS_DIR
+  CONTAINERD_VERSION   # 缺 unit 时下载 containerd.service 用的 tag（默认 1.6.32）
   （无 go 时优先从 INSTALL_FILES_DIR 安装 go\${GO_VERSION}.linux-\${arch}.tar.gz）
   （启动时优先从 BUILD_DEPS_DIR 装 RPM，缺失再 yum 下载）
 EOF
@@ -704,6 +708,31 @@ print_containerd_cpus() {
     pass "containerd pid=$pid 所在 CPU 核心: $affinity"
 }
 
+# 若本机没有 containerd systemd unit，从官方仓库下载并安装（对齐 setup.sh）
+ensure_containerd_unit() {
+    if [ -f /usr/lib/systemd/system/containerd.service ] || \
+       [ -f /etc/systemd/system/containerd.service ] || \
+       systemctl cat containerd &>/dev/null; then
+        return 0
+    fi
+
+    warn "未找到 containerd.service，正在安装 v${CONTAINERD_VERSION} unit..."
+    local svc_pkg svc_url svc_path
+    svc_pkg="containerd-${CONTAINERD_VERSION}.service"
+    svc_url="https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service"
+    svc_path=$(fetch_pkg "$svc_pkg" "$svc_url") || return 1
+
+    sudo cp "$svc_path" /usr/lib/systemd/system/containerd.service
+    # 官方 unit 默认 ExecStart=/usr/local/bin/containerd；本脚本会装到该路径
+    if [ ! -x /usr/local/bin/containerd ] && [ -x /usr/bin/containerd ]; then
+        sudo sed -i 's|^ExecStart=/usr/local/bin/containerd|ExecStart=/usr/bin/containerd|' \
+            /usr/lib/systemd/system/containerd.service
+    fi
+    sudo systemctl daemon-reload
+    sudo systemctl enable containerd
+    pass "已安装 containerd.service → /usr/lib/systemd/system/containerd.service"
+}
+
 restart_containerd() {
     if ! $DO_RESTART; then
         warn "跳过重启 containerd（--no-restart）"
@@ -713,6 +742,22 @@ restart_containerd() {
     if want containerd || want shim; then
         echo ""
         echo "=== 重启 containerd ==="
+        if ! ensure_containerd_unit; then
+            fail "无法安装 containerd.service"
+            return 1
+        fi
+        # 刚补 unit 时，可能已有手工拉起的 containerd 占着 socket
+        if ! systemctl is-active --quiet containerd 2>/dev/null; then
+            if pgrep -x containerd >/dev/null 2>&1; then
+                warn "发现非 systemd 管理的 containerd，先停止以便接管..."
+                sudo pkill -TERM -x containerd || true
+                sleep 2
+                if pgrep -x containerd >/dev/null 2>&1; then
+                    sudo pkill -KILL -x containerd || true
+                    sleep 1
+                fi
+            fi
+        fi
         if sudo systemctl restart containerd; then
             sleep 2
             if systemctl is-active --quiet containerd; then
