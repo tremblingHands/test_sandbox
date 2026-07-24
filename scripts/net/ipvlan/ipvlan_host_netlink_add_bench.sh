@@ -2,7 +2,7 @@
 # 宿主机创建 N 个 ipvlan（仅 ip link add）耗时；可选火焰图 / 内核函数时延
 #
 # 绑核与 perf 分开：
-#   --cpus CPUS   创建循环 taskset 绑核
+#   --cpus CPUS   创建循环绑核；默认同时把内存绑到这些 CPU 所在 NUMA node
 #   --perf        开启 on/off-CPU 火焰图（采样核默认跟 --cpus）
 #
 # 用法:
@@ -20,6 +20,7 @@ KTRACE_SCRIPT="${SCRIPT_DIR}/ipvlan_kfunc_trace.sh"
 N=100
 MASTER=""
 CPUS=""
+NO_MEMBIND=0
 PERF=0
 PERF_FREQ=99
 PERF_CALL_GRAPH=fp
@@ -39,7 +40,8 @@ usage() {
   master                ipvlan master（默认: default route 的 dev / eth0）
 
 选项:
-  --cpus CPUS           创建循环绑核（taskset）；perf/ktrace 未另指定时也用作采样核
+  --cpus CPUS           创建循环绑核；默认把内存也绑到这些 CPU 所在 NUMA（需 numactl）
+  --no-membind          仅绑核，不绑内存（默认：有 --cpus 时自动 membind）
   --perf                开启 bench 窗口 on/off-CPU 火焰图（需同时给 --cpus）
   --perf-freq HZ        on-CPU 采样频率（默认: ${PERF_FREQ}）
   --perf-call-graph M   on-CPU call-graph: fp|dwarf|...（默认: ${PERF_CALL_GRAPH}）
@@ -67,6 +69,7 @@ POS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cpus)            CPUS="$2"; shift 2 ;;
+        --no-membind)      NO_MEMBIND=1; shift ;;
         --perf)            PERF=1; shift ;;
         --perf-cpus)       # 兼容旧用法
             CPUS="$2"
@@ -122,6 +125,65 @@ if [[ -n "$KTRACE_MODE" && "$KTRACE_MODE" != "graph" && "$KTRACE_MODE" != "filte
     echo "错误: --ktrace-mode 须为 graph 或 filter" >&2
     exit 2
 fi
+
+# 展开 taskset 风格 CPU 列表 → 一行一个编号
+expand_cpus_list() {
+    local spec=$1
+    local part a b i
+    IFS=',' read -ra parts <<<"$spec"
+    for part in "${parts[@]}"; do
+        part=${part// /}
+        [[ -z "$part" ]] && continue
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a=${BASH_REMATCH[1]}
+            b=${BASH_REMATCH[2]}
+            (( a <= b )) || { echo "错误: 无效 CPU 范围: $part" >&2; return 1; }
+            for ((i = a; i <= b; i++)); do
+                echo "$i"
+            done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            echo "$part"
+        else
+            echo "错误: 无效 CPU 描述: $part" >&2
+            return 1
+        fi
+    done
+}
+
+# CPU → NUMA node（读 sysfs cpuN/node*）
+cpu_to_numa_node() {
+    local cpu=$1
+    local link node
+    # shellcheck disable=SC2086
+    link=$(echo /sys/devices/system/cpu/cpu"${cpu}"/node[0-9]* 2>/dev/null | awk '{print $1}')
+    if [[ -z "$link" || ! -e "$link" ]]; then
+        echo "错误: 无法解析 CPU ${cpu} 的 NUMA node" >&2
+        return 1
+    fi
+    node=$(basename "$(readlink -f "$link")")
+    node=${node#node}
+    [[ "$node" =~ ^[0-9]+$ ]] || { echo "错误: 无效 NUMA node: $node" >&2; return 1; }
+    echo "$node"
+}
+
+# --cpus 规格 → 去重后的 NUMA node 列表（逗号分隔，如 0 或 0,1）
+cpus_to_numa_nodes() {
+    local spec=$1
+    local cpu node
+    local -A seen=()
+    local -a nodes=()
+    while read -r cpu; do
+        [[ -z "$cpu" ]] && continue
+        node=$(cpu_to_numa_node "$cpu") || return 1
+        if [[ -z "${seen[$node]:-}" ]]; then
+            seen[$node]=1
+            nodes+=("$node")
+        fi
+    done < <(expand_cpus_list "$spec")
+    (( ${#nodes[@]} > 0 )) || { echo "错误: --cpus 未解析出任何 CPU" >&2; return 1; }
+    local IFS=,
+    echo "${nodes[*]}"
+}
 
 cleanup() {
     ip -o link 2>/dev/null | awk -F': ' '$2 ~ /^ivlb/ {print $2}' |
@@ -282,8 +344,7 @@ fi
 
 ok=0
 fail=0
-echo "开始测试 (N=${N}, master=${MASTER}${CPUS:+, cpus=${CPUS}})"
-start=$(date +%s%N)
+MEM_NODES=""
 
 run_adds() {
     local i name
@@ -298,10 +359,10 @@ run_adds() {
     done
 }
 
-if [[ -n "$CPUS" ]] && command -v taskset &>/dev/null; then
-    echo "[bench] taskset -c ${CPUS}"
+# 创建循环：绑核；默认再 membind 到同 NUMA
+if [[ -n "$CPUS" ]]; then
     _r=$(mktemp)
-    taskset -c "$CPUS" bash -c '
+    _add_body='
         set -euo pipefail
         N=$1; MASTER=$2
         ok=0; fail=0
@@ -315,10 +376,38 @@ if [[ -n "$CPUS" ]] && command -v taskset &>/dev/null; then
             fi
         done
         echo "$ok $fail" >"$3"
-    ' bash "$N" "$MASTER" "$_r"
+    '
+    if [[ "$NO_MEMBIND" -eq 0 ]]; then
+        if ! command -v numactl &>/dev/null; then
+            echo "错误: 需要 numactl 以绑定内存（或加 --no-membind 仅绑核）" >&2
+            exit 2
+        fi
+        MEM_NODES=$(cpus_to_numa_nodes "$CPUS") || exit 2
+        echo "开始测试 (N=${N}, master=${MASTER}, cpus=${CPUS}, membind=${MEM_NODES})"
+        echo "[bench] numactl --physcpubind=${CPUS} --membind=${MEM_NODES}"
+        start=$(date +%s%N)
+        numactl --physcpubind="$CPUS" --membind="$MEM_NODES" \
+            bash -c "$_add_body" bash "$N" "$MASTER" "$_r"
+    elif command -v taskset &>/dev/null; then
+        echo "开始测试 (N=${N}, master=${MASTER}, cpus=${CPUS}, membind=off)"
+        echo "[bench] taskset -c ${CPUS} (--no-membind)"
+        start=$(date +%s%N)
+        taskset -c "$CPUS" bash -c "$_add_body" bash "$N" "$MASTER" "$_r"
+    elif command -v numactl &>/dev/null; then
+        echo "开始测试 (N=${N}, master=${MASTER}, cpus=${CPUS}, membind=off)"
+        echo "[bench] numactl --physcpubind=${CPUS} (--no-membind)"
+        start=$(date +%s%N)
+        numactl --physcpubind="$CPUS" \
+            bash -c "$_add_body" bash "$N" "$MASTER" "$_r"
+    else
+        echo "错误: 需要 taskset 或 numactl 以绑定 CPU" >&2
+        exit 2
+    fi
     read -r ok fail <"$_r"
     rm -f "$_r"
 else
+    echo "开始测试 (N=${N}, master=${MASTER})"
+    start=$(date +%s%N)
     run_adds
 fi
 end=$(date +%s%N)
