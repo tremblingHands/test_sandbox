@@ -11,8 +11,17 @@
 #   ./setup.sh --cni-type bridge --ip-masq false  # bridge 且关闭 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --check-only                   # 仅检查，不安装
+#
+# 安装包缓存:
+#   默认目录 <repo>/install/（可用环境变量 INSTALL_FILES_DIR 覆盖，已在 .gitignore）
+#   优先使用该目录中的包；没有则下载并保存到该目录，供下次复用
 # ============================================================
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
+# 本地安装包目录：优先从此处取包，缺失再下载
+INSTALL_FILES_DIR="${INSTALL_FILES_DIR:-${REPO_ROOT}/install}"
 
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
@@ -89,6 +98,38 @@ pass() { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 fail() { echo -e "${RED}✗${NC} $1"; }
 
+ensure_install_dir() {
+    mkdir -p "$INSTALL_FILES_DIR"
+}
+
+# 优先从 INSTALL_FILES_DIR 取包；没有则下载并保存到该目录。
+# 用法: path=$(fetch_pkg <文件名> <url>)
+# 进度信息打到 stderr，stdout 只输出本地路径。
+fetch_pkg() {
+    local name=$1
+    local url=$2
+    local dest="${INSTALL_FILES_DIR}/${name}"
+    local tmp
+
+    ensure_install_dir
+    if [[ -f "$dest" && -s "$dest" ]]; then
+        echo "  使用本地包: $dest" >&2
+        printf '%s\n' "$dest"
+        return 0
+    fi
+
+    echo "  本地未找到 ${name}，下载: $url" >&2
+    echo "  保存到: $dest" >&2
+    tmp="${dest}.partial.$$"
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo "ERROR: 下载失败: $url" >&2
+        return 1
+    fi
+    mv "$tmp" "$dest"
+    printf '%s\n' "$dest"
+}
+
 # ============================================================
 # 检查 containerd
 # ============================================================
@@ -107,18 +148,20 @@ check_containerd() {
         fi
         warn "containerd 未安装，正在安装..."
 
-        # 下载 containerd
-        local url="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
-        echo "  下载: $url"
-        curl -fsSL "$url" -o /tmp/containerd.tar.gz
-        sudo tar -C /usr/local -xzf /tmp/containerd.tar.gz
-        rm -f /tmp/containerd.tar.gz
+        local pkg url svc_pkg svc_url svc_path
+        pkg="containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+        url="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/${pkg}"
+        local tarball
+        tarball=$(fetch_pkg "$pkg" "$url")
+        sudo tar -C /usr/local -xzf "$tarball"
 
         # 安装 systemd service
         if ! [ -f /usr/lib/systemd/system/containerd.service ]; then
             echo "  安装 systemd service..."
-            curl -fsSL https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service | \
-                sudo tee /usr/lib/systemd/system/containerd.service > /dev/null
+            svc_pkg="containerd-${CONTAINERD_VERSION}.service"
+            svc_url="https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service"
+            svc_path=$(fetch_pkg "$svc_pkg" "$svc_url")
+            sudo cp "$svc_path" /usr/lib/systemd/system/containerd.service
             sudo systemctl daemon-reload
             sudo systemctl enable containerd
         fi
@@ -225,7 +268,6 @@ ensure_bridge_egress_masq() {
 KATA_INSTALL_DIR="/opt/kata"
 KATA_BIN_DIR="$KATA_INSTALL_DIR/bin"
 # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 才能对齐
-INSTALL_FILES_DIR="./install"    # 本地 kata 包存放目录（优先使用，不纳入 git）
 TARBALL_NAME="kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
 
 check_kata_runtime() {
@@ -263,17 +305,9 @@ check_kata_runtime() {
                 sudo yum install -y -q zstd 2>/dev/null || true
         fi
 
-        local tarball_path=""
-        # 优先使用本地 install 目录中的包
-        if [ -f "${INSTALL_FILES_DIR}/${TARBALL_NAME}" ]; then
-            tarball_path="${INSTALL_FILES_DIR}/${TARBALL_NAME}"
-            echo "  使用本地包: $tarball_path"
-        else
-            local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst"
-            echo "  下载: $kata_url"
-            tarball_path="/tmp/kata-$$.tar.zst"
-            curl -fsSL "$kata_url" -o "$tarball_path"
-        fi
+        local tarball_path
+        local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_NAME}"
+        tarball_path=$(fetch_pkg "$TARBALL_NAME" "$kata_url")
 
         # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
         if sudo tar --zstd -xf "$tarball_path" -C / 2>/dev/null; then
@@ -287,11 +321,6 @@ check_kata_runtime() {
         else
             fail "无法解压 .tar.zst 文件（需要 zstd 或 tar --zstd）"
             return 1
-        fi
-
-        # 清理临时下载（保留本地 install 目录中的文件）
-        if [ "$tarball_path" != "${INSTALL_FILES_DIR}/${TARBALL_NAME}" ]; then
-            rm -f "$tarball_path"
         fi
 
         # kata-static 解包后查找 shim（优先 runtime-rs 静态二进制）
@@ -618,12 +647,12 @@ check_crictl() {
         fi
         warn "crictl 未安装，正在安装 v${CRICTL_VERSION}..."
 
-        local url="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz"
-        echo "  下载: $url"
-        curl -fsSL "$url" -o /tmp/crictl.tar.gz
-        sudo tar -C /usr/local/bin -xzf /tmp/crictl.tar.gz
+        local pkg url tarball
+        pkg="crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz"
+        url="https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/${pkg}"
+        tarball=$(fetch_pkg "$pkg" "$url")
+        sudo tar -C /usr/local/bin -xzf "$tarball"
         sudo chmod +x /usr/local/bin/crictl
-        rm -f /tmp/crictl.tar.gz
         pass "crictl 安装完成: $(crictl --version)"
     fi
 
@@ -911,8 +940,14 @@ main() {
     fi
     echo "  Snapshotter: $SNAPSHOTTER"
     echo "  pause 镜像:  $PAUSE_IMAGE"
+    echo "  安装包目录: $INSTALL_FILES_DIR"
     echo "=============================================="
     echo
+
+    # 提前创建缓存目录，便于手动放入安装包
+    if ! $CHECK_ONLY; then
+        ensure_install_dir
+    fi
 
     local errors=0
 
