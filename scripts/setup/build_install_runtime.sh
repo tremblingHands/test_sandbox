@@ -124,6 +124,7 @@ usage() {
   CONTAINERD_REF_RELEASE / RUNC_REF_RELEASE / CNI_REF_RELEASE
   INSTALL_FILES_DIR / GO_VERSION / GO_PREFIX / BUILD_DEPS_DIR
   CONTAINERD_VERSION   # 缺 unit 时下载 containerd.service 用的 tag（默认 1.6.32）
+  CONTAINERD_CONFIG    # 默认 /etc/containerd/config.toml；缺失时用 containerd config default 生成
   （无 go 时优先从 INSTALL_FILES_DIR 安装 go\${GO_VERSION}.linux-\${arch}.tar.gz）
   （启动时优先从 BUILD_DEPS_DIR 装 RPM，缺失再 yum 下载）
 EOF
@@ -708,6 +709,35 @@ print_containerd_cpus() {
     pass "containerd pid=$pid 所在 CPU 核心: $affinity"
 }
 
+CONTAINERD_CONFIG="${CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
+
+# 若缺 /etc/containerd/config.toml，用当前 containerd 生成默认配置
+ensure_containerd_config() {
+    if [ -f "$CONTAINERD_CONFIG" ]; then
+        return 0
+    fi
+
+    local ctd
+    ctd=$(command -v containerd 2>/dev/null || true)
+    if [ -z "$ctd" ]; then
+        for p in /usr/local/bin/containerd /usr/bin/containerd; do
+            [ -x "$p" ] && ctd=$p && break
+        done
+    fi
+    if [ -z "$ctd" ]; then
+        fail "缺少 $CONTAINERD_CONFIG，且找不到 containerd 二进制无法生成默认配置"
+        return 1
+    fi
+
+    warn "未找到 $CONTAINERD_CONFIG，正在用 containerd config default 生成..."
+    sudo mkdir -p "$(dirname "$CONTAINERD_CONFIG")"
+    if ! "$ctd" config default | sudo tee "$CONTAINERD_CONFIG" >/dev/null; then
+        fail "生成 $CONTAINERD_CONFIG 失败"
+        return 1
+    fi
+    pass "已生成 $CONTAINERD_CONFIG"
+}
+
 # 若本机没有 containerd systemd unit，从官方仓库下载并安装（对齐 setup.sh）
 ensure_containerd_unit() {
     if [ -f /usr/lib/systemd/system/containerd.service ] || \
@@ -742,6 +772,10 @@ restart_containerd() {
     if want containerd || want shim; then
         echo ""
         echo "=== 重启 containerd ==="
+        if ! ensure_containerd_config; then
+            fail "无法准备 containerd 配置"
+            return 1
+        fi
         if ! ensure_containerd_unit; then
             fail "无法安装 containerd.service"
             return 1

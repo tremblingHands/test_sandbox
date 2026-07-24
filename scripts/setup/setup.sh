@@ -168,6 +168,24 @@ check_containerd() {
         pass "containerd 安装完成"
     fi
 
+    # 缺配置文件时生成默认 config.toml（否则 restart 会报 can't read .../config.toml）
+    local config_file="/etc/containerd/config.toml"
+    if [ -f "$config_file" ]; then
+        pass "containerd 配置已存在: $config_file"
+    else
+        if $CHECK_ONLY; then
+            fail "缺少 $config_file"
+            return 1
+        fi
+        warn "未找到 $config_file，正在用 containerd config default 生成..."
+        sudo mkdir -p /etc/containerd
+        if ! containerd config default | sudo tee "$config_file" >/dev/null; then
+            fail "生成 $config_file 失败"
+            return 1
+        fi
+        pass "已生成 $config_file"
+    fi
+
     # 检查 runc
     if command -v runc &>/dev/null; then
         pass "runc 已安装: $(runc --version | head -1)"
