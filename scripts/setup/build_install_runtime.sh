@@ -28,6 +28,10 @@
 # Go 缺失时：优先 <repo>/install/ 下的官方包，没有再下载
 #   arm64: go1.26.3.linux-arm64.tar.gz
 #   amd64: go1.26.3.linux-amd64.tar.gz
+#
+# 脚本运行依赖：优先 <repo>/install/build-deps/*.rpm，
+# 缺失则 yum/dnf 下载后再本地安装：
+#   make gcc pkg-config libseccomp-devel
 # ============================================================
 set -euo pipefail
 
@@ -44,6 +48,10 @@ CNI_BIN_DIR="${CNI_BIN_DIR:-/opt/cni/bin}"
 # Go 默认版本与安装前缀（解压后为 $GO_PREFIX/go/bin/go，即 /opt/go/bin/go）
 GO_VERSION="${GO_VERSION:-1.26.3}"
 GO_PREFIX="${GO_PREFIX:-/opt}"
+
+# 脚本运行依赖（yum 包名；pkg-config 由 pkgconf-pkg-config 提供）
+BUILD_DEP_PKGS=(make gcc pkg-config libseccomp-devel)
+BUILD_DEPS_DIR="${BUILD_DEPS_DIR:-${INSTALL_FILES_DIR}/build-deps}"
 
 # 默认开源仓库（可用环境变量覆盖）
 CONTAINERD_REPO="${CONTAINERD_REPO:-https://gitee.com/omnihorizon/containerd.git}"
@@ -111,8 +119,9 @@ usage() {
   CONTAINERD_SRC / RUNC_SRC / CNI_SRC / SRC_ROOT
   CONTAINERD_REF_PROFILE / RUNC_REF_PROFILE / CNI_REF_PROFILE
   CONTAINERD_REF_RELEASE / RUNC_REF_RELEASE / CNI_REF_RELEASE
-  INSTALL_FILES_DIR / GO_VERSION / GO_PREFIX
+  INSTALL_FILES_DIR / GO_VERSION / GO_PREFIX / BUILD_DEPS_DIR
   （无 go 时优先从 INSTALL_FILES_DIR 安装 go\${GO_VERSION}.linux-\${arch}.tar.gz）
+  （启动时优先从 BUILD_DEPS_DIR 装 RPM，缺失再 yum 下载）
 EOF
     exit 1
 }
@@ -224,6 +233,82 @@ detect_go_arch() {
             exit 1
             ;;
     esac
+}
+
+# 脚本运行依赖是否已就绪（make / gcc / pkg-config / libseccomp 头文件）
+build_deps_ready() {
+    command -v make >/dev/null 2>&1 || return 1
+    command -v gcc >/dev/null 2>&1 || return 1
+    command -v pkg-config >/dev/null 2>&1 || return 1
+    if pkg-config --exists libseccomp 2>/dev/null; then
+        return 0
+    fi
+    [ -f /usr/include/seccomp.h ]
+}
+
+# 将 make/gcc/pkg-config/libseccomp-devel 下载到 BUILD_DEPS_DIR，再本地安装
+ensure_build_deps() {
+    echo ""
+    echo "=== 脚本运行依赖 ==="
+    if build_deps_ready; then
+        pass "已具备 make / gcc / pkg-config / libseccomp"
+        return 0
+    fi
+
+    local yum_cmd=""
+    if command -v yum >/dev/null 2>&1; then
+        yum_cmd=yum
+    elif command -v dnf >/dev/null 2>&1; then
+        yum_cmd=dnf
+    else
+        fail "缺少脚本运行依赖，且未找到 yum/dnf"
+        echo "  请手动安装: ${BUILD_DEP_PKGS[*]}"
+        exit 1
+    fi
+
+    ensure_install_dir
+    mkdir -p "$BUILD_DEPS_DIR"
+    echo "  依赖包目录: $BUILD_DEPS_DIR"
+
+    local rpms=()
+    shopt -s nullglob
+    rpms=("$BUILD_DEPS_DIR"/*.rpm)
+    shopt -u nullglob
+
+    if [ ${#rpms[@]} -eq 0 ]; then
+        echo "  本地无 RPM，下载: ${BUILD_DEP_PKGS[*]}"
+        if command -v yumdownloader >/dev/null 2>&1; then
+            yumdownloader --resolve --destdir="$BUILD_DEPS_DIR" \
+                "${BUILD_DEP_PKGS[@]}"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf download --resolve --destdir="$BUILD_DEPS_DIR" \
+                "${BUILD_DEP_PKGS[@]}"
+        else
+            # 无 yumdownloader 时：只下载不安装到系统
+            sudo "$yum_cmd" install -y --downloadonly \
+                --downloaddir="$BUILD_DEPS_DIR" \
+                "${BUILD_DEP_PKGS[@]}"
+        fi
+        shopt -s nullglob
+        rpms=("$BUILD_DEPS_DIR"/*.rpm)
+        shopt -u nullglob
+        if [ ${#rpms[@]} -eq 0 ]; then
+            fail "下载后仍无 RPM: $BUILD_DEPS_DIR"
+            exit 1
+        fi
+        pass "已下载 ${#rpms[@]} 个 RPM → $BUILD_DEPS_DIR"
+    else
+        echo "  使用本地包: ${#rpms[@]} 个 RPM"
+    fi
+
+    echo "  从本地 RPM 安装: ${BUILD_DEP_PKGS[*]}"
+    sudo "$yum_cmd" install -y "${rpms[@]}"
+
+    if ! build_deps_ready; then
+        fail "安装后仍缺少 make/gcc/pkg-config/libseccomp，请检查 $BUILD_DEPS_DIR"
+        exit 1
+    fi
+    pass "脚本运行依赖已安装"
 }
 
 # 确保 go 可用：已有则用；否则从 install/ 装官方包（缺则下载）到 $GO_PREFIX/go
@@ -661,6 +746,7 @@ main() {
     need_cmd sudo
     need_cmd install
     need_cmd file
+    ensure_build_deps
     ensure_go
 
     echo "=============================================="
@@ -669,6 +755,7 @@ main() {
     echo "  mode:        $MODE"
     echo "  only:        $ONLY"
     echo "  install dir: $INSTALL_FILES_DIR"
+    echo "  build deps:  $BUILD_DEPS_DIR"
     echo "  containerd:  $CONTAINERD_SRC"
     echo "               repo $CONTAINERD_REPO"
     echo "               ref  $CONTAINERD_REF"
