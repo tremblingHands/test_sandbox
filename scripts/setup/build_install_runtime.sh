@@ -24,14 +24,26 @@
 #   ./scripts/setup/build_install_runtime.sh --mode release --no-backup
 #
 # 默认源码根: /home/nathan/{containerd,runc,plugins}
+#
+# Go 缺失时：优先 <repo>/install/ 下的官方包，没有再下载
+#   arm64: go1.26.3.linux-arm64.tar.gz
+#   amd64: go1.26.3.linux-amd64.tar.gz
 # ============================================================
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
+INSTALL_FILES_DIR="${INSTALL_FILES_DIR:-${REPO_ROOT}/install}"
 
 SRC_ROOT="${SRC_ROOT:-/home/nathan}"
 CONTAINERD_SRC="${CONTAINERD_SRC:-$SRC_ROOT/containerd}"
 RUNC_SRC="${RUNC_SRC:-$SRC_ROOT/runc}"
 CNI_SRC="${CNI_SRC:-$SRC_ROOT/plugins}"
 CNI_BIN_DIR="${CNI_BIN_DIR:-/opt/cni/bin}"
+
+# Go 默认版本与安装前缀（解压后为 $GO_PREFIX/go/bin/go，即 /opt/go/bin/go）
+GO_VERSION="${GO_VERSION:-1.26.3}"
+GO_PREFIX="${GO_PREFIX:-/opt}"
 
 # 默认开源仓库（可用环境变量覆盖）
 CONTAINERD_REPO="${CONTAINERD_REPO:-https://gitee.com/omnihorizon/containerd.git}"
@@ -99,6 +111,8 @@ usage() {
   CONTAINERD_SRC / RUNC_SRC / CNI_SRC / SRC_ROOT
   CONTAINERD_REF_PROFILE / RUNC_REF_PROFILE / CNI_REF_PROFILE
   CONTAINERD_REF_RELEASE / RUNC_REF_RELEASE / CNI_REF_RELEASE
+  INSTALL_FILES_DIR / GO_VERSION / GO_PREFIX
+  （无 go 时优先从 INSTALL_FILES_DIR 安装 go\${GO_VERSION}.linux-\${arch}.tar.gz）
 EOF
     exit 1
 }
@@ -168,6 +182,85 @@ need_cmd() {
         fail "缺少命令: $1"
         exit 1
     fi
+}
+
+ensure_install_dir() {
+    mkdir -p "$INSTALL_FILES_DIR"
+}
+
+# 优先从 INSTALL_FILES_DIR 取包；没有则下载并保存。stdout 仅路径。
+fetch_pkg() {
+    local name=$1
+    local url=$2
+    local dest="${INSTALL_FILES_DIR}/${name}"
+    local tmp
+
+    ensure_install_dir
+    if [[ -f "$dest" && -s "$dest" ]]; then
+        echo "  使用本地包: $dest" >&2
+        printf '%s\n' "$dest"
+        return 0
+    fi
+
+    echo "  本地未找到 ${name}，下载: $url" >&2
+    echo "  保存到: $dest" >&2
+    need_cmd curl
+    tmp="${dest}.partial.$$"
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        fail "下载失败: $url"
+        return 1
+    fi
+    mv "$tmp" "$dest"
+    printf '%s\n' "$dest"
+}
+
+detect_go_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)
+            fail "不支持的架构: $(uname -m)（Go 安装仅支持 amd64/arm64）"
+            exit 1
+            ;;
+    esac
+}
+
+# 确保 go 可用：已有则用；否则从 install/ 装官方包（缺则下载）到 $GO_PREFIX/go
+ensure_go() {
+    # 本机常见路径优先
+    if [ -x /opt/go/bin/go ]; then
+        export PATH="/opt/go/bin:$PATH"
+    fi
+    if [ -x /usr/local/go/bin/go ]; then
+        export PATH="/usr/local/go/bin:$PATH"
+    fi
+    if command -v go &>/dev/null; then
+        pass "已有 Go: $(go version)"
+        return 0
+    fi
+
+    local goarch pkg url tarball
+    goarch=$(detect_go_arch)
+    pkg="go${GO_VERSION}.linux-${goarch}.tar.gz"
+    url="https://go.dev/dl/${pkg}"
+
+    warn "未找到 go，准备安装 ${pkg} → ${GO_PREFIX}/go"
+    echo "  安装包目录: $INSTALL_FILES_DIR"
+    tarball=$(fetch_pkg "$pkg" "$url")
+
+    need_cmd sudo
+    need_cmd tar
+    echo "  解压到 ${GO_PREFIX}/（将创建 ${GO_PREFIX}/go）..."
+    # 官方 tarball 顶层目录名为 go/
+    sudo rm -rf "${GO_PREFIX}/go"
+    sudo tar -C "$GO_PREFIX" -xzf "$tarball"
+    if [ ! -x "${GO_PREFIX}/go/bin/go" ]; then
+        fail "解压后未找到 ${GO_PREFIX}/go/bin/go"
+        exit 1
+    fi
+    export PATH="${GO_PREFIX}/go/bin:$PATH"
+    pass "Go 安装完成: $(go version)"
 }
 
 # 若本地目录不存在或为空，则从默认 Gitee 仓库 clone
@@ -564,24 +657,18 @@ print_versions() {
 }
 
 main() {
-    need_cmd go
     need_cmd git
     need_cmd sudo
     need_cmd install
     need_cmd file
-
-    # 保证 go 在 PATH（本机常见 /opt/go/bin）
-    if [ -x /opt/go/bin/go ] && ! command -v go &>/dev/null; then
-        export PATH="/opt/go/bin:$PATH"
-    elif [ -x /opt/go/bin/go ]; then
-        export PATH="/opt/go/bin:$PATH"
-    fi
+    ensure_go
 
     echo "=============================================="
     echo "  编译安装 runtime 组件"
     echo "=============================================="
     echo "  mode:        $MODE"
     echo "  only:        $ONLY"
+    echo "  install dir: $INSTALL_FILES_DIR"
     echo "  containerd:  $CONTAINERD_SRC"
     echo "               repo $CONTAINERD_REPO"
     echo "               ref  $CONTAINERD_REF"
