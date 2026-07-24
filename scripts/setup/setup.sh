@@ -5,8 +5,10 @@
 #
 # 用法:
 #   ./setup.sh                               # 完整安装，runc + ipvlan-l3
-#   ./setup.sh --runtime kata                # kata + dragonball（默认）
-#   ./setup.sh --runtime kata --hypervisor qemu  # kata + QEMU
+#   ./setup.sh --runtime kata                # kata + qemu（默认 hypervisor）
+#   ./setup.sh --runtime kata --hypervisor dragonball
+#   ./setup.sh --runtime kata --hypervisor cloud-hypervisor
+#   ./setup.sh --runtime kata --hypervisor firecracker
 #   ./setup.sh --cni-type bridge             # 使用 bridge CNI
 #   ./setup.sh --cni-type bridge --ip-masq false  # bridge 且关闭 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
@@ -30,6 +32,7 @@ CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 br
 CONTAINERD_RUNTIME="runc"       # 默认: runc
 SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs）
 KATA_VERSION="3.22.0"           # kata containers 版本
+KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
 IP_MASQ="true"                  # bridge 专用: CNI ipMasq（默认 true；false 则不做 per-sandbox iptables）
 
 # 自动检测架构
@@ -49,6 +52,7 @@ detect_arch() {
 ARCH=$(detect_arch)
 
 CHECK_ONLY=false
+HYPERVISOR_EXPLICIT=false
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,6 +72,17 @@ while [[ $# -gt 0 ]]; do
                 *) echo "ERROR: --runtime 必须是 runc | kata"; exit 1 ;;
             esac
             shift 2 ;;
+        --hypervisor)
+            KATA_HYPERVISOR="$2"
+            HYPERVISOR_EXPLICIT=true
+            case "$KATA_HYPERVISOR" in
+                dragonball|qemu|cloud-hypervisor|firecracker) ;;
+                *)
+                    echo "ERROR: --hypervisor 必须是 dragonball | qemu | cloud-hypervisor | firecracker"
+                    exit 1
+                    ;;
+            esac
+            shift 2 ;;
         --snapshotter)
             SNAPSHOTTER="$2"
             case "$SNAPSHOTTER" in
@@ -84,7 +99,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--snapshotter overlayfs|erofs] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--hypervisor dragonball|qemu|cloud-hypervisor|firecracker] [--snapshotter overlayfs|erofs] [--check-only]"
             exit 1 ;;
     esac
 done
@@ -97,6 +112,10 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 fail() { echo -e "${RED}✗${NC} $1"; }
+
+if $HYPERVISOR_EXPLICIT && [ "$CONTAINERD_RUNTIME" != "kata" ]; then
+    warn "--hypervisor 仅在 --runtime kata 时生效（当前 runtime=$CONTAINERD_RUNTIME）"
+fi
 
 ensure_install_dir() {
     mkdir -p "$INSTALL_FILES_DIR"
@@ -367,38 +386,97 @@ check_kata_runtime() {
         fi
     fi
 
-    # ---- 1.5 配置 runtime-rs QEMU（ARM64 适配） ---- #
+    # ---- 1.5 按 --hypervisor 切换 runtime-rs 配置 ---- #
     local kata_config_dir="/opt/kata/share/defaults/kata-containers/runtime-rs"
-    local qemu_config="$kata_config_dir/configuration-qemu-runtime-rs.toml"
+    local target_config=""
+    local target_link_name=""
 
-    if [ -f "$qemu_config" ]; then
-        echo "  配置 runtime-rs QEMU（ARM64 适配）..."
-        # 1. machine_type: q35 是 x86 专用，ARM64 必须用 virt
-        sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$qemu_config"
-        # 2. kernel
-        local actual_kernel
-        actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-* 2>/dev/null | head -1)
-        [ -n "$actual_kernel" ] && sudo sed -i "s|kernel = .*|kernel = \"$actual_kernel\"|" "$qemu_config"
-        # 3. firmware: ARM64 UEFI
-        if grep -q 'firmware = ""' "$qemu_config" 2>/dev/null; then
-            sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$qemu_config"
-            sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$qemu_config"
-        fi
-        # 4. virtio-pmem → virtio-blk-pci (ARM64 virt 上 pmem 会崩)
-        sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$qemu_config"
+    case "$KATA_HYPERVISOR" in
+        dragonball)
+            target_link_name="configuration-dragonball.toml"
+            ;;
+        qemu)
+            target_link_name="configuration-qemu-runtime-rs.toml"
+            ;;
+        cloud-hypervisor)
+            target_link_name="configuration-cloud-hypervisor.toml"
+            ;;
+        firecracker)
+            target_link_name="configuration-rs-fc.toml"
+            ;;
+        *)
+            fail "未知 hypervisor: $KATA_HYPERVISOR"
+            return 1
+            ;;
+    esac
+    target_config="$kata_config_dir/$target_link_name"
 
-        # 5. 指向 QEMU 配置
-        local default_config="$kata_config_dir/configuration.toml"
-        if [ "$(readlink -f "$default_config" 2>/dev/null)" != "$qemu_config" ]; then
-            if ! $CHECK_ONLY; then
-                sudo rm -f "$default_config"
-                sudo ln -s configuration-qemu-runtime-rs.toml "$default_config"
-            fi
-        fi
-        pass "runtime-rs QEMU 配置完成"
-    else
-        fail "QEMU runtime-rs 配置文件不存在: $qemu_config"
+    if [ ! -f "$target_config" ]; then
+        fail "hypervisor 配置不存在: $target_config"
         return 1
+    fi
+
+    # QEMU：做架构相关修补（ARM64 virt / firmware / rootfs driver）
+    if [ "$KATA_HYPERVISOR" = "qemu" ]; then
+        echo "  配置 runtime-rs QEMU..."
+        if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            # machine_type: q35 是 x86 专用，ARM64 必须用 virt
+            sudo sed -i 's|machine_type = "q35"|machine_type = "virt"|' "$target_config"
+            sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$target_config"
+            # firmware: ARM64 UEFI
+            if grep -q 'firmware = ""' "$target_config" 2>/dev/null; then
+                sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$target_config"
+                sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$target_config"
+            fi
+            # virtio-pmem → virtio-blk-pci (ARM64 virt 上 pmem 会崩)
+            sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$target_config"
+        fi
+        # 若配置里 kernel 路径不存在，尽量补成实际 vmlinux（排除 dragonball experimental）
+        local cfg_kernel actual_kernel
+        cfg_kernel=$(grep -E '^kernel =' "$target_config" | head -1 | sed 's/.*= *"//;s/"//')
+        if [ -n "$cfg_kernel" ] && [ ! -e "$cfg_kernel" ]; then
+            actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-[0-9]* 2>/dev/null | grep -v dragonball | head -1 || true)
+            [ -n "$actual_kernel" ] && sudo sed -i "s|^kernel = .*|kernel = \"$actual_kernel\"|" "$target_config"
+        fi
+    fi
+
+    # 校验 hypervisor 二进制（dragonball 内置，无独立 path）
+    case "$KATA_HYPERVISOR" in
+        qemu)
+            if [ ! -x /opt/kata/bin/qemu-system-x86_64 ] && \
+               [ ! -x /opt/kata/bin/qemu-system-aarch64 ]; then
+                warn "未找到 qemu-system-*，请确认 kata-static 已完整安装"
+            fi
+            ;;
+        cloud-hypervisor)
+            [ -x /opt/kata/bin/cloud-hypervisor ] || {
+                fail "缺少 /opt/kata/bin/cloud-hypervisor"
+                return 1
+            }
+            ;;
+        firecracker)
+            [ -x /opt/kata/bin/firecracker ] || {
+                fail "缺少 /opt/kata/bin/firecracker"
+                return 1
+            }
+            ;;
+    esac
+
+    local default_config="$kata_config_dir/configuration.toml"
+    local current_target
+    local hypervisor_changed=false
+    current_target=$(readlink -f "$default_config" 2>/dev/null || true)
+    if [ "$current_target" = "$(readlink -f "$target_config")" ]; then
+        pass "runtime-rs hypervisor 已是 $KATA_HYPERVISOR ($target_link_name)"
+    elif $CHECK_ONLY; then
+        warn "hypervisor 期望 $KATA_HYPERVISOR，当前: ${current_target:-none}"
+        return 1
+    else
+        echo "  切换 hypervisor → $KATA_HYPERVISOR ($target_link_name)"
+        sudo rm -f "$default_config"
+        sudo ln -s "$target_link_name" "$default_config"
+        hypervisor_changed=true
+        pass "runtime-rs hypervisor 已设为 $KATA_HYPERVISOR"
     fi
 
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
@@ -416,10 +494,17 @@ check_kata_runtime() {
             sudo sed -i "/runtimes\.kata\]/,/^\[/s|ConfigPath = .*|ConfigPath = '/opt/kata/share/defaults/kata-containers/runtime-rs/configuration.toml'|" "$config_file"
             need_fix=true
         fi
-        if $need_fix; then
-            sudo systemctl restart containerd
-            sleep 2
-            pass "containerd kata 配置已修正"
+        if $need_fix || $hypervisor_changed; then
+            if ! $CHECK_ONLY; then
+                echo "  重启 containerd 使 hypervisor/配置生效..."
+                sudo systemctl restart containerd
+                sleep 2
+            fi
+            if $need_fix; then
+                pass "containerd kata 配置已修正"
+            else
+                pass "containerd 已注册 kata runtime（hypervisor 已切换）"
+            fi
         else
             pass "containerd 已注册 kata runtime"
         fi
@@ -952,6 +1037,9 @@ main() {
     echo "=============================================="
     echo "  检测架构: $(uname -m) → $ARCH"
     echo "  Runtime:     $CONTAINERD_RUNTIME"
+    if [ "$CONTAINERD_RUNTIME" = "kata" ]; then
+        echo "  Hypervisor:  $KATA_HYPERVISOR"
+    fi
     echo "  CNI 类型:    $CNI_TYPE"
     if [ "$CNI_TYPE" = "bridge" ]; then
         echo "  CNI ipMasq:  $IP_MASQ"
