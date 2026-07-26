@@ -9,8 +9,8 @@
 #   ./setup.sh --runtime kata --hypervisor dragonball
 #   ./setup.sh --runtime kata --hypervisor cloud-hypervisor
 #   ./setup.sh --runtime kata --hypervisor firecracker
-#   ./setup.sh --cni-type bridge             # 使用 bridge CNI
-#   ./setup.sh --cni-type bridge --ip-masq false  # bridge 且关闭 per-sandbox MASQUERADE
+#   ./setup.sh --cni-type bridge             # 使用 bridge CNI（默认 ipMasq=false）
+#   ./setup.sh --cni-type bridge --ip-masq true   # bridge 且开启 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --check-only                   # 仅检查，不安装
 #   ./setup.sh --no-warmup                    # 成功后不跑 cold_start_bench warmup
@@ -34,7 +34,7 @@ CONTAINERD_RUNTIME="runc"       # 默认: runc
 SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs）
 KATA_VERSION="3.22.0"           # kata containers 版本
 KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
-IP_MASQ="true"                  # bridge 专用: CNI ipMasq（默认 true；false 则不做 per-sandbox iptables）
+IP_MASQ="false"                 # bridge 专用: CNI ipMasq（默认 false；出网用节点级 MASQUERADE）
 
 # 自动检测架构
 detect_arch() {
@@ -55,9 +55,55 @@ ARCH=$(detect_arch)
 CHECK_ONLY=false
 NO_WARMUP=false
 HYPERVISOR_EXPLICIT=false
+
+usage() {
+    cat <<EOF
+沙箱冷启动测试 — 环境准备（安装/检查 containerd、CNI、runtime 等）
+
+用法:
+  $0 [选项]
+
+选项（括号内为默认值）:
+  --cni-type TYPE          CNI 类型: bridge | ipvlan-l2 | ipvlan-l3
+                           (默认: ${CNI_TYPE})
+  --ip-masq true|false     bridge 的 CNI ipMasq；false 时用节点级 MASQUERADE
+                           (默认: ${IP_MASQ})
+  --runtime RUNTIME        OCI 运行时: runc | kata
+                           (默认: ${CONTAINERD_RUNTIME})
+  --hypervisor HV          kata hypervisor: dragonball | qemu | cloud-hypervisor | firecracker
+                           (默认: ${KATA_HYPERVISOR}；仅 --runtime kata 时生效)
+  --snapshotter NAME       snapshotter: overlayfs | erofs
+                           (默认: ${SNAPSHOTTER})
+  --check-only             仅检查，不安装/不修改
+                           (默认: ${CHECK_ONLY})
+  --no-warmup              成功后不跑 cold_start_bench warmup
+                           (默认: ${NO_WARMUP}，即默认会 warmup)
+  -h, --help               显示本帮助
+
+其它默认（非 CLI，可改脚本内变量 / 环境变量）:
+  pause 镜像:              ${PAUSE_IMAGE}
+  crictl 版本:             ${CRICTL_VERSION}
+  containerd 版本(安装包): ${CONTAINERD_VERSION}
+  kata 版本:               ${KATA_VERSION}
+  安装包目录:              ${INSTALL_FILES_DIR}
+                           (可用环境变量 INSTALL_FILES_DIR 覆盖)
+
+示例:
+  $0
+  $0 --cni-type bridge
+  $0 --cni-type bridge --ip-masq true
+  $0 --runtime kata --hypervisor qemu
+  $0 --check-only
+  $0 --no-warmup
+EOF
+    exit 0
+}
+
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            usage ;;
         --check-only)
             CHECK_ONLY=true; shift ;;
         --no-warmup)
@@ -103,7 +149,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--hypervisor dragonball|qemu|cloud-hypervisor|firecracker] [--snapshotter overlayfs|erofs] [--check-only] [--no-warmup]"
+            echo "运行 $0 --help 查看用法与默认值"
             exit 1 ;;
     esac
 done

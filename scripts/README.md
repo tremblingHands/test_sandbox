@@ -23,7 +23,7 @@
 
 ```bash
 ./scripts/setup/setup.sh                          # 成功后默认 warmup: cold_start_bench.py
-./scripts/setup/setup.sh --cni-type bridge --ip-masq false
+./scripts/setup/setup.sh --cni-type bridge          # 默认 --ip-masq false
 ./scripts/setup/setup.sh --no-warmup              # 跳过 warmup
 ./scripts/setup/build_install_runtime.sh              # 默认 --mode release
 ./scripts/setup/build_install_runtime.sh --mode debug
