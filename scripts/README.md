@@ -38,11 +38,14 @@
 | `throughput_sweep.sh` | 自动划核扫吞吐参数 |
 | `scale_bench.py` | 并发扩展性评估 |
 | `max_concurrency.py` | 最大同时存活沙箱数 |
+| `bbolt_metadata_bench.sh` | metadata 风格 bbolt 场景微基准（sync/no_sync × update/merged/batch） |
 
 ```bash
 python3 scripts/bench/cold_start_bench.py --runs 50
 ./scripts/bench/multi_single_cold_start.sh 128-255 128 1 --profile --perf
 ./scripts/bench/throughput_sweep.sh --help
+./scripts/bench/bbolt_metadata_bench.sh --goroutines 128 --rounds 200 --mode sync --tx update
+./scripts/bench/bbolt_metadata_bench.sh --cpus 128 --goroutines 128 --mode no_sync --tx merged
 ```
 
 ## profile/ — 剖析与资源

@@ -2284,6 +2284,8 @@ bbolt `Batch`：多 goroutine 机会性合并进一次事务，减少 fsync 次�
 | D. 镜像/snapshot 预热 | 降并发 Prepare 风暴 | `snapshot.Prepare.*.tx.wait` |
 | E. pprof mutex | 与 TRACE 交叉 | `metadata.(*DB).Update` 占比是否下降 |
 
+场景微基准（不经 CRI，只压 bbolt 写形状）：`scripts/bench/bbolt_metadata_bench.sh`，矩阵 `sync|no_sync` × `update|merged|batch` × `G`，输出 round 吞吐与 wait/exec/commit 近似分位。
+
 ### 17.8 小结（§17）
 
 1. **机制**：单写者 + 每事务（默认同步）fsync；TRACE 已证明 wait≫exec。  
