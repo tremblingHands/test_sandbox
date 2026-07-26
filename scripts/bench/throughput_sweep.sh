@@ -8,6 +8,8 @@
 #   K 只跑 >= N_w 的候选（列表为空则至少跑 K=N_w）
 #   沙箱 cpuset: all = HOST；excl-cd = HOST \ CD
 #   multi_single 的 NUMA（membind）= --worker-numa
+#   默认 HOST = 在线 CPU \ {0}（避开 core0，含 containerd / sandbox / workers）
+#   显式 --host-cpus 原样使用；--allow-cpu0 可让自动探测保留 0
 #
 # 用法:
 #   ./scripts/bench/throughput_sweep.sh \
@@ -25,6 +27,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MULTI_SCRIPT="${SCRIPT_DIR}/multi_single_cold_start.sh"
 
 HOST_CPUS=""
+ALLOW_CPU0=false
 CONTAINERD_COUNTS=""
 WORKER_COUNTS=""
 WORKER_NUMA=""
@@ -37,6 +40,11 @@ RESTORE=true
 DRY_RUN=false
 CONFIRM_DURATION=""
 CONFIRM_TOP=0
+MAX_MEAN_MS=""
+RUNTIME="runc"
+LABEL_CNI=""
+LABEL_HYPERVISOR=""
+OUT_ROOT_OVERRIDE=""
 
 DROPIN_SWEEP_LEFTOVER="/etc/systemd/system/containerd.service.d/90-throughput-sweep-cpuset.conf"
 UNIT_FILE=""
@@ -53,18 +61,27 @@ usage() {
   --workers LIST           K 候选；实际只跑 K>=N_w（缺省/滤空则至少 K=N_w）
 
 可选:
-  --host-cpus SPEC         参与划核的全集（默认自动探测在线 CPU）
+  --host-cpus SPEC         参与划核的全集（默认=在线 CPU 去掉 0）
+  --allow-cpu0             自动探测 HOST 时保留 CPU 0（显式 --host-cpus 不受影响）
   --sandbox-modes LIST     all,excl-cd（默认两者）
   --duration SEC           压测时长（默认 30）
   --preconfig N            透传 --preconfig（默认 50）
   --mems SPEC              覆盖沙箱 --cpuset-mems（默认=当轮 worker-numa）
   --confirm-duration SEC   对 Top-N 再用更长 duration 复核（可选）
   --confirm-top N          复核点数（默认 0=不复核）
+  --max-mean-ms N          结束后在 mean≤N 的组合中选最大 tps（写 best_under_mean.json）
+  --runtime runc|kata      透传 crictl runp --runtime（默认 runc）
+  --label-cni NAME         结果元数据标签（不参与划核）
+  --label-hypervisor NAME  结果元数据标签（不参与划核；runc 可空）
+  --out-root DIR           指定输出目录（默认 results/throughput_sweep/<ts>）
   --no-restore             结束不恢复扫前 containerd.service
   --dry-run                只打印将跑的组合，不改 unit、不压测
   -h, --help
 
-划核: worker 在指定 NUMA 上取编号最大的 N_w 个；containerd 在 HOST\WR 取编号最小的 N_c 个。
+划核: worker 在指定 NUMA∩HOST 上取编号最大的 N_w 个；
+      containerd 在 HOST\WR 取编号最小的 N_c 个；
+      sandbox: all=HOST，excl-cd=HOST\CD。
+默认 HOST 不含 CPU 0，故 containerd / sandbox / workers 都不会落到 core0。
 绑核: 通过 systemctl show FragmentPath 定位实际加载的 containerd.service 再改；
       失败时回退 /etc → /usr/lib。结束可恢复扫前备份。
 不够则 skip。workers 与 containerd 永不重叠。
@@ -89,6 +106,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host-cpus) HOST_CPUS="$2"; shift 2 ;;
+        --allow-cpu0) ALLOW_CPU0=true; shift ;;
         --containerd-cpus) CONTAINERD_COUNTS="$2"; shift 2 ;;
         --worker-cpus) WORKER_COUNTS="$2"; shift 2 ;;
         --worker-numa) WORKER_NUMA="$2"; shift 2 ;;
@@ -99,12 +117,27 @@ while [[ $# -gt 0 ]]; do
         --mems) MEMS_OVERRIDE="$2"; shift 2 ;;
         --confirm-duration) CONFIRM_DURATION="$2"; shift 2 ;;
         --confirm-top) CONFIRM_TOP="$2"; shift 2 ;;
+        --max-mean-ms) MAX_MEAN_MS="$2"; shift 2 ;;
+        --runtime) RUNTIME="$2"; shift 2 ;;
+        --label-cni) LABEL_CNI="$2"; shift 2 ;;
+        --label-hypervisor) LABEL_HYPERVISOR="$2"; shift 2 ;;
+        --out-root) OUT_ROOT_OVERRIDE="$2"; shift 2 ;;
         --no-restore) RESTORE=false; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage ;;
         *) echo "未知参数: $1"; usage ;;
     esac
 done
+
+if [ -n "$MAX_MEAN_MS" ] && ! [[ "$MAX_MEAN_MS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "错误: --max-mean-ms 须为非负数字，收到: $MAX_MEAN_MS"
+    exit 1
+fi
+
+case "$RUNTIME" in
+    runc|kata) ;;
+    *) echo "错误: --runtime 必须是 runc | kata，收到: $RUNTIME"; exit 1 ;;
+esac
 
 [[ -n "$CONTAINERD_COUNTS" ]] || { echo "错误: 需要 --containerd-cpus"; usage; }
 [[ -n "$WORKER_COUNTS" ]] || { echo "错误: 需要 --worker-cpus"; usage; }
@@ -439,10 +472,21 @@ parse_all_line() {
 
 cd "$REPO_DIR"
 
+HOST_CPUS_EXPLICIT=true
 if [ -z "$HOST_CPUS" ]; then
+    HOST_CPUS_EXPLICIT=false
     HOST_CPUS=$(detect_online_cpus_spec)
 fi
 HOST_LIST=$(expand_spec_to_list "$HOST_CPUS")
+# 默认避开 CPU 0（仅自动探测路径）；显式 --host-cpus 原样保留
+if ! $HOST_CPUS_EXPLICIT && ! $ALLOW_CPU0; then
+    HOST_LIST=$(list_diff "$HOST_LIST" "0")
+    if [ -z "${HOST_LIST// }" ]; then
+        echo "错误: 排除 CPU 0 后 HOST 为空；可用 --allow-cpu0 或 --host-cpus"
+        exit 1
+    fi
+    HOST_CPUS=$(list_to_spec "$HOST_LIST")
+fi
 
 IFS=' ' read -ra NUMA_ARR <<< "$(parse_csv_ints "$WORKER_NUMA")"
 if [ ${#NUMA_ARR[@]} -eq 0 ]; then
@@ -457,11 +501,138 @@ for _n in "${NUMA_ARR[@]}"; do
 done
 
 TS=$(date +%Y%m%d%H%M%S)
-OUT_ROOT="${REPO_DIR}/results/throughput_sweep/${TS}"
+if [ -n "$OUT_ROOT_OVERRIDE" ]; then
+    OUT_ROOT="$OUT_ROOT_OVERRIDE"
+else
+    OUT_ROOT="${REPO_DIR}/results/throughput_sweep/${TS}"
+fi
 mkdir -p "$OUT_ROOT/runs"
 SUMMARY_CSV="${OUT_ROOT}/summary.csv"
 SWEEP_LOG="${OUT_ROOT}/sweep.log"
 BEST_JSON="${OUT_ROOT}/best.json"
+BEST_UNDER_MEAN_JSON="${OUT_ROOT}/best_under_mean.json"
+BEST_BY_CD_CSV="${OUT_ROOT}/best_by_cd_n.csv"
+BEST_BY_CD_JSON="${OUT_ROOT}/best_by_cd_n.json"
+BEST_BY_CD_UNDER_MEAN_CSV="${OUT_ROOT}/best_by_cd_n_under_mean.csv"
+BEST_BY_CD_UNDER_MEAN_JSON="${OUT_ROOT}/best_by_cd_n_under_mean.json"
+# 写入 OUT_ROOT 供外层矩阵脚本读取
+echo "$OUT_ROOT" > "${OUT_ROOT}/.out_root"
+
+# 从 summary 按 cd_n 取最大 tps；mean_lim 空=无时延约束。写 csv/json 并打印表。
+emit_best_by_cd_n() {
+    local mean_lim="${1:-}" out_csv="$2" out_json="$3" title="$4"
+    local tmp rows=0
+    tmp=$(mktemp)
+    awk -F, -v lim="$mean_lim" '
+        NR > 1 && ($9 == "ok" || $9 == "confirm") {
+            if (lim != "" && (($16 + 0) > (lim + 0))) next
+            cd = $2 + 0
+            tps = $10 + 0
+            if (!(cd in best) || tps > best[cd]) {
+                best[cd] = tps
+                line[cd] = $0
+            }
+        }
+        END {
+            for (cd in best) printf "%d\t%s\n", cd, line[cd]
+        }
+    ' "$SUMMARY_CSV" | sort -n -k1,1 > "$tmp"
+
+    echo "cni,runtime,hypervisor,cd_n,tps,mean,p50,p95,p99,numa,wr_n,K,sandbox_mode,cd_cpus,wr_cpus,sandbox_cpus,status,total,success,run_dir" \
+        > "$out_csv"
+
+    {
+        echo "{"
+        echo "  \"cni\": \"${LABEL_CNI}\","
+        echo "  \"runtime\": \"${RUNTIME}\","
+        echo "  \"hypervisor\": \"${LABEL_HYPERVISOR}\","
+        if [ -n "$mean_lim" ]; then
+            echo "  \"constraint\": \"mean_ms <= $mean_lim\","
+            echo "  \"max_mean_ms\": $mean_lim,"
+        fi
+        echo "  \"by_containerd_cpus\": ["
+    } > "$out_json"
+
+    echo ""
+    echo "=============================================="
+    echo "  $title"
+    printf "  %-6s %-10s %-10s %-8s %-6s %-6s %-10s %s\n" \
+        "cd_n" "tps" "mean_ms" "p50" "wr_n" "K" "mode" "cd_cpus"
+    echo "  --------------------------------------------------------------"
+
+    local first=true line cd_n numa wr_n K mode cd_cpus wr_cpus sb status tps total success p50 p95 p99 mean run_dir
+    while IFS=$'\t' read -r cd_n line; do
+        [ -n "$line" ] || continue
+        IFS=',' read -r numa _cd wr_n K mode cd_cpus wr_cpus sb status tps total success p50 p95 p99 mean run_dir _ <<< "$line"
+        echo "${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR},$cd_n,$tps,$mean,$p50,$p95,$p99,$numa,$wr_n,$K,$mode,$cd_cpus,$wr_cpus,$sb,$status,$total,$success,$run_dir" \
+            >> "$out_csv"
+        printf "  %-6s %-10s %-10s %-8s %-6s %-6s %-10s %s\n" \
+            "$cd_n" "${tps}/s" "$mean" "$p50" "$wr_n" "$K" "$mode" "$cd_cpus"
+        if $first; then first=false; else echo "," >> "$out_json"; fi
+        cat >> "$out_json" <<EOF
+    {
+      "cni": "${LABEL_CNI}",
+      "runtime": "${RUNTIME}",
+      "hypervisor": "${LABEL_HYPERVISOR}",
+      "containerd_cpus_count": $cd_n,
+      "tps": $tps,
+      "mean_ms": $mean,
+      "p50_ms": $p50,
+      "p95_ms": $p95,
+      "p99_ms": $p99,
+      "worker_numa": $numa,
+      "worker_cpus_count": $wr_n,
+      "workers_K": $K,
+      "sandbox_mode": "$mode",
+      "containerd_cpus": "$cd_cpus",
+      "worker_cpus": "$wr_cpus",
+      "sandbox_cpus": "$sb",
+      "status": "$status",
+      "total": $total,
+      "success": $success,
+      "run_dir": "$run_dir"
+    }
+EOF
+        rows=$((rows + 1))
+    done < "$tmp"
+    rm -f "$tmp"
+
+    {
+        echo
+        echo "  ]"
+        echo "}"
+    } >> "$out_json"
+
+    if [ "$rows" -eq 0 ]; then
+        echo "  (无符合条件的成功组合)"
+        if [ -n "$mean_lim" ]; then
+            cat > "$out_json" <<EOF
+{
+  "cni": "${LABEL_CNI}",
+  "runtime": "${RUNTIME}",
+  "hypervisor": "${LABEL_HYPERVISOR}",
+  "constraint": "mean_ms <= $mean_lim",
+  "max_mean_ms": $mean_lim,
+  "by_containerd_cpus": [],
+  "note": "no matching successful runs"
+}
+EOF
+        else
+            cat > "$out_json" <<EOF
+{
+  "cni": "${LABEL_CNI}",
+  "runtime": "${RUNTIME}",
+  "hypervisor": "${LABEL_HYPERVISOR}",
+  "by_containerd_cpus": [],
+  "note": "no matching successful runs"
+}
+EOF
+        fi
+    fi
+    echo "  csv:  $out_csv"
+    echo "  json: $out_json"
+    echo "=============================================="
+}
 
 exec > >(tee -a "$SWEEP_LOG") 2>&1
 
@@ -469,6 +640,13 @@ echo "=============================================="
 echo "  吞吐扫描 throughput_sweep"
 echo "=============================================="
 echo "  host-cpus:        $HOST_CPUS ($(list_count "$HOST_LIST") cpus)"
+if $HOST_CPUS_EXPLICIT; then
+    echo "  host-cpus 来源:   显式 --host-cpus"
+elif $ALLOW_CPU0; then
+    echo "  host-cpus 来源:   自动探测（保留 CPU 0）"
+else
+    echo "  host-cpus 来源:   自动探测（已排除 CPU 0）"
+fi
 echo "  containerd-cpus:  $CONTAINERD_COUNTS  (counts)"
 echo "  worker-cpus:      $WORKER_COUNTS  (counts)"
 echo "  worker-numa:      $WORKER_NUMA"
@@ -480,12 +658,16 @@ echo "  sandbox-modes:    $SANDBOX_MODES"
 echo "  duration:         $DURATION"
 echo "  preconfig:        $PRECONFIG"
 echo "  cpuset-mems:      ${MEMS_OVERRIDE:-(每轮=当轮 numa)}"
+echo "  max-mean-ms:      ${MAX_MEAN_MS:-(未启用)}"
+echo "  runtime:          $RUNTIME"
+echo "  label-cni:        ${LABEL_CNI:-(空)}"
+echo "  label-hypervisor: ${LABEL_HYPERVISOR:-(空)}"
 echo "  unit file:        $(resolve_containerd_unit_file)"
 echo "  output:           $OUT_ROOT"
 echo "  dry-run:          $DRY_RUN"
 echo "=============================================="
 
-echo "numa,cd_n,wr_n,K,sandbox_mode,cd_cpus,wr_cpus,sandbox_cpus,status,tps,total,success,p50,p95,p99,mean,run_dir,reason" \
+echo "numa,cd_n,wr_n,K,sandbox_mode,cd_cpus,wr_cpus,sandbox_cpus,status,tps,total,success,p50,p95,p99,mean,run_dir,reason,cni,runtime,hypervisor" \
     > "$SUMMARY_CSV"
 
 IFS=' ' read -ra CD_COUNTS_ARR <<< "$(parse_csv_ints "$CONTAINERD_COUNTS")"
@@ -522,7 +704,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
             avail_wr=$(list_count "$NODE_HOST_LIST")
             if [ "$avail_wr" -lt "$N_w" ]; then
                 echo "[skip] numa=$NUMA_NODE N_c=$N_c N_w=$N_w: 仅 ${avail_wr} 核 < N_w"
-                echo "$NUMA_NODE,$N_c,$N_w,,,,,,skip,,,,,,,\"\",numa_too_small" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,,,,skip,,,,,,,\"\",numa_too_small,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
             WR_LIST=$(list_take_highest "$N_w" "$NODE_HOST_LIST")
@@ -532,7 +714,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
             avail_cd=$(list_count "$REST")
             if [ "$avail_cd" -lt "$N_c" ]; then
                 echo "[skip] numa=$NUMA_NODE N_c=$N_c N_w=$N_w WR=$WR_SPEC: HOST\\WR 仅 ${avail_cd} 核 < N_c"
-                echo "$NUMA_NODE,$N_c,$N_w,,,${WR_SPEC},,skip,,,,,,,\"\",insufficient_cpus" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,${WR_SPEC},,skip,,,,,,,\"\",insufficient_cpus,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
             CD_LIST=$(list_take_lowest "$N_c" "$REST")
@@ -540,7 +722,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
 
             if list_intersect_nonempty "$CD_LIST" "$WR_LIST"; then
                 echo "[skip] 内部错误: CD 与 WR 重叠"
-                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,skip,,,,,,,\"\",overlap" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,skip,,,,,,,\"\",overlap,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
 
@@ -570,15 +752,15 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                             excl-cd) SB_SPEC=$(list_to_spec "$(list_diff "$HOST_LIST" "$CD_LIST")") ;;
                             *) echo "[skip] 未知 sandbox mode: $mode"; continue ;;
                         esac
-                        echo "[dry-run] numa=$NUMA_NODE N_c=$N_c N_w=$N_w K=$K mode=$mode cd=$CD_SPEC wr=$WR_SPEC sb=$SB_SPEC"
-                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,dry-run,,,,,,,\"\",\"\"" >> "$SUMMARY_CSV"
+                        echo "[dry-run] numa=$NUMA_NODE N_c=$N_c N_w=$N_w K=$K mode=$mode cd=$CD_SPEC wr=$WR_SPEC sb=$SB_SPEC runtime=$RUNTIME"
+                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,dry-run,,,,,,,\"\",\"\",${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                     done
                 done
                 continue
             fi
 
             if ! apply_containerd_cpus "$CD_SPEC"; then
-                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,fail,,,,,,,\"\",containerd_restart_failed" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,fail,,,,,,,\"\",containerd_restart_failed,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
 
@@ -598,7 +780,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
 
                     echo ""
                     echo "----- ${run_tag} -----"
-                    echo "  multi_single $WR_SPEC $K $NUMA_NODE -- duration=$DURATION cpuset-cpus=$SB_SPEC mems=$MEMS_VAL"
+                    echo "  multi_single $WR_SPEC $K $NUMA_NODE -- duration=$DURATION cpuset-cpus=$SB_SPEC mems=$MEMS_VAL runtime=$RUNTIME"
 
                     set +e
                     bash "$MULTI_SCRIPT" "$WR_SPEC" "$K" "$NUMA_NODE" -- \
@@ -606,6 +788,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                         --cpuset-cpus "$SB_SPEC" \
                         --cpuset-mems "$MEMS_VAL" \
                         --preconfig "$PRECONFIG" \
+                        --runtime "$RUNTIME" \
                         >"$run_log" 2>&1
                     rc=$?
                     set -e
@@ -617,7 +800,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                     parsed=$(parse_all_line < "$run_log" || true)
                     if [ -z "$parsed" ]; then
                         echo "  结果: FAIL/无 ALL 行 (rc=$rc) 见 $run_log"
-                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,fail,,,,,,${run_dir},no_all_line" >> "$SUMMARY_CSV"
+                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,fail,,,,,,${run_dir},no_all_line,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                         continue
                     fi
                     # shellcheck disable=SC2086
@@ -625,7 +808,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                     total=$1; success=$2; p50=$3; p95=$4; p99=$5; mean=$6; tps=$7
                     echo "  结果: tps=$tps total=$total success=$success p50=$p50 p95=$p95 mean=$mean"
 
-                    echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,ok,$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir}," \
+                    echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,ok,$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" \
                         >> "$SUMMARY_CSV"
 
                     awk_best=$(awk -v t="$tps" -v b="$best_tps" 'BEGIN{print (t+0>b+0)?"1":"0"}')
@@ -660,6 +843,7 @@ if ! $DRY_RUN && [ "${CONFIRM_TOP:-0}" -gt 0 ] && [ -n "${CONFIRM_DURATION:-}" ]
             --cpuset-cpus "$SB_SPEC" \
             --cpuset-mems "$MEMS_VAL" \
             --preconfig "$PRECONFIG" \
+            --runtime "$RUNTIME" \
             >"${run_dir}/multi.log" 2>&1
         set -e
         [ -d "${REPO_DIR}/results/multi" ] && cp -a "${REPO_DIR}/results/multi" "${run_dir}/multi_results" 2>/dev/null || true
@@ -668,7 +852,7 @@ if ! $DRY_RUN && [ "${CONFIRM_TOP:-0}" -gt 0 ] && [ -n "${CONFIRM_DURATION:-}" ]
             # shellcheck disable=SC2086
             set -- $parsed
             echo "  confirm tps=$7 (was $_tps)"
-            echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,confirm,$7,$1,$2,$3,$4,$5,$6,${run_dir}," >> "$SUMMARY_CSV"
+            echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,confirm,$7,$1,$2,$3,$4,$5,$6,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
             awk_best=$(awk -v t="$7" -v b="$best_tps" 'BEGIN{print (t+0>b+0)?"1":"0"}')
             if [ "$awk_best" = "1" ]; then
                 best_tps="$7"
@@ -686,6 +870,9 @@ elif [ -n "$best_line" ]; then
     b_mems="${MEMS_OVERRIDE:-$b_numa}"
     cat > "$BEST_JSON" <<EOF
 {
+  "cni": "${LABEL_CNI}",
+  "runtime": "${RUNTIME}",
+  "hypervisor": "${LABEL_HYPERVISOR}",
   "tps": $b_tps,
   "worker_numa": $b_numa,
   "containerd_cpus_count": $b_nc,
@@ -709,13 +896,94 @@ EOF
     echo ""
     echo "=============================================="
     echo "  最优吞吐: ${b_tps}/s"
+    echo "  config:     cni=${LABEL_CNI:--} runtime=$RUNTIME hypervisor=${LABEL_HYPERVISOR:--}"
     echo "  containerd: $b_cd ($b_nc)"
     echo "  workers:    $b_wr ($b_nw)  K=$b_k  numa=$b_numa"
     echo "  sandbox:    $b_mode → $b_sb"
+    echo "  mean_ms:    $b_mean"
     echo "  best.json:  $BEST_JSON"
     echo "  summary:    $SUMMARY_CSV"
     echo "=============================================="
 else
-    echo '{"tps": null, "note": "no successful runs"}' > "$BEST_JSON"
+    cat > "$BEST_JSON" <<EOF
+{"tps": null, "cni": "${LABEL_CNI}", "runtime": "${RUNTIME}", "hypervisor": "${LABEL_HYPERVISOR}", "note": "no successful runs"}
+EOF
     echo "[sweep] 无成功跑通的组合（见 $SUMMARY_CSV）"
+fi
+
+# 按 containerd 核数分组的最大吞吐（含 confirm）
+if ! $DRY_RUN; then
+    emit_best_by_cd_n "" "$BEST_BY_CD_CSV" "$BEST_BY_CD_JSON" \
+        "各 containerd 核数下的最大吞吐"
+fi
+
+# 时延约束下最大吞吐：扫完后从 summary 选 mean≤N 且 tps 最大（含 confirm）
+if ! $DRY_RUN && [ -n "$MAX_MEAN_MS" ]; then
+    constrained_line=$(awk -F, -v lim="$MAX_MEAN_MS" '
+        NR > 1 && ($9 == "ok" || $9 == "confirm") && ($16 + 0) <= (lim + 0) {
+            if (($10 + 0) > (best + 0)) {
+                best = $10 + 0
+                line = $0
+            }
+        }
+        END { if (line != "") print line }
+    ' "$SUMMARY_CSV")
+    if [ -n "$constrained_line" ]; then
+        IFS=',' read -r c_numa c_nc c_nw c_k c_mode c_cd c_wr c_sb c_status c_tps c_tot c_suc c_p50 c_p95 c_p99 c_mean c_dir _ <<< "$constrained_line"
+        c_mems="${MEMS_OVERRIDE:-$c_numa}"
+        cat > "$BEST_UNDER_MEAN_JSON" <<EOF
+{
+  "cni": "${LABEL_CNI}",
+  "runtime": "${RUNTIME}",
+  "hypervisor": "${LABEL_HYPERVISOR}",
+  "constraint": "mean_ms <= $MAX_MEAN_MS",
+  "max_mean_ms": $MAX_MEAN_MS,
+  "tps": $c_tps,
+  "worker_numa": $c_numa,
+  "containerd_cpus_count": $c_nc,
+  "worker_cpus_count": $c_nw,
+  "workers_K": $c_k,
+  "sandbox_mode": "$c_mode",
+  "containerd_cpus": "$c_cd",
+  "worker_cpus": "$c_wr",
+  "sandbox_cpus": "$c_sb",
+  "cpuset_mems": "$c_mems",
+  "status": "$c_status",
+  "duration": $DURATION,
+  "total": $c_tot,
+  "success": $c_suc,
+  "p50_ms": $c_p50,
+  "p95_ms": $c_p95,
+  "p99_ms": $c_p99,
+  "mean_ms": $c_mean,
+  "run_dir": "$c_dir"
+}
+EOF
+        echo ""
+        echo "=============================================="
+        echo "  时延约束最优: mean≤${MAX_MEAN_MS}ms → ${c_tps}/s"
+        echo "  containerd: $c_cd ($c_nc)"
+        echo "  workers:    $c_wr ($c_nw)  K=$c_k  numa=$c_numa"
+        echo "  sandbox:    $c_mode → $c_sb"
+        echo "  mean_ms:    $c_mean  (status=$c_status)"
+        echo "  best_under_mean.json: $BEST_UNDER_MEAN_JSON"
+        echo "=============================================="
+    else
+        cat > "$BEST_UNDER_MEAN_JSON" <<EOF
+{
+  "cni": "${LABEL_CNI}",
+  "runtime": "${RUNTIME}",
+  "hypervisor": "${LABEL_HYPERVISOR}",
+  "constraint": "mean_ms <= $MAX_MEAN_MS",
+  "max_mean_ms": $MAX_MEAN_MS,
+  "tps": null,
+  "note": "no successful runs with mean_ms <= $MAX_MEAN_MS"
+}
+EOF
+        echo ""
+        echo "[sweep] 无 mean≤${MAX_MEAN_MS}ms 的成功组合 → $BEST_UNDER_MEAN_JSON"
+    fi
+
+    emit_best_by_cd_n "$MAX_MEAN_MS" "$BEST_BY_CD_UNDER_MEAN_CSV" "$BEST_BY_CD_UNDER_MEAN_JSON" \
+        "各 containerd 核数下 mean≤${MAX_MEAN_MS}ms 的最大吞吐"
 fi

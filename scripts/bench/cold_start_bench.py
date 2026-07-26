@@ -451,10 +451,11 @@ def run_benchmark(runs=50):
     runps = [t.t_runp_ms for t in traces]
     readys = [t.t_ready_ms for t in traces]
 
+    runtime_name = getattr(args, "runtime", "runc")
     return {
         "config": {
             "pause_image": PAUSE_IMAGE,
-            "runtime": "runc (via crictl)",
+            "runtime": "{} (via crictl)".format(runtime_name),
             "description": "Pod sandbox cold start — pause container only, no image pull",
         },
         "summary": {
@@ -488,6 +489,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     report = run_benchmark(runs=args.runs)
+
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
 
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)

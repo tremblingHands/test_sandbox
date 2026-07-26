@@ -13,6 +13,7 @@
 #   ./setup.sh --cni-type bridge --ip-masq false  # bridge 且关闭 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --check-only                   # 仅检查，不安装
+#   ./setup.sh --no-warmup                    # 成功后不跑 cold_start_bench warmup
 #
 # 安装包缓存:
 #   默认目录 <repo>/install/（可用环境变量 INSTALL_FILES_DIR 覆盖，已在 .gitignore）
@@ -52,12 +53,15 @@ detect_arch() {
 ARCH=$(detect_arch)
 
 CHECK_ONLY=false
+NO_WARMUP=false
 HYPERVISOR_EXPLICIT=false
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check-only)
             CHECK_ONLY=true; shift ;;
+        --no-warmup)
+            NO_WARMUP=true; shift ;;
         --cni-type)
             CNI_TYPE="$2"
             case "$CNI_TYPE" in
@@ -99,7 +103,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         *)
             echo "ERROR: 未知参数: $1"
-            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--hypervisor dragonball|qemu|cloud-hypervisor|firecracker] [--snapshotter overlayfs|erofs] [--check-only]"
+            echo "用法: $0 [--cni-type bridge|ipvlan-l2|ipvlan-l3] [--ip-masq true|false] [--runtime runc|kata] [--hypervisor dragonball|qemu|cloud-hypervisor|firecracker] [--snapshotter overlayfs|erofs] [--check-only] [--no-warmup]"
             exit 1 ;;
     esac
 done
@@ -1079,10 +1083,33 @@ main() {
 
     print_containerd_cpus
 
+    # 仅全部检查成功时 warmup（--check-only / --no-warmup 跳过）
+    if [ "$errors" -eq 0 ] && ! $CHECK_ONLY && ! $NO_WARMUP; then
+        local warmup_py="${REPO_ROOT}/scripts/bench/cold_start_bench.py"
+        echo ""
+        echo "--- Warmup: cold_start_bench.py (runtime=$CONTAINERD_RUNTIME) ---"
+        if [ ! -f "$warmup_py" ]; then
+            warn "未找到 $warmup_py，跳过 warmup"
+        else
+            set +e
+            (cd "$REPO_ROOT" && python3 "$warmup_py" --runtime "$CONTAINERD_RUNTIME")
+            local warmup_rc=$?
+            set -e
+            if [ "$warmup_rc" -eq 0 ]; then
+                pass "warmup 完成"
+            else
+                warn "warmup 失败 (exit=$warmup_rc)；环境已就绪，可稍后重跑 cold_start_bench.py"
+            fi
+        fi
+    elif [ "$errors" -eq 0 ] && $NO_WARMUP; then
+        echo ""
+        echo "已跳过 warmup（--no-warmup）"
+    fi
+
     echo ""
     echo "下一步:"
     echo "  # 单发冷启动测试"
-    echo "  python3 scripts/bench/cold_start_bench.py --runs 50"
+    echo "  python3 scripts/bench/cold_start_bench.py --runs 50 --runtime $CONTAINERD_RUNTIME"
     echo ""
     echo "  # 并发冷启动测试"
     echo "  ./scripts/bench/concurrent_cold_start.py 10 3"

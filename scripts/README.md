@@ -22,9 +22,11 @@
 | `remove_kata.sh` | 清理 kata 二进制与配置 |
 
 ```bash
-./scripts/setup/setup.sh
+./scripts/setup/setup.sh                          # 成功后默认 warmup: cold_start_bench.py
 ./scripts/setup/setup.sh --cni-type bridge --ip-masq false
-./scripts/setup/build_install_runtime.sh --mode release
+./scripts/setup/setup.sh --no-warmup              # 跳过 warmup
+./scripts/setup/build_install_runtime.sh              # 默认 --mode release
+./scripts/setup/build_install_runtime.sh --mode debug
 ```
 
 ## bench/ — 沙箱压测
@@ -35,7 +37,8 @@
 | `single_cold_start.py` | 单 worker 串行冷启动 |
 | `concurrent_cold_start.py` | 多线程并发冷启动 |
 | `multi_single_cold_start.sh` | 多进程绑核冷启动（可挂 perf/pprof/resources） |
-| `throughput_sweep.sh` | 自动划核扫吞吐参数 |
+| `throughput_sweep.sh` | 自动划核扫吞吐；按 cd_n 分组最优；`--runtime` / `--max-mean-ms` / 配置标签 |
+| `config_matrix_sweep.sh` | 推荐入口：release/profile 编译 → env 基线 → 每组合 cold_start_bench → 吞吐矩阵 |
 | `scale_bench.py` | 并发扩展性评估 |
 | `max_concurrency.py` | 最大同时存活沙箱数 |
 | `bbolt_metadata_bench.sh` | metadata 风格 bbolt 场景微基准（sync/no_sync × update/merged/batch） |
@@ -44,6 +47,21 @@
 python3 scripts/bench/cold_start_bench.py --runs 50
 ./scripts/bench/multi_single_cold_start.sh 128-255 128 1 --profile --perf
 ./scripts/bench/throughput_sweep.sh --help
+# 配置矩阵：release 编译 → env_baseline → 每组合 cold_start_bench + 吞吐扫
+# （默认 worker-numa=1、sandbox=excl-cd、ip-masq=false；--profile=debug 编译）
+./scripts/bench/config_matrix_sweep.sh \
+  --cnis bridge,ipvlan-l3 \
+  --runtimes runc,kata \
+  --hypervisors qemu,cloud-hypervisor \
+  --containerd-cpus 2,4,8,16 \
+  --worker-cpus 64,128 \
+  --workers 64,128,256 \
+  --duration 30 --max-mean-ms 200
+./scripts/bench/config_matrix_sweep.sh ... --cold-start-runs 50
+./scripts/bench/config_matrix_sweep.sh ... --skip-cold-start
+./scripts/bench/config_matrix_sweep.sh ... --profile      # debug 编译
+./scripts/bench/config_matrix_sweep.sh ... --skip-build   # 跳过编译
+./scripts/bench/config_matrix_sweep.sh ... --dry-run
 ./scripts/bench/bbolt_metadata_bench.sh --goroutines 128 --rounds 200 --mode sync --tx update
 ./scripts/bench/bbolt_metadata_bench.sh --cpus 128 --goroutines 128 --mode no_sync --tx merged
 ```

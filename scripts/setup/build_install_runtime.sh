@@ -16,6 +16,7 @@
 #   https://gitee.com/omnihorizon/plugins.git
 #
 # 用法:
+#   ./scripts/setup/build_install_runtime.sh                 # 默认 release
 #   ./scripts/setup/build_install_runtime.sh --mode debug
 #   ./scripts/setup/build_install_runtime.sh --mode release
 #   ./scripts/setup/build_install_runtime.sh --mode debug --only cni
@@ -69,7 +70,7 @@ CONTAINERD_REF_RELEASE="${CONTAINERD_REF_RELEASE:-b4ab8c0537d3178a4b88cbafb9eab8
 RUNC_REF_RELEASE="${RUNC_REF_RELEASE:-bb14dabeb7185bb72c8c86735d090dcb20f36587}"
 CNI_REF_RELEASE="${CNI_REF_RELEASE:-33cc6bd63968280b330b00468afbb66161aaa6bd}"
 
-MODE=""
+MODE="release"   # 默认 release（吞吐压测）；debug 需显式 --mode debug
 ONLY="containerd,shim,runc,cni"
 DO_RESTART=true
 DO_BACKUP=true
@@ -96,6 +97,7 @@ usage() {
   https://gitee.com/omnihorizon/plugins.git
 
 用法:
+  ./scripts/setup/build_install_runtime.sh                 # 默认 release
   ./scripts/setup/build_install_runtime.sh --mode debug     # profile 分支
   ./scripts/setup/build_install_runtime.sh --mode release   # 正式 commit
   ./scripts/setup/build_install_runtime.sh debug
@@ -107,10 +109,10 @@ usage() {
 
 模式与源码 ref:
   debug   → containerd:profile  runc:profile_cgroup-misc  plugins:profile
-  release → containerd:b4ab8c05…  runc:bb14dabe…  plugins:33cc6bd6…
+  release → containerd:b4ab8c05…  runc:bb14dabe…  plugins:33cc6bd6…（默认）
 
 选项:
-  --mode debug|release   编译模式（必填，或用位置参数）
+  --mode debug|release   编译模式（默认 release；也可用位置参数）
   --only LIST            逗号分隔: containerd,shim,runc,cni（默认全开）
   --src-root DIR         默认 /home/nathan
   --no-restart           装完不重启 containerd
@@ -167,9 +169,6 @@ done
 
 case "$MODE" in
     debug|release) ;;
-    "")
-        echo "ERROR: 必须指定 --mode debug|release（或位置参数 debug|release）"
-        usage ;;
     *)
         echo "ERROR: --mode 必须是 debug 或 release，收到: $MODE"
         exit 1 ;;
