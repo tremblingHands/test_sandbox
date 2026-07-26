@@ -547,7 +547,7 @@ run_one_combo() {
         fi
         echo "[setup] bash $SETUP_SCRIPT ${setup_args[*]}"
         set +e
-        sudo bash "$SETUP_SCRIPT" "${setup_args[@]}"
+        bash "$SETUP_SCRIPT" "${setup_args[@]}"
         local setup_rc=$?
         set -e
         if [ "$setup_rc" -ne 0 ]; then

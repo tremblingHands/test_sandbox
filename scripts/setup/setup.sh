@@ -26,6 +26,17 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 # 本地安装包目录：优先从此处取包，缺失再下载
 INSTALL_FILES_DIR="${INSTALL_FILES_DIR:-${REPO_ROOT}/install}"
 
+# 保证能找到 /usr/local/bin 下的 crictl 等（勿再套一层 sudo 清 PATH）
+export PATH="/usr/local/bin:/usr/local/sbin:${PATH:-/usr/bin:/bin}"
+
+# 已是 root 时不调用真实 sudo（避免 secure_path 丢掉 /usr/local/bin）
+if [ "$(id -u)" -eq 0 ]; then
+    sudo() { "$@" ; }
+elif ! command -v sudo >/dev/null 2>&1; then
+    echo "ERROR: 需要 root，或安装 sudo 后以具备权限的用户运行" >&2
+    exit 1
+fi
+
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.6.32"
@@ -782,6 +793,22 @@ check_cni_network() {
     return 0
 }
 
+# 查找 crictl（兼容 sudo 精简 PATH）
+find_crictl() {
+    if command -v crictl &>/dev/null; then
+        command -v crictl
+        return 0
+    fi
+    local p
+    for p in /usr/local/bin/crictl /usr/bin/crictl; do
+        if [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ============================================================
 # 检查 crictl
 # ============================================================
@@ -789,16 +816,21 @@ check_crictl() {
     echo ""
     echo "--- crictl ---"
 
-    if command -v crictl &>/dev/null; then
-        local ver
-        ver=$(crictl --version 2>/dev/null | head -1)
-        pass "crictl 已安装: $ver"
+    local crictl_bin ver
+    if crictl_bin=$(find_crictl); then
+        # 保证后续步骤（含 sudo 子 shell）能直接调用
+        if ! command -v crictl &>/dev/null; then
+            export PATH="$(dirname "$crictl_bin"):${PATH}"
+        fi
+        ver=$("$crictl_bin" --version 2>/dev/null | head -1)
+        pass "crictl 已安装: $ver ($crictl_bin)"
     else
         if $CHECK_ONLY; then
             fail "crictl 未安装"
             return 1
         fi
-        warn "crictl 未安装，正在安装 v${CRICTL_VERSION}..."
+        # CRICTL_VERSION 已含 v 前缀，如 v1.30.0
+        warn "crictl 未安装，正在安装 ${CRICTL_VERSION}..."
 
         local pkg url tarball
         pkg="crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz"
@@ -806,7 +838,8 @@ check_crictl() {
         tarball=$(fetch_pkg "$pkg" "$url")
         sudo tar -C /usr/local/bin -xzf "$tarball"
         sudo chmod +x /usr/local/bin/crictl
-        pass "crictl 安装完成: $(crictl --version)"
+        export PATH="/usr/local/bin:${PATH}"
+        pass "crictl 安装完成: $(/usr/local/bin/crictl --version)"
     fi
 
     return 0
