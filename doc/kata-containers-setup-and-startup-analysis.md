@@ -32,7 +32,8 @@
 | 配置矩阵 | `scripts/bench/config_matrix_sweep.sh` |
 | containerd 配置 | `/etc/containerd/config.toml` |
 | kata shim（runtime-rs） | `/opt/kata/runtime-rs/bin/containerd-shim-kata-v2` |
-| kata shim（Go 静态，stratovirt） | `/opt/kata/bin/containerd-shim-kata-v2-go-static`（源自 `install/go-shim-static/`） |
+| kata shim（Go 静态，stratovirt） | `/opt/kata/bin/containerd-shim-kata-v2-go-static`（源自 `install/go-shim-static/`；构建说明见 `config/kata/go-shim-static/README.md`） |
+| 仓库内 kata 配置 | `config/kata/`（如 `configuration-clh-runtime-rs.toml`） |
 | kata 默认配置（runtime-rs symlink） | `/opt/kata/share/defaults/kata-containers/runtime-rs/configuration.toml` |
 | kata 默认配置（Go symlink） | `/opt/kata/share/defaults/kata-containers/configuration.toml` |
 | QEMU 配置 | `.../runtime-rs/configuration-qemu-runtime-rs.toml` |
@@ -302,9 +303,9 @@ QEMU 路径在相同环境下用 PCI blk 可工作；Dragonball / Firecracker �
 ### Cloud Hypervisor / StratoVirt
 
 - **cloud-hypervisor（CLI 别名）→ 内部名 `clh`**：Kata **4.0.0** runtime-rs 把插件/配置段从 `cloud-hypervisor` 改成了 **`clh`**。用旧段名会报 `Can not find plugin for hypervisor cloud-hypervisor`。
-- **aarch64 静态包缺 CLH 配置**：`arch/aarch64-options.mk` 未定义 `CLHCMD`，安装包里通常没有 `runtime-rs/configuration-clh-runtime-rs.toml`。`setup.sh` 从 `install/runtime-rs-configs/` 补齐。
+- **aarch64 静态包缺 CLH 配置**：`arch/aarch64-options.mk` 未定义 `CLHCMD`，安装包里通常没有 `runtime-rs/configuration-clh-runtime-rs.toml`。`setup.sh` 从 `config/kata/` 补齐。
 - **本机实测**（`--hypervisor cloud-hypervisor`，3 runs）：`t_runp` 约 **0.83–0.93s**（与清 firmware 后的 qemu 同量级）。
-- **stratovirt**：runtime-rs **无** 后端；须用 **Go** `containerd-shim-kata-v2` + 顶层 `configuration-stratovirt.toml`。官方动态链接 Go shim 需要 **GLIBC≥2.32**，本机 2.28 不可用 → `setup.sh` 安装 `install/go-shim-static/` 下的静态 shim 到 `/opt/kata/bin/containerd-shim-kata-v2-go-static`。
+- **stratovirt**：runtime-rs **无** 后端；须用 **Go** `containerd-shim-kata-v2` + 顶层 `configuration-stratovirt.toml`。官方动态链接 Go shim 需要 **GLIBC≥2.32**，本机 2.28 不可用 → `setup.sh` 安装 `install/go-shim-static/` 下的静态 shim 到 `/opt/kata/bin/containerd-shim-kata-v2-go-static`（构建见 `config/kata/go-shim-static/README.md`）。
 
 ### 5.4.1 为何各 hypervisor 冷启动差这么大
 
@@ -616,7 +617,7 @@ zgrep CONFIG_CGROUP_BPF /proc/config.gz
 | firecracker：注释 `jailer_path` | 避免 jail 路径/挂载异常 |
 | firecracker：`dial_timeout_ms=10` + `reconnect_timeout_ms=45000` | 修 4.0.0 静态包 retry_times=0 panic |
 | qemu ARM64：强制 `firmware = ""` | 避免 4.0 默认 AAVMF 拖慢冷启动 ~1.3s |
-| clh：捆绑 `configuration-clh-runtime-rs.toml`（段名 `clh`） | 4.0 aarch64 包缺 CLH runtime-rs 配置 |
+| clh：捆绑 `config/kata/configuration-clh-runtime-rs.toml`（段名 `clh`） | 4.0 aarch64 包缺 CLH runtime-rs 配置 |
 | stratovirt：切换 Go 静态 shim + `configuration-stratovirt.toml` | runtime-rs 无 StratoVirt；官方 Go shim 需 GLIBC≥2.32 |
 
 相关提交 / 变更示例：
@@ -635,7 +636,7 @@ zgrep CONFIG_CGROUP_BPF /proc/config.gz
 - Kata runtime-rs `agent/src/sock/hybrid_vsock.rs`（`retry_times = reconnect/dial`；为 0 时 unwrap panic）
 - Firecracker API：`vcpu_count` 须为整数；vsock `guest_cid` 合法范围
 - QEMU ARM64：已有 `-kernel` 时无需 `-bios` AAVMF；4.0 默认 `firmware=AAVMF_CODE.fd` 会显著拉高冷启动
-- StratoVirt：仅 Go runtime；`install/go-shim-static/README.md`
+- StratoVirt：仅 Go runtime；`config/kata/go-shim-static/README.md`
 - containerd CRI v1 runtime 配置：`plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.*`
 - 本仓库：`doc/runc-cgroup-v2-bpf-device-analysis.md`、`doc/sandbox-ready-and-startup-latency.md`
 - 安装包：`install/kata-static-4.0.0-arm64.tar.zst`

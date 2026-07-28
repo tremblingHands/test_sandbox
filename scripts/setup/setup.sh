@@ -19,6 +19,8 @@
 # 安装包缓存:
 #   默认目录 <repo>/install/（可用环境变量 INSTALL_FILES_DIR 覆盖，已在 .gitignore）
 #   优先使用该目录中的包；没有则下载并保存到该目录，供下次复用
+# 仓库配置（纳入 git）:
+#   <repo>/config/kata/ — kata 捆绑 toml 等（可用环境变量 KATA_CONFIG_DIR 覆盖）
 # ============================================================
 set -euo pipefail
 
@@ -26,6 +28,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 # 本地安装包目录：优先从此处取包，缺失再下载
 INSTALL_FILES_DIR="${INSTALL_FILES_DIR:-${REPO_ROOT}/install}"
+# 仓库内配置目录（toml 等，应纳入版本库）
+KATA_CONFIG_DIR="${KATA_CONFIG_DIR:-${REPO_ROOT}/config/kata}"
 
 # 保证能找到 /usr/local/bin 下的 crictl 等（勿再套一层 sudo 清 PATH）
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH:-/usr/bin:/bin}"
@@ -107,6 +111,8 @@ usage() {
   kata 版本:               ${KATA_VERSION}
   安装包目录:              ${INSTALL_FILES_DIR}
                            (可用环境变量 INSTALL_FILES_DIR 覆盖)
+  kata 配置目录:           ${KATA_CONFIG_DIR}
+                           (可用环境变量 KATA_CONFIG_DIR 覆盖)
 
 示例:
   $0
@@ -459,10 +465,11 @@ check_kata_runtime() {
                 # 官方动态链接 shim 若在本机可跑则直接用
                 kata_go_static_shim="$kata_shim"
             else
-                fail "stratovirt 需要 Go shim，但本机 glibc 过旧且缺少 install/go-shim-static/containerd-shim-kata-v2"
-                echo "  构建方法（在 kata-containers 4.0.0 源码树）:"
+                fail "stratovirt 需要 Go shim，但本机 glibc 过旧且缺少 ${kata_go_static_bundled}"
+                echo "  构建方法见: ${KATA_CONFIG_DIR}/go-shim-static/README.md"
+                echo "  （或在 kata-containers 4.0.0 源码树）:"
                 echo "    cd src/runtime && make pkg/katautils/config-settings.go"
-                echo "    CGO_ENABLED=0 go build -mod=mod -ldflags '-s -w' -o <out> ./cmd/containerd-shim-kata-v2/"
+                echo "    CGO_ENABLED=0 go build -mod=mod -ldflags '-s -w' -o ${kata_go_static_bundled} ./cmd/containerd-shim-kata-v2/"
                 return 1
             fi
         fi
@@ -525,9 +532,13 @@ check_kata_runtime() {
     esac
     target_config="$kata_config_dir/$target_link_name"
 
-    # 4.0.0 静态包（尤其 aarch64）常缺 runtime-rs 的 clh 配置；从仓库捆绑安装
+    # 4.0.0 静态包（尤其 aarch64）常缺 runtime-rs 的 clh 配置；从仓库 config/kata 捆绑安装
     if [ "$KATA_HYPERVISOR" = "clh" ]; then
-        local bundled="${INSTALL_FILES_DIR}/runtime-rs-configs/configuration-clh-runtime-rs.toml"
+        local bundled="${KATA_CONFIG_DIR}/configuration-clh-runtime-rs.toml"
+        # 兼容旧路径 install/runtime-rs-configs/
+        if [ ! -f "$bundled" ] && [ -f "${INSTALL_FILES_DIR}/runtime-rs-configs/configuration-clh-runtime-rs.toml" ]; then
+            bundled="${INSTALL_FILES_DIR}/runtime-rs-configs/configuration-clh-runtime-rs.toml"
+        fi
         # 旧错误名（cloud-hypervisor 段）不可用：4.0 shim 插件注册名为 clh
         if [ -f "$target_config" ] && grep -q '^\[hypervisor\.cloud-hypervisor\]' "$target_config" 2>/dev/null; then
             warn "发现旧版 cloud-hypervisor 段名配置，将用捆绑的 [hypervisor.clh] 覆盖"
