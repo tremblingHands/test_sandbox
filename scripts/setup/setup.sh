@@ -12,6 +12,7 @@
 #   ./setup.sh --cni-type bridge             # 使用 bridge CNI（默认 ipMasq=false）
 #   ./setup.sh --cni-type bridge --ip-masq true   # bridge 且开启 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
+#   ./setup.sh --runtime kata --hypervisor firecracker  # 自动切 devmapper（块设备 rootfs）
 #   ./setup.sh --check-only                   # 仅检查，不安装
 #   ./setup.sh --no-warmup                    # 成功后不跑 cold_start_bench warmup
 #
@@ -42,10 +43,15 @@ CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.6.32"
 CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 CONTAINERD_RUNTIME="runc"       # 默认: runc
-SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs）
-KATA_VERSION="3.22.0"           # kata containers 版本
+SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs | devmapper）
+KATA_VERSION="4.0.0"           # kata containers 版本
 KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
 IP_MASQ="false"                 # bridge 专用: CNI ipMasq（默认 false；出网用节点级 MASQUERADE）
+DEVMAPPER_DATA_DIR="/var/lib/containerd/devmapper"
+DEVMAPPER_POOL_NAME="devpool4"
+DEVMAPPER_DATA_SIZE="50G"       # sparse 数据盘
+DEVMAPPER_META_SIZE="5G"        # sparse 元数据盘
+DEVMAPPER_BASE_IMAGE_SIZE="10GB"
 
 # 自动检测架构
 detect_arch() {
@@ -66,6 +72,7 @@ ARCH=$(detect_arch)
 CHECK_ONLY=false
 NO_WARMUP=false
 HYPERVISOR_EXPLICIT=false
+SNAPSHOTTER_EXPLICIT=false
 
 usage() {
     cat <<EOF
@@ -81,10 +88,12 @@ usage() {
                            (默认: ${IP_MASQ})
   --runtime RUNTIME        OCI 运行时: runc | kata
                            (默认: ${CONTAINERD_RUNTIME})
-  --hypervisor HV          kata hypervisor: dragonball | qemu | cloud-hypervisor | firecracker
+  --hypervisor HV          kata hypervisor: dragonball | qemu | cloud-hypervisor|clh | firecracker | stratovirt
                            (默认: ${KATA_HYPERVISOR}；仅 --runtime kata 时生效)
-  --snapshotter NAME       snapshotter: overlayfs | erofs
-                           (默认: ${SNAPSHOTTER})
+                           注: Kata 4.0 runtime-rs 中 CLH 配置段名为 clh（cloud-hypervisor 为别名）
+                           注: stratovirt 走 Go shim（非 runtime-rs）；本机 glibc 过旧时用捆绑静态 Go shim
+  --snapshotter NAME       snapshotter: overlayfs | erofs | devmapper
+                           (默认: ${SNAPSHOTTER}；firecracker 自动强制 devmapper)
   --check-only             仅检查，不安装/不修改
                            (默认: ${CHECK_ONLY})
   --no-warmup              成功后不跑 cold_start_bench warmup
@@ -104,6 +113,7 @@ usage() {
   $0 --cni-type bridge
   $0 --cni-type bridge --ip-masq true
   $0 --runtime kata --hypervisor qemu
+  $0 --runtime kata --hypervisor firecracker
   $0 --check-only
   $0 --no-warmup
 EOF
@@ -137,18 +147,24 @@ while [[ $# -gt 0 ]]; do
             KATA_HYPERVISOR="$2"
             HYPERVISOR_EXPLICIT=true
             case "$KATA_HYPERVISOR" in
-                dragonball|qemu|cloud-hypervisor|firecracker) ;;
+                dragonball|qemu|cloud-hypervisor|clh|firecracker|stratovirt)
+                    # Kata 4.0.0 runtime-rs 插件名/配置段为 clh
+                    if [ "$KATA_HYPERVISOR" = "cloud-hypervisor" ]; then
+                        KATA_HYPERVISOR=clh
+                    fi
+                    ;;
                 *)
-                    echo "ERROR: --hypervisor 必须是 dragonball | qemu | cloud-hypervisor | firecracker"
+                    echo "ERROR: --hypervisor 必须是 dragonball | qemu | cloud-hypervisor|clh | firecracker | stratovirt"
                     exit 1
                     ;;
             esac
             shift 2 ;;
         --snapshotter)
             SNAPSHOTTER="$2"
+            SNAPSHOTTER_EXPLICIT=true
             case "$SNAPSHOTTER" in
-                overlayfs|erofs) ;;
-                *) echo "ERROR: --snapshotter 必须是 overlayfs | erofs"; exit 1 ;;
+                overlayfs|erofs|devmapper) ;;
+                *) echo "ERROR: --snapshotter 必须是 overlayfs | erofs | devmapper"; exit 1 ;;
             esac
             shift 2 ;;
         --ip-masq)
@@ -176,6 +192,16 @@ fail() { echo -e "${RED}✗${NC} $1"; }
 
 if $HYPERVISOR_EXPLICIT && [ "$CONTAINERD_RUNTIME" != "kata" ]; then
     warn "--hypervisor 仅在 --runtime kata 时生效（当前 runtime=$CONTAINERD_RUNTIME）"
+fi
+
+# Firecracker 无 virtio-fs，只能挂块设备 rootfs → 强制 devmapper
+if [ "$CONTAINERD_RUNTIME" = "kata" ] && [ "$KATA_HYPERVISOR" = "firecracker" ]; then
+    if [ "$SNAPSHOTTER" != "devmapper" ]; then
+        if $SNAPSHOTTER_EXPLICIT; then
+            warn "firecracker 需要 devmapper；忽略 --snapshotter $SNAPSHOTTER"
+        fi
+        SNAPSHOTTER="devmapper"
+    fi
 fi
 
 ensure_install_dir() {
@@ -377,26 +403,28 @@ check_kata_runtime() {
     echo ""
     echo "--- Kata Containers ---"
 
-    # ---- 1. 检查 kata shim（优先 runtime-rs 静态二进制，兼容旧 glibc） ---- #
+    # ---- 1. 检查 kata shim ---- #
+    # 默认优先 runtime-rs（静态 Rust，兼容旧 glibc）。
+    # stratovirt 仅 Go runtime 支持 → 改用静态编译的 Go shim（官方动态链接包要 GLIBC≥2.32）。
     local kata_bin="$KATA_BIN_DIR/kata-runtime"
     local kata_shim="$KATA_BIN_DIR/containerd-shim-kata-v2"
     local kata_rs_shim="$KATA_INSTALL_DIR/runtime-rs/bin/containerd-shim-kata-v2"
+    local kata_go_static_shim="$KATA_BIN_DIR/containerd-shim-kata-v2-go-static"
+    local kata_go_static_bundled="${INSTALL_FILES_DIR}/go-shim-static/containerd-shim-kata-v2"
+    local use_go_runtime=false
 
-    # runtime-rs 是静态链接的 Rust 二进制，无需高版本 glibc
-    if [ -x "$kata_rs_shim" ]; then
-        pass "kata runtime-rs shim 可用: $kata_rs_shim"
-        kata_shim="$kata_rs_shim"
-    elif [ -x "$kata_shim" ] && ldd "$kata_shim" &>/dev/null; then
-        ver=$("$kata_bin" --version 2>/dev/null | head -1 || echo "kata (glibc)")
-        pass "kata-runtime 已安装: $ver"
-    else
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
+        use_go_runtime=true
+    fi
+
+    # 确保已安装 kata 静态包（至少有 HV 二进制 / 配置）
+    if [ ! -x "$kata_rs_shim" ] && [ ! -x "$KATA_BIN_DIR/stratovirt" ] && [ ! -x "$kata_shim" ]; then
         if $CHECK_ONLY; then
             fail "kata-runtime 未安装（需要 --runtime kata）"
             return 1
         fi
         warn "kata-runtime 未安装，正在安装 v${KATA_VERSION}..."
 
-        # 确保 zstd 解压工具可用
         if ! command -v zstd &>/dev/null; then
             echo "  安装 zstd..."
             sudo apt-get update -qq && sudo apt-get install -y -qq zstd 2>/dev/null || \
@@ -407,7 +435,6 @@ check_kata_runtime() {
         local kata_url="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_NAME}"
         tarball_path=$(fetch_pkg "$TARBALL_NAME" "$kata_url")
 
-        # kata-static tarball 内部前缀为 ./opt/kata/，需解压到 / 根目录
         if sudo tar --zstd -xf "$tarball_path" -C / 2>/dev/null; then
             true
         elif command -v zstd &>/dev/null; then
@@ -420,37 +447,57 @@ check_kata_runtime() {
             fail "无法解压 .tar.zst 文件（需要 zstd 或 tar --zstd）"
             return 1
         fi
+    fi
 
-        # kata-static 解包后查找 shim（优先 runtime-rs 静态二进制）
-        if [ ! -x "$kata_shim" ]; then
-            local found_shim
-            # 优先 runtime-rs（静态链接，兼容旧 glibc）
-            found_shim=$(find "$KATA_INSTALL_DIR" -path "*/runtime-rs/bin/containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
-            if [ -z "$found_shim" ]; then
-                found_shim=$(find "$KATA_INSTALL_DIR" -name "containerd-shim-kata-v2" -type f 2>/dev/null | head -1)
-            fi
-            if [ -n "$found_shim" ]; then
-                kata_shim="$found_shim"
+    if $use_go_runtime; then
+        # 安装/选用静态 Go shim（避免官方 /opt/kata/bin/... 的 GLIBC_2.32+ 依赖）
+        if [ ! -x "$kata_go_static_shim" ] || ! "$kata_go_static_shim" --version &>/dev/null; then
+            if [ -x "$kata_go_static_bundled" ]; then
+                echo "  安装捆绑的静态 Go shim（stratovirt 需要）..."
+                sudo install -m 0755 "$kata_go_static_bundled" "$kata_go_static_shim"
+            elif [ -x "$kata_shim" ] && "$kata_shim" --version &>/dev/null; then
+                # 官方动态链接 shim 若在本机可跑则直接用
+                kata_go_static_shim="$kata_shim"
+            else
+                fail "stratovirt 需要 Go shim，但本机 glibc 过旧且缺少 install/go-shim-static/containerd-shim-kata-v2"
+                echo "  构建方法（在 kata-containers 4.0.0 源码树）:"
+                echo "    cd src/runtime && make pkg/katautils/config-settings.go"
+                echo "    CGO_ENABLED=0 go build -mod=mod -ldflags '-s -w' -o <out> ./cmd/containerd-shim-kata-v2/"
+                return 1
             fi
         fi
-
-        if [ -x "$kata_shim" ]; then
-            pass "kata-runtime 安装完成: $("$kata_bin" --version 2>/dev/null | head -1 || echo ok)"
-        else
-            fail "kata-runtime 安装失败，未找到 containerd-shim-kata-v2"
+        if ! "$kata_go_static_shim" --version &>/dev/null; then
+            fail "Go shim 无法执行: $kata_go_static_shim"
             return 1
         fi
-
-        # 重新检测 runtime-rs shim（安装后新文件已就位，更新 kata_shim）
+        kata_shim="$kata_go_static_shim"
+        pass "kata Go shim（stratovirt）: $kata_shim ($("$kata_shim" --version 2>/dev/null | head -1))"
+    else
         if [ -x "$kata_rs_shim" ]; then
+            pass "kata runtime-rs shim 可用: $kata_rs_shim"
             kata_shim="$kata_rs_shim"
+        elif [ -x "$kata_shim" ] && "$kata_shim" --version &>/dev/null; then
+            ver=$("$kata_bin" --version 2>/dev/null | head -1 || echo "kata (glibc)")
+            pass "kata-runtime 已安装: $ver"
+        else
+            fail "kata-runtime 安装失败，未找到可用的 containerd-shim-kata-v2"
+            return 1
         fi
     fi
 
-    # ---- 1.5 按 --hypervisor 切换 runtime-rs 配置 ---- #
-    local kata_config_dir="/opt/kata/share/defaults/kata-containers/runtime-rs"
+    # ---- 1.5 按 --hypervisor 切换配置（runtime-rs 或 Go） ---- #
+    local kata_config_dir
     local target_config=""
     local target_link_name=""
+    local default_config=""
+
+    if $use_go_runtime; then
+        kata_config_dir="/opt/kata/share/defaults/kata-containers"
+        default_config="$kata_config_dir/configuration.toml"
+    else
+        kata_config_dir="/opt/kata/share/defaults/kata-containers/runtime-rs"
+        default_config="$kata_config_dir/configuration.toml"
+    fi
 
     case "$KATA_HYPERVISOR" in
         dragonball)
@@ -459,11 +506,17 @@ check_kata_runtime() {
         qemu)
             target_link_name="configuration-qemu-runtime-rs.toml"
             ;;
-        cloud-hypervisor)
-            target_link_name="configuration-cloud-hypervisor.toml"
+        clh|cloud-hypervisor)
+            # 4.0.0：配置文件名 configuration-clh-runtime-rs.toml，段名 [hypervisor.clh]
+            # aarch64 官方静态包因未定义 CLHCMD 常缺此文件，用仓库捆绑配置补齐
+            target_link_name="configuration-clh-runtime-rs.toml"
+            KATA_HYPERVISOR=clh
             ;;
         firecracker)
             target_link_name="configuration-rs-fc.toml"
+            ;;
+        stratovirt)
+            target_link_name="configuration-stratovirt.toml"
             ;;
         *)
             fail "未知 hypervisor: $KATA_HYPERVISOR"
@@ -471,6 +524,24 @@ check_kata_runtime() {
             ;;
     esac
     target_config="$kata_config_dir/$target_link_name"
+
+    # 4.0.0 静态包（尤其 aarch64）常缺 runtime-rs 的 clh 配置；从仓库捆绑安装
+    if [ "$KATA_HYPERVISOR" = "clh" ]; then
+        local bundled="${INSTALL_FILES_DIR}/runtime-rs-configs/configuration-clh-runtime-rs.toml"
+        # 旧错误名（cloud-hypervisor 段）不可用：4.0 shim 插件注册名为 clh
+        if [ -f "$target_config" ] && grep -q '^\[hypervisor\.cloud-hypervisor\]' "$target_config" 2>/dev/null; then
+            warn "发现旧版 cloud-hypervisor 段名配置，将用捆绑的 [hypervisor.clh] 覆盖"
+            sudo rm -f "$target_config"
+        fi
+        if [ ! -f "$target_config" ]; then
+            if [ -f "$bundled" ]; then
+                echo "  安装捆绑的 clh runtime-rs 配置..."
+                sudo mkdir -p "$kata_config_dir"
+                sudo cp "$bundled" "$target_config"
+                pass "已安装 $target_config"
+            fi
+        fi
+    fi
 
     if [ ! -f "$target_config" ]; then
         fail "hypervisor 配置不存在: $target_config"
@@ -484,10 +555,12 @@ check_kata_runtime() {
             # machine_type: q35 是 x86 专用，ARM64 必须用 virt
             sudo sed -i 's|machine_type = "q35"|machine_type = "virt"|' "$target_config"
             sudo sed -i 's|machine_type = ""|machine_type = "virt"|' "$target_config"
-            # firmware: ARM64 UEFI
-            if grep -q 'firmware = ""' "$target_config" 2>/dev/null; then
-                sudo sed -i 's|firmware = ""|firmware = "/opt/kata/share/kata-qemu/qemu/edk2-aarch64-code.fd"|' "$target_config"
-                sudo sed -i 's|firmware_volume = ""|firmware_volume = "/opt/kata/share/kata-qemu/qemu/edk2-arm-vars.fd"|' "$target_config"
+            # firmware: 已有 -kernel 直启时不需要 AAVMF/EDK2；4.0.0 默认
+            # firmware=/opt/kata/share/aavmf/AAVMF_CODE.fd（64MB）会让冷启动多约 1.3s
+            # （本机实测 t_runp ~2.3s → 清掉后 ~0.9s，与 3.22 量级一致）
+            if grep -qE '^firmware\s*=' "$target_config" 2>/dev/null; then
+                sudo sed -i 's|^firmware = .*|firmware = ""|' "$target_config"
+                pass "qemu ARM64 已清空 firmware（-kernel 直启，避免 AAVMF 拖慢冷启动）"
             fi
             # virtio-pmem → virtio-blk-pci (ARM64 virt 上 pmem 会崩)
             sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$target_config"
@@ -502,8 +575,14 @@ check_kata_runtime() {
     fi
 
     # Dragonball：ARM64 上 virtio-blk-pci 根盘 guest 看不到（VFS Unable to mount root fs），改用 mmio
+    # 4.0.0 静态包可能带 AAVMF firmware；runtime-rs 校验要求 dragonball 的 firmware 必须为空
     if [ "$KATA_HYPERVISOR" = "dragonball" ]; then
         echo "  配置 runtime-rs Dragonball..."
+        # runtime-rs: "Firmware for dragonball hypervisor should be empty"
+        if grep -qE '^firmware\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^firmware = .*|firmware = ""|' "$target_config"
+            pass "dragonball 已强制 firmware=\"\" （4.0 静态包常带 AAVMF，会校验失败）"
+        fi
         if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
             if grep -q 'vm_rootfs_driver = "virtio-blk-pci"' "$target_config" 2>/dev/null || \
                grep -q 'block_device_driver = "virtio-blk-pci"' "$target_config" 2>/dev/null; then
@@ -516,6 +595,87 @@ check_kata_runtime() {
         fi
     fi
 
+    # Cloud Hypervisor (clh)：virtio-fs；ARM64 清 firmware、避免 virtio-pmem
+    if [ "$KATA_HYPERVISOR" = "clh" ]; then
+        echo "  配置 runtime-rs Cloud Hypervisor (clh)..."
+        if ! grep -qE '^\[hypervisor\.clh\]' "$target_config" 2>/dev/null; then
+            fail "clh 配置缺少 [hypervisor.clh]（Kata 4.0 插件名是 clh，不是 cloud-hypervisor）"
+            return 1
+        fi
+        if grep -qE '^firmware\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^firmware = .*|firmware = ""|' "$target_config"
+            pass "clh 已强制 firmware=\"\""
+        fi
+        if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            sudo sed -i 's|vm_rootfs_driver = "virtio-pmem"|vm_rootfs_driver = "virtio-blk-pci"|' "$target_config"
+            pass "clh ARM64 vm_rootfs_driver 使用 virtio-blk-pci"
+        fi
+        local cfg_kernel actual_kernel
+        cfg_kernel=$(grep -E '^kernel =' "$target_config" | head -1 | sed 's/.*= *"//;s/"//')
+        if [ -n "$cfg_kernel" ] && [ ! -e "$cfg_kernel" ]; then
+            actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-[0-9]* 2>/dev/null | grep -v dragonball | head -1 || true)
+            [ -n "$actual_kernel" ] && sudo sed -i "s|^kernel = .*|kernel = \"$actual_kernel\"|" "$target_config"
+        fi
+    fi
+
+    # Firecracker：default_maxvcpus=0 会解析为宿主机 CPU 数；本机 128+/256 超过
+    # kata-types MAX_FIRECRACKER_VCPUS=32，校验失败 "can not support N vCPUs"
+    # 另：vm_rootfs_driver 若为 virtio-blk-pci，guest 可能挂不上根盘 → agent hvsock unwrap panic
+    if [ "$KATA_HYPERVISOR" = "firecracker" ]; then
+        echo "  配置 runtime-rs Firecracker..."
+        # 未显式写时默认 DEFAULT_BLOCK_DEVICE_TYPE=virtio-blk-pci，FC 不支持
+        if grep -qE '^vm_rootfs_driver\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^vm_rootfs_driver = .*|vm_rootfs_driver = "virtio-blk-mmio"|' "$target_config"
+        else
+            sudo sed -i '/^block_device_driver = /a vm_rootfs_driver = "virtio-blk-mmio"' "$target_config"
+        fi
+        pass "firecracker vm_rootfs_driver = virtio-blk-mmio"
+        # jailer 在部分环境下导致路径/挂载异常；默认关掉（可按需再开）
+        if grep -qE '^jailer_path\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^jailer_path = |#jailer_path = |' "$target_config"
+            pass "firecracker 已注释 jailer_path（非 jail 启动）"
+        fi
+        # 4.0.0 静态包把旧 dial_timeout=45(秒) 误写成 dial_timeout_ms=45000，
+        # 而 reconnect 默认 3000 → retry_times=0 → hybrid_vsock last_err.unwrap() panic
+        if grep -qE '^dial_timeout_ms\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^dial_timeout_ms = .*|dial_timeout_ms = 10|' "$target_config"
+        else
+            sudo sed -i '/^\[agent\.kata\]/a dial_timeout_ms = 10' "$target_config" 2>/dev/null || \
+                echo 'dial_timeout_ms = 10' | sudo tee -a "$target_config" >/dev/null
+        fi
+        if grep -qE '^reconnect_timeout_ms\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^reconnect_timeout_ms = .*|reconnect_timeout_ms = 45000|' "$target_config"
+        else
+            sudo sed -i '/^dial_timeout_ms = /a reconnect_timeout_ms = 45000' "$target_config"
+        fi
+        pass "firecracker agent dial_timeout_ms=10, reconnect_timeout_ms=45000"
+        local fc_max_vcpus=32
+        local cur_max
+        cur_max=$(grep -E '^default_maxvcpus\s*=' "$target_config" 2>/dev/null | head -1 | awk -F= '{gsub(/ /,"",$2); print $2}')
+        if [ -z "$cur_max" ] || [ "$cur_max" = "0" ] || [ "$cur_max" -gt "$fc_max_vcpus" ] 2>/dev/null; then
+            sudo sed -i "s|^default_maxvcpus = .*|default_maxvcpus = ${fc_max_vcpus}|" "$target_config"
+            pass "firecracker default_maxvcpus ${cur_max:-unset} → ${fc_max_vcpus}（上限 MAX_FIRECRACKER_VCPUS）"
+        else
+            pass "firecracker default_maxvcpus=$cur_max（≤${fc_max_vcpus}）"
+        fi
+    fi
+
+    # StratoVirt：Go runtime；ARM64 轻量机用 microvm+mmio（官方默认），标准机用 virt+pci
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
+        echo "  配置 Go runtime StratoVirt..."
+        local cfg_kernel actual_kernel
+        cfg_kernel=$(grep -E '^kernel =' "$target_config" | head -1 | sed 's/.*= *"//;s/"//')
+        if [ -n "$cfg_kernel" ] && [ ! -e "$cfg_kernel" ]; then
+            actual_kernel=$(ls /opt/kata/share/kata-containers/vmlinux-[0-9]* 2>/dev/null | grep -v dragonball | head -1 || true)
+            [ -n "$actual_kernel" ] && sudo sed -i "s|^kernel = .*|kernel = \"$actual_kernel\"|" "$target_config"
+        fi
+        # 确保 virtiofsd 路径存在
+        if [ ! -x /opt/kata/libexec/virtiofsd ] && [ -x /opt/kata/bin/virtiofsd ]; then
+            sudo sed -i 's|/opt/kata/libexec/virtiofsd|/opt/kata/bin/virtiofsd|' "$target_config"
+        fi
+        pass "stratovirt machine_type=$(grep -E '^machine_type' "$target_config" | head -1 | awk -F= '{gsub(/[" ]/,"",$2);print $2}') shared_fs=virtio-fs"
+    fi
+
     # 校验 hypervisor 二进制（dragonball 内置，无独立 path）
     case "$KATA_HYPERVISOR" in
         qemu)
@@ -524,7 +684,7 @@ check_kata_runtime() {
                 warn "未找到 qemu-system-*，请确认 kata-static 已完整安装"
             fi
             ;;
-        cloud-hypervisor)
+        clh)
             [ -x /opt/kata/bin/cloud-hypervisor ] || {
                 fail "缺少 /opt/kata/bin/cloud-hypervisor"
                 return 1
@@ -536,14 +696,20 @@ check_kata_runtime() {
                 return 1
             }
             ;;
+        stratovirt)
+            [ -x /opt/kata/bin/stratovirt ] || {
+                fail "缺少 /opt/kata/bin/stratovirt"
+                return 1
+            }
+            ;;
     esac
 
-    local default_config="$kata_config_dir/configuration.toml"
+    # default_config 已在上方按 Go/runtime-rs 设好目录
     local current_target
     local hypervisor_changed=false
     current_target=$(readlink -f "$default_config" 2>/dev/null || true)
     if [ "$current_target" = "$(readlink -f "$target_config")" ]; then
-        pass "runtime-rs hypervisor 已是 $KATA_HYPERVISOR ($target_link_name)"
+        pass "kata hypervisor 已是 $KATA_HYPERVISOR ($target_link_name)"
     elif $CHECK_ONLY; then
         warn "hypervisor 期望 $KATA_HYPERVISOR，当前: ${current_target:-none}"
         return 1
@@ -552,7 +718,7 @@ check_kata_runtime() {
         sudo rm -f "$default_config"
         sudo ln -s "$target_link_name" "$default_config"
         hypervisor_changed=true
-        pass "runtime-rs hypervisor 已设为 $KATA_HYPERVISOR"
+        pass "kata hypervisor 已设为 $KATA_HYPERVISOR"
     fi
 
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
@@ -569,17 +735,8 @@ check_kata_runtime() {
     local kata_runtime_section_alt="[plugins.'${cri_runtime_plugin}'.containerd.runtimes.kata]"
     local kata_options_section_alt="[plugins.'${cri_runtime_plugin}'.containerd.runtimes.kata.options]"
 
-    # 找到 kata 配置文件（runtime-rs 使用 runtime-rs 子目录下的配置）
-    local kata_config_path=""
-    if echo "$kata_shim" | grep -q "runtime-rs"; then
-        kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/runtime-rs/*" 2>/dev/null | head -1)
-    fi
-    if [ -z "$kata_config_path" ]; then
-        kata_config_path=$(find "$KATA_INSTALL_DIR" -name "configuration.toml" -path "*/kata-containers/*" 2>/dev/null | head -1)
-    fi
-    if [ -z "$kata_config_path" ]; then
-        kata_config_path="/opt/kata/share/defaults/kata-containers/configuration.toml"
-    fi
+    # 使用本轮选中的 configuration.toml（runtime-rs 子目录或 Go 顶层）
+    local kata_config_path="$default_config"
 
     _kata_section_present() {
         grep -qF "$kata_runtime_section" "$config_file" 2>/dev/null || \
@@ -592,12 +749,17 @@ check_kata_runtime() {
     }
 
     _write_kata_runtime_block() {
+        local snap_line=""
+        if [ "$SNAPSHOTTER" = "devmapper" ]; then
+            snap_line="  snapshotter = 'devmapper'"
+        fi
         sudo tee -a "$config_file" > /dev/null <<KATAEOF
 
 ${kata_runtime_section}
   runtime_type = 'io.containerd.kata.v2'
   runtime_path = '${kata_shim}'
   privileged_without_host_devices = true
+${snap_line}
   pod_annotations = ['io.katacontainers.*']
   ${kata_options_section}
     ConfigPath = '${kata_config_path}'
@@ -615,13 +777,37 @@ KATAEOF
 
     if _kata_section_present; then
         local need_fix=false
-        if ! awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/runtime_path/{print; exit}' "$config_file" | grep -q runtime-rs; then
-            warn "kata runtime_path 未指向 runtime-rs，正在修正..."
-            need_fix=true
-        fi
-        if ! awk '/\[plugins.*runtimes\.kata(\.options)?\]/{p=1} p&&/ConfigPath/{print; exit}' "$config_file" | grep -q runtime-rs; then
-            warn "kata ConfigPath 未指向 runtime-rs，正在修正..."
-            need_fix=true
+        local cur_path cur_cfg
+        cur_path=$(awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/runtime_path/{print; exit}' "$config_file")
+        cur_cfg=$(awk '/\[plugins.*runtimes\.kata(\.options)?\]/{p=1} p&&/ConfigPath/{print; exit}' "$config_file")
+        if $use_go_runtime; then
+            if ! echo "$cur_path" | grep -qE 'go-static|/opt/kata/bin/containerd-shim-kata-v2'; then
+                warn "kata runtime_path 未指向 Go shim，正在修正..."
+                need_fix=true
+            fi
+            if echo "$cur_cfg" | grep -q 'runtime-rs'; then
+                warn "kata ConfigPath 仍指向 runtime-rs，正在改为 Go 配置..."
+                need_fix=true
+            elif ! echo "$cur_cfg" | grep -q 'kata-containers/configuration.toml'; then
+                # 允许顶层 configuration.toml；若完全不对也修正
+                if ! echo "$cur_cfg" | grep -q "$kata_config_path"; then
+                    warn "kata ConfigPath 与 stratovirt 期望不符，正在修正..."
+                    need_fix=true
+                fi
+            fi
+            # shim 路径变化时也要重写
+            if ! echo "$cur_path" | grep -Fq "$kata_shim"; then
+                need_fix=true
+            fi
+        else
+            if ! echo "$cur_path" | grep -q runtime-rs; then
+                warn "kata runtime_path 未指向 runtime-rs，正在修正..."
+                need_fix=true
+            fi
+            if ! echo "$cur_cfg" | grep -q runtime-rs; then
+                warn "kata ConfigPath 未指向 runtime-rs，正在修正..."
+                need_fix=true
+            fi
         fi
         if $need_fix; then
             if $CHECK_ONLY; then
@@ -1043,17 +1229,190 @@ TOML
 }
 
 # ============================================================
+# 准备 containerd devmapper thin-pool（Firecracker 必需）
+# ============================================================
+ensure_devmapper() {
+    echo ""
+    echo "--- devmapper thin-pool ---"
+
+    if ! command -v dmsetup >/dev/null 2>&1 || ! command -v losetup >/dev/null 2>&1; then
+        fail "缺少 dmsetup/losetup，无法配置 devmapper"
+        return 1
+    fi
+
+    local data_file="${DEVMAPPER_DATA_DIR}/data4"
+    local meta_file="${DEVMAPPER_DATA_DIR}/meta4"
+    local reload_script="/usr/local/sbin/devmapper-reload.sh"
+    local reload_unit="/etc/systemd/system/devmapper-reload.service"
+    local config_file="/etc/containerd/config.toml"
+    local need_restart=false
+
+    if $CHECK_ONLY; then
+        if dmsetup info "$DEVMAPPER_POOL_NAME" >/dev/null 2>&1 && \
+           ctr plugins ls 2>/dev/null | grep devmapper | grep -q 'ok'; then
+            pass "devmapper pool=$DEVMAPPER_POOL_NAME 就绪"
+            return 0
+        fi
+        warn "devmapper 未就绪（pool 或插件）"
+        return 1
+    fi
+
+    sudo mkdir -p "$DEVMAPPER_DATA_DIR"
+    if [ ! -f "$data_file" ]; then
+        echo "  创建 sparse data ${DEVMAPPER_DATA_SIZE} → $data_file"
+        sudo truncate -s "$DEVMAPPER_DATA_SIZE" "$data_file"
+    fi
+    if [ ! -f "$meta_file" ]; then
+        echo "  创建 sparse meta ${DEVMAPPER_META_SIZE} → $meta_file"
+        sudo truncate -s "$DEVMAPPER_META_SIZE" "$meta_file"
+    fi
+
+    if ! dmsetup info "$DEVMAPPER_POOL_NAME" >/dev/null 2>&1; then
+        echo "  创建 thin-pool $DEVMAPPER_POOL_NAME ..."
+        # 清理可能残留的 loop 绑定
+        local old
+        for f in "$data_file" "$meta_file"; do
+            while read -r old; do
+                [ -n "$old" ] && sudo losetup -d "$old" 2>/dev/null || true
+            done < <(losetup -j "$f" -O NAME -n 2>/dev/null || true)
+        done
+        local data_dev meta_dev data_size length
+        data_dev=$(sudo losetup --find --show --direct-io=on "$data_file" 2>/dev/null \
+            || sudo losetup --find --show "$data_file")
+        meta_dev=$(sudo losetup --find --show --direct-io=on "$meta_file" 2>/dev/null \
+            || sudo losetup --find --show "$meta_file")
+        data_size=$(sudo blockdev --getsize64 "$data_dev")
+        length=$((data_size / 512))
+        sudo dmsetup create "$DEVMAPPER_POOL_NAME" \
+            --table "0 ${length} thin-pool ${meta_dev} ${data_dev} 128 32768"
+        pass "thin-pool $DEVMAPPER_POOL_NAME 已创建"
+        need_restart=true
+    else
+        pass "thin-pool $DEVMAPPER_POOL_NAME 已存在"
+    fi
+
+    # 写入/更新 containerd devmapper 插件配置
+    if ! grep -q "pool_name = '${DEVMAPPER_POOL_NAME}'" "$config_file" 2>/dev/null && \
+       ! grep -q "pool_name = \"${DEVMAPPER_POOL_NAME}\"" "$config_file" 2>/dev/null; then
+        echo "  写入 containerd devmapper 插件配置..."
+        # 兼容单引号 / 双引号 section 写法
+        if grep -q "io.containerd.snapshotter.v1.devmapper" "$config_file"; then
+            sudo sed -i \
+                -e "/io.containerd.snapshotter.v1.devmapper/,/^$/s|root_path = .*|root_path = '${DEVMAPPER_DATA_DIR}'|" \
+                -e "/io.containerd.snapshotter.v1.devmapper/,/^$/s|pool_name = .*|pool_name = '${DEVMAPPER_POOL_NAME}'|" \
+                -e "/io.containerd.snapshotter.v1.devmapper/,/^$/s|base_image_size = .*|base_image_size = '${DEVMAPPER_BASE_IMAGE_SIZE}'|" \
+                -e "/io.containerd.snapshotter.v1.devmapper/,/^$/s|discard_blocks = .*|discard_blocks = true|" \
+                "$config_file"
+            # fs_type 空串时补 ext4（部分版本需要）
+            if grep -A8 "io.containerd.snapshotter.v1.devmapper" "$config_file" | grep -q "fs_type = ''"; then
+                sudo sed -i "/io.containerd.snapshotter.v1.devmapper/,/^$/s|fs_type = ''|fs_type = 'ext4'|" "$config_file"
+            fi
+        else
+            sudo tee -a "$config_file" >/dev/null <<EOF
+
+[plugins.'io.containerd.snapshotter.v1.devmapper']
+  root_path = '${DEVMAPPER_DATA_DIR}'
+  pool_name = '${DEVMAPPER_POOL_NAME}'
+  base_image_size = '${DEVMAPPER_BASE_IMAGE_SIZE}'
+  discard_blocks = true
+  fs_type = 'ext4'
+EOF
+        fi
+        need_restart=true
+        pass "containerd devmapper 插件已配置"
+    else
+        pass "containerd devmapper 插件已配置"
+    fi
+
+    # 重启后自动恢复 thin-pool
+    sudo tee "$reload_script" >/dev/null <<'RELOAD'
+#!/bin/bash
+set -euo pipefail
+DATA_DIR=/var/lib/containerd/devmapper
+POOL_NAME=devpool4
+DATA_FILE="${DATA_DIR}/data4"
+META_FILE="${DATA_DIR}/meta4"
+[ -f "$DATA_FILE" ] && [ -f "$META_FILE" ] || exit 0
+if dmsetup info "$POOL_NAME" >/dev/null 2>&1; then
+    exit 0
+fi
+DATA_DEV=$(losetup --find --show --direct-io=on "$DATA_FILE" 2>/dev/null || losetup --find --show "$DATA_FILE")
+META_DEV=$(losetup --find --show --direct-io=on "$META_FILE" 2>/dev/null || losetup --find --show "$META_FILE")
+LENGTH=$(($(blockdev --getsize64 "$DATA_DEV") / 512))
+dmsetup create "$POOL_NAME" --table "0 ${LENGTH} thin-pool ${META_DEV} ${DATA_DEV} 128 32768"
+RELOAD
+    sudo chmod +x "$reload_script"
+    sudo tee "$reload_unit" >/dev/null <<EOF
+[Unit]
+Description=Reload containerd devmapper thin-pool
+DefaultDependencies=no
+Before=containerd.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=${reload_script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+Also=containerd.service
+EOF
+    sudo systemctl daemon-reload
+    if ! sudo systemctl enable devmapper-reload.service >/dev/null 2>&1; then
+        sudo systemctl enable devmapper-reload.service
+    fi
+
+    if $need_restart; then
+        echo "  重启 containerd 以加载 devmapper..."
+        sudo systemctl restart containerd
+        sleep 2
+    fi
+
+    if ctr plugins ls 2>/dev/null | grep devmapper | grep -q 'ok'; then
+        pass "devmapper 插件状态 ok"
+        return 0
+    fi
+    # 再试一次重启
+    sudo systemctl restart containerd
+    sleep 2
+    if ctr plugins ls 2>/dev/null | grep devmapper | grep -q 'ok'; then
+        pass "devmapper 插件状态 ok"
+        return 0
+    fi
+    fail "devmapper 插件未就绪（ctr plugins ls | grep devmapper）"
+    return 1
+}
+
+# ============================================================
 # 检查 snapshotter 配置
 # ============================================================
 check_snapshotter() {
     echo ""
     echo "--- snapshotter ---"
 
+    if [ "$SNAPSHOTTER" = "devmapper" ]; then
+        ensure_devmapper || return 1
+    fi
+
     local config_file="/etc/containerd/config.toml"
     local current_snapshotter
     current_snapshotter=$(grep -oP "snapshotter\s*=\s*'\K[^']*" "$config_file" 2>/dev/null | head -1)
 
     if [ "$current_snapshotter" = "$SNAPSHOTTER" ]; then
+        # kata runtime 段也尽量对齐 devmapper
+        if [ "$SNAPSHOTTER" = "devmapper" ] && [ "$CONTAINERD_RUNTIME" = "kata" ]; then
+            if ! awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/^\[/{if(!/runtimes\.kata/)p=0} p&&/snapshotter/{print; exit}' "$config_file" | grep -q devmapper; then
+                if ! $CHECK_ONLY; then
+                    if ! grep -A12 'runtimes\.kata\]' "$config_file" | grep -q "snapshotter"; then
+                        warn "kata runtime 未声明 snapshotter=devmapper，正在补齐..."
+                        sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = 'devmapper'" "$config_file"
+                        sudo systemctl restart containerd
+                        sleep 2
+                    fi
+                fi
+            fi
+        fi
         pass "snapshotter 已配置: $SNAPSHOTTER"
         return 0
     fi
@@ -1078,6 +1437,13 @@ check_snapshotter() {
       snapshotter = '$SNAPSHOTTER'" "$config_file"
     fi
 
+    # kata + devmapper：runtime 段也写上
+    if [ "$SNAPSHOTTER" = "devmapper" ] && [ "$CONTAINERD_RUNTIME" = "kata" ]; then
+        if ! awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/snapshotter/{print; exit}' "$config_file" | grep -q devmapper; then
+            sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = 'devmapper'" "$config_file"
+        fi
+    fi
+
     # 重启 containerd 使配置生效
     echo "  重启 containerd..."
     sudo systemctl restart containerd
@@ -1094,9 +1460,44 @@ check_pause_image() {
     echo ""
     echo "--- pause 镜像 ---"
 
-    if crictl images 2>/dev/null | awk '{print $1":"$2}' | grep -qF "$PAUSE_IMAGE"; then
-        pass "pause 镜像已缓存: $PAUSE_IMAGE"
-        return 0
+    _pause_listed() {
+        crictl images 2>/dev/null | awk '{print $1":"$2}' | grep -qF "$PAUSE_IMAGE"
+    }
+
+    # devmapper：content 在但未 unpack 时 CRI 会报 not unpacked；用 ctr mount 触发 unpack
+    _ensure_pause_unpacked() {
+        [ "$SNAPSHOTTER" = "devmapper" ] || return 0
+        # 已有 committed snapshot 即视为已 unpack（避免残留 View 干扰）
+        # ctr snapshots ls：无 PARENT 时 KIND 在 $2，有 PARENT 时在 $3
+        if sudo ctr -n k8s.io snapshots --snapshotter "$SNAPSHOTTER" ls 2>/dev/null | awk 'NR>1 && /Committed/{found=1} END{exit !found}'; then
+            return 0
+        fi
+        local mnt="/tmp/pause-${SNAPSHOTTER}-unpack-$$"
+        sudo mkdir -p "$mnt"
+        sudo ctr -n k8s.io images unmount "$mnt" >/dev/null 2>&1 || true
+        local plat="linux/${ARCH}"
+        [ "$ARCH" = "arm64" ] && plat="linux/arm64"
+        if sudo ctr -n k8s.io images mount --snapshotter "$SNAPSHOTTER" --platform "$plat" "$PAUSE_IMAGE" "$mnt" >/dev/null 2>&1            || sudo ctr -n k8s.io images mount --snapshotter "$SNAPSHOTTER" "$PAUSE_IMAGE" "$mnt" >/dev/null 2>&1; then
+            sudo ctr -n k8s.io images unmount "$mnt" >/dev/null 2>&1 || true
+            sudo ctr -n k8s.io snapshots --snapshotter "$SNAPSHOTTER" rm "$mnt" >/dev/null 2>&1 || true
+            sudo rmdir "$mnt" 2>/dev/null || true
+            return 0
+        fi
+        sudo rmdir "$mnt" 2>/dev/null || true
+        return 1
+    }
+
+    if _pause_listed; then
+        if [ "$SNAPSHOTTER" = "devmapper" ] && ! $CHECK_ONLY; then
+            if _ensure_pause_unpacked; then
+                pass "pause 镜像已缓存并 unpack 到 devmapper: $PAUSE_IMAGE"
+                return 0
+            fi
+            warn "pause 已在镜像库但 devmapper unpack 失败，尝试重新 pull..."
+        else
+            pass "pause 镜像已缓存: $PAUSE_IMAGE"
+            return 0
+        fi
     fi
 
     if $CHECK_ONLY; then
@@ -1106,7 +1507,14 @@ check_pause_image() {
 
     warn "pause 镜像缺失，正在拉取: $PAUSE_IMAGE ..."
     if crictl pull "$PAUSE_IMAGE"; then
+        _ensure_pause_unpacked || true
         pass "pause 镜像拉取完成"
+        return 0
+    fi
+
+    # 离线：content 可能已有，仅需 devmapper unpack
+    if _pause_listed && _ensure_pause_unpacked; then
+        pass "pause 镜像已从本地 content unpack 到 $SNAPSHOTTER"
         return 0
     fi
 
