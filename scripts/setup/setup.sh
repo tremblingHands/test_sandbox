@@ -13,6 +13,7 @@
 #   ./setup.sh --cni-type bridge --ip-masq true   # bridge 且开启 per-sandbox MASQUERADE
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --runtime kata --hypervisor firecracker  # 自动切 devmapper（块设备 rootfs）
+#   ./setup.sh --runtime kata --hypervisor qemu --vm-template  # VM 模板加速冷启动（Go+qemu）
 #   ./setup.sh --check-only                   # 仅检查，不安装
 #   ./setup.sh --no-warmup                    # 成功后不跑 cold_start_bench warmup
 #
@@ -51,6 +52,11 @@ SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs | devmapper�
 KATA_VERSION="4.0.0"           # kata containers 版本
 KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
 IP_MASQ="false"                 # bridge 专用: CNI ipMasq（默认 false；出网用节点级 MASQUERADE）
+VM_TEMPLATE=false               # Kata VM templating（factory）；仅 qemu + Go runtime
+HYPERVISOR_EXPLICIT=false
+SNAPSHOTTER_EXPLICIT=false
+CHECK_ONLY=false
+NO_WARMUP=false
 DEVMAPPER_DATA_DIR="/var/lib/containerd/devmapper"
 DEVMAPPER_POOL_NAME="devpool4"
 DEVMAPPER_DATA_SIZE="50G"       # sparse 数据盘
@@ -73,11 +79,6 @@ detect_arch() {
 }
 ARCH=$(detect_arch)
 
-CHECK_ONLY=false
-NO_WARMUP=false
-HYPERVISOR_EXPLICIT=false
-SNAPSHOTTER_EXPLICIT=false
-
 usage() {
     cat <<EOF
 沙箱冷启动测试 — 环境准备（安装/检查 containerd、CNI、runtime 等）
@@ -96,6 +97,9 @@ usage() {
                            (默认: ${KATA_HYPERVISOR}；仅 --runtime kata 时生效)
                            注: Kata 4.0 runtime-rs 中 CLH 配置段名为 clh（cloud-hypervisor 为别名）
                            注: stratovirt 走 Go shim（非 runtime-rs）；本机 glibc 过旧时用捆绑静态 Go shim
+  --vm-template            启用 Kata VM templating（factory）；强制 qemu + Go runtime
+                           需 initrd、shared_fs≠virtio-fs；ARM64 上官方测试曾标记不稳定
+                           (默认: ${VM_TEMPLATE})
   --snapshotter NAME       snapshotter: overlayfs | erofs | devmapper
                            (默认: ${SNAPSHOTTER}；firecracker 自动强制 devmapper)
   --check-only             仅检查，不安装/不修改
@@ -119,6 +123,7 @@ usage() {
   $0 --cni-type bridge
   $0 --cni-type bridge --ip-masq true
   $0 --runtime kata --hypervisor qemu
+  $0 --runtime kata --hypervisor qemu --vm-template
   $0 --runtime kata --hypervisor firecracker
   $0 --check-only
   $0 --no-warmup
@@ -135,6 +140,8 @@ while [[ $# -gt 0 ]]; do
             CHECK_ONLY=true; shift ;;
         --no-warmup)
             NO_WARMUP=true; shift ;;
+        --vm-template)
+            VM_TEMPLATE=true; shift ;;
         --cni-type)
             CNI_TYPE="$2"
             case "$CNI_TYPE" in
@@ -207,6 +214,33 @@ if [ "$CONTAINERD_RUNTIME" = "kata" ] && [ "$KATA_HYPERVISOR" = "firecracker" ];
             warn "firecracker 需要 devmapper；忽略 --snapshotter $SNAPSHOTTER"
         fi
         SNAPSHOTTER="devmapper"
+    fi
+fi
+
+# VM template + shared_fs=none 需要块设备 rootfs（overlayfs 无法给 guest 提供 rootfs）
+if $VM_TEMPLATE && [ "$SNAPSHOTTER" != "devmapper" ]; then
+    if $SNAPSHOTTER_EXPLICIT; then
+        warn "--vm-template 需要块 rootfs；忽略 --snapshotter $SNAPSHOTTER → devmapper"
+    else
+        warn "--vm-template 需要块 rootfs；切换 snapshotter → devmapper"
+    fi
+    SNAPSHOTTER="devmapper"
+fi
+
+
+# VM templating：仅 qemu；切到 Go runtime（kata-runtime factory init）
+if $VM_TEMPLATE; then
+    if [ "$CONTAINERD_RUNTIME" != "kata" ]; then
+        echo "ERROR: --vm-template 需要 --runtime kata"; exit 1
+    fi
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
+        echo "ERROR: --vm-template 与 stratovirt 互斥"; exit 1
+    fi
+    if [ "$KATA_HYPERVISOR" != "qemu" ]; then
+        if $HYPERVISOR_EXPLICIT; then
+            warn "--vm-template 仅支持 qemu；忽略 --hypervisor $KATA_HYPERVISOR"
+        fi
+        KATA_HYPERVISOR="qemu"
     fi
 fi
 
@@ -419,7 +453,7 @@ check_kata_runtime() {
     local kata_go_static_bundled="${INSTALL_FILES_DIR}/go-shim-static/containerd-shim-kata-v2"
     local use_go_runtime=false
 
-    if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ] || $VM_TEMPLATE; then
         use_go_runtime=true
     fi
 
@@ -511,7 +545,12 @@ check_kata_runtime() {
             target_link_name="configuration-dragonball.toml"
             ;;
         qemu)
-            target_link_name="configuration-qemu-runtime-rs.toml"
+            if $VM_TEMPLATE; then
+                # Go runtime + factory（官方 kata-runtime factory init 路径）
+                target_link_name="configuration-qemu.toml"
+            else
+                target_link_name="configuration-qemu-runtime-rs.toml"
+            fi
             ;;
         clh|cloud-hypervisor)
             # 4.0.0：配置文件名 configuration-clh-runtime-rs.toml，段名 [hypervisor.clh]
@@ -687,6 +726,90 @@ check_kata_runtime() {
         pass "stratovirt machine_type=$(grep -E '^machine_type' "$target_config" | head -1 | awk -F= '{gsub(/[" ]/,"",$2);print $2}') shared_fs=virtio-fs"
     fi
 
+    # VM templating（Go qemu）：initrd、关 image、shared_fs≠virtio-fs、enable_template
+    if $VM_TEMPLATE; then
+        echo "  配置 Go runtime QEMU VM templating..."
+        local initrd="/opt/kata/share/kata-containers/kata-containers-initrd.img"
+        if [ ! -e "$initrd" ]; then
+            fail "缺少 initrd: $initrd（VM template 要求 initrd，不支持纯 image）"
+            return 1
+        fi
+        # image 与 initrd 不能同时设置
+        if grep -qE '^image\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^image = |#image = |' "$target_config"
+        fi
+        if grep -qE '^#\s*initrd\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^#\s*initrd = .*|initrd = \"$initrd\"|" "$target_config"
+        elif grep -qE '^initrd\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^initrd = .*|initrd = \"$initrd\"|" "$target_config"
+        else
+            sudo sed -i "/^\[hypervisor\.qemu\]/a initrd = \"$initrd\"" "$target_config"
+        fi
+        # template 与 virtio-fs 互斥。virtio-9p 在本机 guest agent/initrd 无 9p handler。
+        # shared_fs=none + 静态 shim 补丁（MkdirAll sharePath）才能走 factory。
+        if grep -qE '^shared_fs\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^shared_fs = .*|shared_fs = "none"|' "$target_config"
+        else
+            sudo sed -i '/^\[hypervisor\.qemu\]/a shared_fs = "none"' "$target_config"
+        fi
+        if grep -qE '^disable_block_device_use\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^disable_block_device_use = .*|disable_block_device_use = false|' "$target_config"
+        fi
+        if grep -qE '^enable_template\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^enable_template = .*|enable_template = true|' "$target_config"
+        else
+            sudo sed -i '/^\[factory\]/a enable_template = true' "$target_config"
+        fi
+        if ! grep -qE '^template_path\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i '/^enable_template = /a template_path = "/run/vc/vm/template"' "$target_config"
+        fi
+        # ARM64 qemu 常用修补
+        if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            sudo sed -i 's|machine_type = "q35"|machine_type = "virt"|' "$target_config"
+            if grep -qE '^firmware\s*=' "$target_config" 2>/dev/null; then
+                sudo sed -i 's|^firmware = .*|firmware = ""|' "$target_config"
+            fi
+            warn "ARM64 上 VM templating 官方测试曾 skip（可能不稳定）"
+        fi
+        # ARM64 virt：pcie_root_port 仅在 hot_plug_vfio=root-port 时生效；
+        # template 无网卡时 epNum=0，否则不会创建 rp0，后续 ipvlan 热插失败。
+        if grep -qE '^hot_plug_vfio\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^hot_plug_vfio = .*|hot_plug_vfio = "root-port"|' "$target_config"
+        elif grep -qE '^#\s*hot_plug_vfio\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^#\s*hot_plug_vfio = .*|hot_plug_vfio = "root-port"|' "$target_config"
+        else
+            sudo sed -i '/^default_bridges = /a hot_plug_vfio = "root-port"' "$target_config"
+        fi
+        if grep -qE '^pcie_root_port\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^pcie_root_port = .*|pcie_root_port = 1|' "$target_config"
+        else
+            sudo sed -i '/^hot_plug_vfio = /a pcie_root_port = 1' "$target_config" 2>/dev/null || true
+            if ! grep -qE '^pcie_root_port\s*=' "$target_config" 2>/dev/null; then
+                sudo sed -i '/^default_bridges = /a pcie_root_port = 1' "$target_config"
+            fi
+        fi
+        # static_sandbox_resource_mgmt 会把 DefaultMaxVCPUs 压成 default_vcpus；
+        # factory 校验严格匹配，default_maxvcpus=0（主机核数）会导致永远 fallback 直启。
+        local def_vcpus
+        def_vcpus=$(grep -E '^default_vcpus\s*=' "$target_config" 2>/dev/null | head -1 | awk -F= '{gsub(/[" ]/,"",$2);print int($2)}')
+        [ -z "$def_vcpus" ] || [ "$def_vcpus" -le 0 ] 2>/dev/null && def_vcpus=1
+        if grep -qE '^default_maxvcpus\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^default_maxvcpus = .*|default_maxvcpus = $def_vcpus|" "$target_config"
+        else
+            sudo sed -i "/^default_vcpus = /a default_maxvcpus = $def_vcpus" "$target_config"
+        fi
+        # qemu+devmapper：sandbox_cgroup_only=false 会 cgroup.procs EINVAL（kata#6977）
+        if grep -qE '^sandbox_cgroup_only\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^sandbox_cgroup_only = .*|sandbox_cgroup_only = true|' "$target_config"
+        elif grep -qE '^#\s*sandbox_cgroup_only\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^#\s*sandbox_cgroup_only = .*|sandbox_cgroup_only = true|' "$target_config"
+        else
+            sudo sed -i '/^\[runtime\]/a sandbox_cgroup_only = true' "$target_config"
+        fi
+        pass "vm-template: enable_template=true, initrd, shared_fs=none, hot_plug_vfio=root-port, pcie_root_port=1, default_maxvcpus=$def_vcpus, sandbox_cgroup_only=true"
+    fi
+
+
     # 校验 hypervisor 二进制（dragonball 内置，无独立 path）
     case "$KATA_HYPERVISOR" in
         qemu)
@@ -730,6 +853,43 @@ check_kata_runtime() {
         sudo ln -s "$target_link_name" "$default_config"
         hypervisor_changed=true
         pass "kata hypervisor 已设为 $KATA_HYPERVISOR"
+    fi
+
+
+    # VM template：安装静态 kata-runtime 并 factory init
+    if $VM_TEMPLATE; then
+        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+        local kata_rt_bundled="${INSTALL_FILES_DIR}/go-shim-static/kata-runtime"
+        if [ ! -x "$kata_rt_static" ] || ! "$kata_rt_static" --version &>/dev/null; then
+            if [ -x "$kata_rt_bundled" ]; then
+                echo "  安装捆绑的静态 kata-runtime（factory CLI）..."
+                sudo install -m 0755 "$kata_rt_bundled" "$kata_rt_static"
+            else
+                fail "缺少 ${kata_rt_bundled}（见 config/kata/go-shim-static/README.md）"
+                return 1
+            fi
+        fi
+        pass "kata-runtime（factory）: $("$kata_rt_static" --version 2>/dev/null | head -1)"
+        if ! $CHECK_ONLY; then
+            echo "  初始化 VM factory（kata-runtime factory init）..."
+            # 先 destroy 残留，忽略失败
+            sudo "$kata_rt_static" --config "$default_config" factory destroy >/dev/null 2>&1 || true
+            if sudo "$kata_rt_static" --config "$default_config" factory init; then
+                pass "vm factory 已初始化（template_path=/run/vc/vm/template）"
+            else
+                fail "kata-runtime factory init 失败（ARM64 上可能不稳定，见官方 template 测试 skip）"
+                return 1
+            fi
+        fi
+    elif [ -d /run/vc/vm/template ] && ! $CHECK_ONLY; then
+        # 离开 template 模式时清理残留 factory（避免占 tmpfs）
+        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+        if [ -x "$kata_rt_static" ]; then
+            echo "  清理旧 VM factory..."
+            sudo "$kata_rt_static" factory destroy >/dev/null 2>&1 || \
+                sudo umount /run/vc/vm/template >/dev/null 2>&1 || true
+            sudo rm -rf /run/vc/vm/template >/dev/null 2>&1 || true
+        fi
     fi
 
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
@@ -1714,6 +1874,9 @@ main() {
     echo "  Runtime:     $CONTAINERD_RUNTIME"
     if [ "$CONTAINERD_RUNTIME" = "kata" ]; then
         echo "  Hypervisor:  $KATA_HYPERVISOR"
+        if $VM_TEMPLATE; then
+            echo "  VM template: on (Go factory)"
+        fi
     fi
     echo "  CNI 类型:    $CNI_TYPE"
     if [ "$CNI_TYPE" = "bridge" ]; then

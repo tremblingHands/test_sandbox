@@ -539,6 +539,50 @@ Firmware for dragonball hypervisor should be empty
 
 `setup.sh` 在 `--hypervisor dragonball` 时强制 `firmware = ""`（与 qemu 清 firmware 同源，但 DB 是硬校验而非仅性能问题）。清空后本机 warmup **3/3**，`t_runp` 约 **1.5s**。
 
+## 5.7 问题 G：Kata VM templating（`--vm-template`）
+
+官方 Go 路径：`enable_template=true` + `kata-runtime factory init`，新沙箱从 `/run/vc/vm/template` clone（`BootFromTemplate` + 设备状态迁移）。
+
+### setup 行为
+
+```bash
+bash scripts/setup/setup.sh --runtime kata --hypervisor qemu --vm-template
+```
+
+强制 **qemu + Go 静态 shim/runtime**，并写入：
+
+| 配置 | 值 | 原因 |
+|------|-----|------|
+| `enable_template` | `true` | 启用 factory |
+| `initrd` | `kata-containers-initrd.img` | template **不支持**纯 `image=` |
+| `shared_fs` | `none` | 与 virtio-fs 内存共享冲突 |
+| `disable_block_device_use` | `false` | none 下尽量允许块 rootfs |
+| `hot_plug_vfio` | `root-port` | ARM64 virt 上否则忽略 `pcie_root_port` |
+| `pcie_root_port` | `1` | template 无网卡时仍预留 `rp0`，clone 后 ipvlan 热插 |
+| `default_maxvcpus` | `= default_vcpus`（通常 1） | `static_sandbox_resource_mgmt` 会压扁 maxvcpus；不匹配则 **永远 fallback 直启** |
+| `sandbox_cgroup_only` | `true` | qemu+devmapper 否则 `cgroup.procs EINVAL`（kata#6977） |
+| snapshotter | **强制 `devmapper`** | `shared_fs=none` 需要块 rootfs |
+
+另需静态 shim 补丁（`config/kata/go-shim-static/patches/`）：`shared_fs=none` 时仍创建 `/run/vc/vm/<vmid>/shared`，否则 `assignSandbox` 软链悬空。
+
+### 本机实测进度（`--snapshotter devmapper`）
+
+| 阶段 | 结果 |
+|------|------|
+| `factory init` | OK |
+| clone（`-incoming defer` + template memory） | OK |
+| ipvlan 热插到 `rp0` | OK |
+| pause rootfs（**devmapper** 块设备） | OK（需 `sandbox_cgroup_only=true`，见 kata#6977） |
+| `cold_start_bench` 3/3 | OK，但 **`t_runp` ~2.05s** |
+
+同机对照（Go qemu + devmapper + `sandbox_cgroup_only`，**关** template）：`t_runp` ~**1.04s**。本机上 template 的设备状态迁移（~200MB+ state / 2GiB 共享内存）开销大于省下的 guest 启动，**单次冷启动反而更慢**。clh/qemu+virtio-fs 直启仍约 **0.8–1.0s**。
+
+### 为何 overlayfs 不行、devmapper 可以
+
+Kata 4.0 guest agent **已去掉 9p**；virtio-fs 与 template 互斥；`shared_fs=none` + overlayfs 不会产生块 rootfs。**devmapper** 提供 `/dev/dm-*`，`hotplugDrive` 可挂进 guest。
+
+`--vm-template` 现会强制 `snapshotter=devmapper`，并设 `sandbox_cgroup_only=true`。
+
 ---
 
 ## 6. 推荐排查顺序
@@ -593,9 +637,10 @@ zgrep CONFIG_CGROUP_BPF /proc/config.gz
 7. firecracker 必须 **devmapper**；强杀 VM 后若出现 `Buffer I/O error` / snapshot busy，重建 thin-pool 并重新 unpack pause。
 8. kata **3.22.0** 官方 shim 的 FC `vcpu_count` 浮点 bug 需补丁版 shim；**4.0.0 已修复**，优先用 `install/kata-static-4.0.0-arm64.tar.zst`。
 9. 4.0.0 FC 静态包若仍见 `hybrid_vsock` unwrap，核对 `dial_timeout_ms=10` 与 `reconnect_timeout_ms=45000`（勿留 `dial_timeout_ms=45000`）。
-10. 默认用 **runtime-rs**；**stratovirt** 例外走 Go 静态 shim（官方 Go 二进制需 GLIBC≥2.32）。
+10. 默认用 **runtime-rs**；**stratovirt** / **`--vm-template`** 例外走 Go 静态 shim（官方 Go 二进制需 GLIBC≥2.32）。
 11. qemu 4.0 若冷启动突然慢到 ~2s+，先查 `firmware` 是否指向 AAVMF/EDK2；有 `-kernel` 时应清空。
 12. 切到 **clh** 时确认配置段是 `[hypervisor.clh]`，不是旧名 `cloud-hypervisor`。
+13. **`--vm-template`** 需 **devmapper** + `sandbox_cgroup_only=true`；本机可 3/3，但 `t_runp` ~2s，慢于同条件直启 ~1s 与 clh/qemu+virtio-fs ~0.8–1.0s（见 §5.7）。
 
 ---
 
@@ -617,6 +662,7 @@ zgrep CONFIG_CGROUP_BPF /proc/config.gz
 | firecracker：注释 `jailer_path` | 避免 jail 路径/挂载异常 |
 | firecracker：`dial_timeout_ms=10` + `reconnect_timeout_ms=45000` | 修 4.0.0 静态包 retry_times=0 panic |
 | qemu ARM64：强制 `firmware = ""` | 避免 4.0 默认 AAVMF 拖慢冷启动 ~1.3s |
+| `--vm-template`：Go qemu factory + devmapper + sandbox_cgroup_only | 官方 template；本机可 3/3，但慢于直启 |
 | clh：捆绑 `config/kata/configuration-clh-runtime-rs.toml`（段名 `clh`） | 4.0 aarch64 包缺 CLH runtime-rs 配置 |
 | stratovirt：切换 Go 静态 shim + `configuration-stratovirt.toml` | runtime-rs 无 StratoVirt；官方 Go shim 需 GLIBC≥2.32 |
 

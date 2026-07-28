@@ -1,0 +1,37 @@
+diff --git a/src/runtime/virtcontainers/kata_agent.go b/src/runtime/virtcontainers/kata_agent.go
+index cc47c2f40..78dd9a56a 100644
+--- a/src/runtime/virtcontainers/kata_agent.go
++++ b/src/runtime/virtcontainers/kata_agent.go
+@@ -482,24 +482,25 @@ func (k *kataAgent) configure(ctx context.Context, h Hypervisor, id, sharePath s
+ 		return types.ErrInvalidConfigType
+ 	}
+ 
+-	// Neither create shared directory nor add 9p device if hypervisor
+-	// doesn't support filesystem sharing.
++	// Create shared directory even when FS sharing is unsupported: VM factory
++	// assignSandbox() symlinks the sandbox mounts path to this directory.
++	if err = os.MkdirAll(sharePath, DirMode); err != nil {
++		return err
++	}
++
++	// Neither add 9p/virtio-fs device if hypervisor doesn't support filesystem sharing.
+ 	caps := h.Capabilities(ctx)
+ 	if !caps.IsFsSharingSupported() {
+ 		return nil
+ 	}
+ 
+-	// Create shared directory and add the shared volume if filesystem sharing is supported.
++	// Add the shared volume if filesystem sharing is supported.
+ 	// This volume contains all bind mounted container bundles.
+ 	sharedVolume := types.Volume{
+ 		MountTag: mountGuestTag,
+ 		HostPath: sharePath,
+ 	}
+ 
+-	if err = os.MkdirAll(sharedVolume.HostPath, DirMode); err != nil {
+-		return err
+-	}
+-
+ 	return h.AddDevice(ctx, sharedVolume, FsDev)
+ }
+ 
