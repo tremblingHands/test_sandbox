@@ -501,6 +501,21 @@ check_kata_runtime() {
         fi
     fi
 
+    # Dragonball：ARM64 上 virtio-blk-pci 根盘 guest 看不到（VFS Unable to mount root fs），改用 mmio
+    if [ "$KATA_HYPERVISOR" = "dragonball" ]; then
+        echo "  配置 runtime-rs Dragonball..."
+        if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            if grep -q 'vm_rootfs_driver = "virtio-blk-pci"' "$target_config" 2>/dev/null || \
+               grep -q 'block_device_driver = "virtio-blk-pci"' "$target_config" 2>/dev/null; then
+                sudo sed -i 's|vm_rootfs_driver = "virtio-blk-pci"|vm_rootfs_driver = "virtio-blk-mmio"|' "$target_config"
+                sudo sed -i 's|block_device_driver = "virtio-blk-pci"|block_device_driver = "virtio-blk-mmio"|' "$target_config"
+                pass "dragonball ARM64 rootfs/block 驱动已改为 virtio-blk-mmio"
+            else
+                pass "dragonball ARM64 rootfs 驱动已是 mmio/非 pci"
+            fi
+        fi
+    fi
+
     # 校验 hypervisor 二进制（dragonball 内置，无独立 path）
     case "$KATA_HYPERVISOR" in
         qemu)
