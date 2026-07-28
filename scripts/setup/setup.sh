@@ -541,43 +541,18 @@ check_kata_runtime() {
     fi
 
     # ---- 2. 检查 containerd 是否注册了 kata runtime ---- #
+    # containerd v2 (config version>=3) 使用 io.containerd.cri.v1.runtime；
+    # 旧版使用 io.containerd.grpc.v1.cri。写错路径时 grep 仍能命中，但 CRI 看不到 kata。
     local config_file="/etc/containerd/config.toml"
-    if grep -q "io.containerd.kata.v2" "$config_file" 2>/dev/null; then
-        # 验证 runtime_path 和 ConfigPath 是否正确（防止旧配置缓存问题）
-        local need_fix=false
-        if ! grep -q "runtime-rs" <<< "$(grep 'runtime_path.*kata' "$config_file")"; then
-            warn "kata runtime_path 未指向 runtime-rs，正在修正..."
-            sudo sed -i "/runtimes\.kata\]/,/^\[/s|runtime_path = .*|runtime_path = '$kata_shim'|" "$config_file"
-            need_fix=true
-        fi
-        if ! grep -q "runtime-rs" <<< "$(grep 'ConfigPath.*kata' "$config_file")"; then
-            warn "kata ConfigPath 未指向 runtime-rs，正在修正..."
-            sudo sed -i "/runtimes\.kata\]/,/^\[/s|ConfigPath = .*|ConfigPath = '/opt/kata/share/defaults/kata-containers/runtime-rs/configuration.toml'|" "$config_file"
-            need_fix=true
-        fi
-        if $need_fix || $hypervisor_changed; then
-            if ! $CHECK_ONLY; then
-                echo "  重启 containerd 使 hypervisor/配置生效..."
-                sudo systemctl restart containerd
-                sleep 2
-            fi
-            if $need_fix; then
-                pass "containerd kata 配置已修正"
-            else
-                pass "containerd 已注册 kata runtime（hypervisor 已切换）"
-            fi
-        else
-            pass "containerd 已注册 kata runtime"
-        fi
-        return 0
+    local cri_runtime_plugin="io.containerd.grpc.v1.cri"
+    if grep -q "io.containerd.cri.v1.runtime" "$config_file" 2>/dev/null; then
+        cri_runtime_plugin="io.containerd.cri.v1.runtime"
     fi
-
-    if $CHECK_ONLY; then
-        warn "containerd 未注册 kata runtime"
-        return 1
-    fi
-
-    echo "  注册 kata runtime 到 containerd..."
+    local kata_runtime_section="[plugins.\"${cri_runtime_plugin}\".containerd.runtimes.kata]"
+    local kata_options_section="[plugins.\"${cri_runtime_plugin}\".containerd.runtimes.kata.options]"
+    # 单引号写法（containerd config dump 常用）
+    local kata_runtime_section_alt="[plugins.'${cri_runtime_plugin}'.containerd.runtimes.kata]"
+    local kata_options_section_alt="[plugins.'${cri_runtime_plugin}'.containerd.runtimes.kata.options]"
 
     # 找到 kata 配置文件（runtime-rs 使用 runtime-rs 子目录下的配置）
     local kata_config_path=""
@@ -591,41 +566,119 @@ check_kata_runtime() {
         kata_config_path="/opt/kata/share/defaults/kata-containers/configuration.toml"
     fi
 
-    # 附加 kata runtime 到 containerd config.toml 末尾
-    # TOML 完整路径格式，append 到文件末尾即可
-    sudo tee -a "$config_file" > /dev/null <<KATAEOF
+    _kata_section_present() {
+        grep -qF "$kata_runtime_section" "$config_file" 2>/dev/null || \
+            grep -qF "$kata_runtime_section_alt" "$config_file" 2>/dev/null
+    }
 
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+    _kata_active_in_cri() {
+        # crictl info 的 runtimes 才是 CRI 实际加载的 handler
+        crictl info 2>/dev/null | grep -q '"kata"'
+    }
+
+    _write_kata_runtime_block() {
+        sudo tee -a "$config_file" > /dev/null <<KATAEOF
+
+${kata_runtime_section}
   runtime_type = 'io.containerd.kata.v2'
-  runtime_path = '$kata_shim'
+  runtime_path = '${kata_shim}'
   privileged_without_host_devices = true
   pod_annotations = ['io.katacontainers.*']
-  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
-    ConfigPath = '$kata_config_path'
+  ${kata_options_section}
+    ConfigPath = '${kata_config_path}'
 KATAEOF
+    }
 
-    # 重启 containerd 使配置生效
-    echo "  重启 containerd 使 kata runtime 生效..."
-    if ! sudo systemctl restart containerd; then
-        fail "containerd 重启失败，检查 /etc/containerd/config.toml"
-        return 1
-    fi
-    sleep 3
+    _strip_stale_kata_sections() {
+        # 删掉任意路径下的 kata runtime 段（含旧 grpc.v1.cri 残留）
+        sudo sed -i '/\[plugins.*runtimes\.kata\]/,/^$/d' "$config_file"
+        sudo sed -i '/^$/{N;/^\n$/d;}' "$config_file"
+    }
 
-    # 验证注册成功
-    if grep -q "io.containerd.kata.v2" "$config_file"; then
-        # 进一步验证 containerd 能识别
-        if ctr plugins ls 2>/dev/null | grep -q "io.containerd.kata"; then
-            pass "kata runtime 已注册到 containerd"
+    local need_restart=false
+    local need_reregister=false
+
+    if _kata_section_present; then
+        local need_fix=false
+        if ! awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/runtime_path/{print; exit}' "$config_file" | grep -q runtime-rs; then
+            warn "kata runtime_path 未指向 runtime-rs，正在修正..."
+            need_fix=true
+        fi
+        if ! awk '/\[plugins.*runtimes\.kata(\.options)?\]/{p=1} p&&/ConfigPath/{print; exit}' "$config_file" | grep -q runtime-rs; then
+            warn "kata ConfigPath 未指向 runtime-rs，正在修正..."
+            need_fix=true
+        fi
+        if $need_fix; then
+            if $CHECK_ONLY; then
+                warn "containerd kata 配置路径不正确"
+                return 1
+            fi
+            _strip_stale_kata_sections
+            _write_kata_runtime_block
+            need_restart=true
+            pass "containerd kata 配置已修正（plugin=${cri_runtime_plugin}）"
+        elif $hypervisor_changed; then
+            need_restart=true
+            pass "containerd 已注册 kata runtime（hypervisor 已切换）"
         else
-            warn "kata 配置已写入，但 containerd 未加载 kata 插件（可能需手动检查）"
+            pass "containerd 已注册 kata runtime（plugin=${cri_runtime_plugin}）"
         fi
     else
-        fail "kata runtime 注册失败"
+        # 可能只写了旧路径，或完全未注册
+        if grep -q "io.containerd.kata.v2" "$config_file" 2>/dev/null; then
+            warn "kata 写在非活动 CRI 路径，需迁移到 ${cri_runtime_plugin}"
+        fi
+        need_reregister=true
+    fi
+
+    if $need_reregister; then
+        if $CHECK_ONLY; then
+            warn "containerd 未在活动路径注册 kata runtime（期望 plugin=${cri_runtime_plugin}）"
+            return 1
+        fi
+        echo "  注册 kata runtime 到 containerd（plugin=${cri_runtime_plugin}）..."
+        _strip_stale_kata_sections
+        _write_kata_runtime_block
+        need_restart=true
+    fi
+
+    if $need_restart && ! $CHECK_ONLY; then
+        echo "  重启 containerd 使 kata runtime 生效..."
+        if ! sudo systemctl restart containerd; then
+            fail "containerd 重启失败，检查 /etc/containerd/config.toml"
+            return 1
+        fi
+        sleep 3
+    fi
+
+    # 验证：配置文件 + CRI 实际可见
+    if ! _kata_section_present; then
+        fail "kata runtime 注册失败（配置未写入活动路径 ${cri_runtime_plugin}）"
+        return 1
+    fi
+    if _kata_active_in_cri; then
+        pass "kata runtime 已对 CRI 生效（crictl 可见）"
+        return 0
+    fi
+
+    # 配置正确但 CRI 未见：再重启一次（常见于先前写错路径）
+    if ! $CHECK_ONLY; then
+        warn "kata 已写入 ${cri_runtime_plugin}，但 crictl 未见，再重启 containerd..."
+        if ! sudo systemctl restart containerd; then
+            fail "containerd 重启失败，检查 /etc/containerd/config.toml"
+            return 1
+        fi
+        sleep 3
+        if _kata_active_in_cri; then
+            pass "kata runtime 已对 CRI 生效（crictl 可见）"
+            return 0
+        fi
+        fail "kata 已写入 ${cri_runtime_plugin}，但 crictl 仍看不到 kata"
         return 1
     fi
 
-    return 0
+    warn "kata 已写入 ${cri_runtime_plugin}，但 crictl 尚未看到 kata"
+    return 1
 }
 
 # ============================================================
@@ -1084,30 +1137,33 @@ check_kernel_params() {
 # cgroup v2: cpu controller + BPF device（runc 硬性依赖）
 # ============================================================
 # 探测 BPF_CGROUP_DEVICE 是否可用（cgroup v2 设备权限依赖 CONFIG_CGROUP_BPF）
+# 注意: bpf_cmd / bpf_attach_type 枚举随内核演进，硬编码单一常量会在旧内核上误报 EINVAL。
+# 例如 5.10 BTF: BPF_PROG_QUERY=16 BPF_CGROUP_DEVICE=6；较新 UAPI 常为 17 / 15。
 _cgroup_bpf_device_ok() {
     python3 - <<'PY' 2>/dev/null
 import ctypes, ctypes.util, os, platform, sys
-# bpf() syscall number
 NR_BPF = {"x86_64": 321, "aarch64": 280, "arm64": 280}.get(platform.machine(), 321)
-BPF_PROG_QUERY, BPF_CGROUP_DEVICE = 17, 15
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 fd = os.open("/sys/fs/cgroup", os.O_RDONLY)
-class Attr(ctypes.Structure):
-    _fields_ = [
-        ("target_fd", ctypes.c_uint32),
-        ("attach_type", ctypes.c_uint32),
-        ("query_flags", ctypes.c_uint32),
-        ("attach_flags", ctypes.c_uint32),
-        ("prog_ids", ctypes.c_uint64),
-        ("prog_cnt", ctypes.c_uint32),
-        ("prog_attach_flags", ctypes.c_uint64),
-    ]
-attr = Attr(target_fd=fd, attach_type=BPF_CGROUP_DEVICE)
-ret = libc.syscall(NR_BPF, BPF_PROG_QUERY, ctypes.byref(attr), ctypes.sizeof(attr))
-err = ctypes.get_errno()
+
+# (BPF_PROG_QUERY, BPF_CGROUP_DEVICE) 候选：先试本机常见旧值，再试新 UAPI
+candidates = [(16, 6), (17, 15)]
+ok = False
+for cmd, attach_type in candidates:
+    # 与 libbpf/bpftool 一致：传入完整 union bpf_attr 大小，尾部置零
+    buf = (ctypes.c_byte * 128)()
+    # target_fd u32 @0, attach_type u32 @4；其余保持 0（prog_ids=NULL, prog_cnt=0）
+    ctypes.c_uint32.from_buffer(buf, 0).value = fd
+    ctypes.c_uint32.from_buffer(buf, 4).value = attach_type
+    ctypes.set_errno(0)
+    ret = libc.syscall(NR_BPF, cmd, buf, 128)
+    err = ctypes.get_errno()
+    # 成功，或 ENOSPC/ENOBUFS/E2BIG（缓冲区不够但仍说明该 attach 受支持）
+    if ret == 0 or err in (7, 28, 105):
+        ok = True
+        break
 os.close(fd)
-# 成功或 ENOSPC/E2BIG 说明支持；EINVAL/ENOTSUPP/ENOSYS 则不支持
-sys.exit(0 if ret == 0 or err in (7, 28) else 1)
+sys.exit(0 if ok else 1)
 PY
 }
 
@@ -1127,8 +1183,8 @@ check_cgroup_v2_cpu() {
     if _cgroup_bpf_device_ok; then
         pass "BPF_CGROUP_DEVICE 可用"
     else
-        fail "内核不支持 cgroup BPF device（bpf_prog_query BPF_CGROUP_DEVICE → EINVAL）"
-        echo "  典型原因: CONFIG_CGROUP_BPF 未开启（本机 /boot/config-* 可查）"
+        fail "内核不支持 cgroup BPF device（bpf_prog_query BPF_CGROUP_DEVICE 失败）"
+        echo "  可查: zgrep CONFIG_CGROUP_BPF /proc/config.gz ；bpftool feature | grep cgroup_device"
         echo "  runc 在 cgroup v2 上用 eBPF 替代 v1 devices 控制器，缺则无法创建容器"
         echo "  修复任选:"
         echo "    A) 换回 cgroup v1: 去掉 cmdline 中 systemd.unified_cgroup_hierarchy=1 后 reboot"
