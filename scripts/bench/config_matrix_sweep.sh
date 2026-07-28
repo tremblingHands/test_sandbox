@@ -6,8 +6,8 @@
 #   3) 遍历 CNI × runtime × hypervisor，内层 throughput_sweep
 #
 # 拓扑默认:
-#   worker-numa=1；HOST 排除 CPU0；sandbox-modes=excl-cd
-#   → containerd 落 numa0 低编号核；sandbox = HOST\CD
+#   worker-numa=1；containerd-numa=0；HOST 排除 CPU0；sandbox-modes=excl-cd
+#   → containerd 落 numa0 低编号核；worker 落 numa1 高编号核；sandbox = HOST\CD
 #
 # 组合展开:
 #   runc → 忽略 hypervisor（一组）
@@ -43,6 +43,7 @@ RUNTIMES="runc,kata"
 HYPERVISORS="qemu"
 IP_MASQ="false"
 WORKER_NUMA="1"
+CONTAINERD_NUMA="0"
 SANDBOX_MODES="excl-cd"
 CONTAINERD_COUNTS=""
 WORKER_COUNTS=""
@@ -88,6 +89,7 @@ usage() {
 
 拓扑 / 压测（默认已按方案固定）:
   --worker-numa LIST          默认 1
+  --containerd-numa N         默认 0（containerd 只从该 NUMA 取核）
   --sandbox-modes LIST        默认 excl-cd
   --duration SEC              默认 30
   --preconfig N               默认 50
@@ -131,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --worker-cpus) WORKER_COUNTS="$2"; shift 2 ;;
         --workers) WORKERS_K="$2"; shift 2 ;;
         --worker-numa) WORKER_NUMA="$2"; shift 2 ;;
+        --containerd-numa) CONTAINERD_NUMA="$2"; shift 2 ;;
         --sandbox-modes) SANDBOX_MODES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
         --preconfig) PRECONFIG="$2"; shift 2 ;;
@@ -154,6 +157,10 @@ done
 
 [[ -n "$CONTAINERD_COUNTS" ]] || { echo "错误: 需要 --containerd-cpus"; usage; }
 [[ -n "$WORKER_COUNTS" ]] || { echo "错误: 需要 --worker-cpus"; usage; }
+if ! [[ "$CONTAINERD_NUMA" =~ ^[0-9]+$ ]]; then
+    echo "错误: --containerd-numa 须为非负整数，收到: $CONTAINERD_NUMA"
+    exit 1
+fi
 [[ -f "$SETUP_SCRIPT" ]] || { echo "错误: 未找到 $SETUP_SCRIPT"; exit 1; }
 [[ -f "$BUILD_SCRIPT" ]] || { echo "错误: 未找到 $BUILD_SCRIPT"; exit 1; }
 [[ -f "$SWEEP_SCRIPT" ]] || { echo "错误: 未找到 $SWEEP_SCRIPT"; exit 1; }
@@ -247,7 +254,7 @@ write_env_baseline() {
         echo "=== matrix args ==="
         echo "cnis=$CNIS runtimes=$RUNTIMES hypervisors=$HYPERVISORS ip_masq=$IP_MASQ"
         echo "containerd_cpus=$CONTAINERD_COUNTS worker_cpus=$WORKER_COUNTS workers=$WORKERS_K"
-        echo "worker_numa=$WORKER_NUMA sandbox_modes=$SANDBOX_MODES duration=$DURATION max_mean_ms=$MAX_MEAN_MS"
+        echo "worker_numa=$WORKER_NUMA containerd_numa=$CONTAINERD_NUMA sandbox_modes=$SANDBOX_MODES duration=$DURATION max_mean_ms=$MAX_MEAN_MS"
     } > "$txt"
 
     # 结构化 JSON：优先 resource_sampler，再叠矩阵字段
@@ -403,6 +410,7 @@ echo "  hypervisors:      $HYPERVISORS  (仅 kata)"
 echo "  ip-masq:          $IP_MASQ"
 echo "  combos:           ${#COMBOS[@]}"
 echo "  worker-numa:      $WORKER_NUMA"
+echo "  containerd-numa:  $CONTAINERD_NUMA"
 echo "  sandbox-modes:    $SANDBOX_MODES"
 echo "  containerd-cpus:  $CONTAINERD_COUNTS"
 echo "  worker-cpus:      $WORKER_COUNTS"
@@ -593,6 +601,7 @@ run_one_combo() {
         --containerd-cpus "$CONTAINERD_COUNTS"
         --worker-cpus "$WORKER_COUNTS"
         --worker-numa "$WORKER_NUMA"
+        --containerd-numa "$CONTAINERD_NUMA"
         --sandbox-modes "$SANDBOX_MODES"
         --duration "$DURATION"
         --preconfig "$PRECONFIG"

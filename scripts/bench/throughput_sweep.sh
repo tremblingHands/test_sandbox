@@ -4,7 +4,8 @@
 #
 # 约定（见会话方案）:
 #   --containerd-cpus / --worker-cpus 只给「个数」，具体核由脚本分配
-#   workers 核落在 --worker-numa；与 containerd 禁止重叠；不够则 skip
+#   workers 核落在 --worker-numa；containerd 落在 --containerd-numa（默认 0）
+#   两者禁止重叠；目标 NUMA 上不够则 skip
 #   K 只跑 >= N_w 的候选（列表为空则至少跑 K=N_w）
 #   沙箱 cpuset: all = HOST；excl-cd = HOST \ CD
 #   multi_single 的 NUMA（membind）= --worker-numa
@@ -15,7 +16,8 @@
 #   ./scripts/bench/throughput_sweep.sh \
 #     --containerd-cpus 2,4,8 \
 #     --worker-cpus 64,128 \
-#     --worker-numa 0,1 \
+#     --worker-numa 1 \
+#     --containerd-numa 0 \
 #     --workers 32,64,128,256 \
 #     --sandbox-modes all,excl-cd \
 #     --duration 30 --preconfig 50
@@ -31,6 +33,7 @@ ALLOW_CPU0=false
 CONTAINERD_COUNTS=""
 WORKER_COUNTS=""
 WORKER_NUMA=""
+CONTAINERD_NUMA="0"
 WORKERS_K=""
 SANDBOX_MODES="all,excl-cd"
 DURATION=30
@@ -61,6 +64,7 @@ usage() {
   --workers LIST           K 候选；实际只跑 K>=N_w（缺省/滤空则至少 K=N_w）
 
 可选:
+  --containerd-numa N      containerd 所在 NUMA（默认 0；从该 node∩HOST\WR 取最低 N_c 核）
   --host-cpus SPEC         参与划核的全集（默认=在线 CPU 去掉 0）
   --allow-cpu0             自动探测 HOST 时保留 CPU 0（显式 --host-cpus 不受影响）
   --sandbox-modes LIST     all,excl-cd（默认两者）
@@ -78,8 +82,8 @@ usage() {
   --dry-run                只打印将跑的组合，不改 unit、不压测
   -h, --help
 
-划核: worker 在指定 NUMA∩HOST 上取编号最大的 N_w 个；
-      containerd 在 HOST\WR 取编号最小的 N_c 个；
+划核: worker 在 --worker-numa∩HOST 上取编号最大的 N_w 个；
+      containerd 在 --containerd-numa∩HOST\WR 取编号最小的 N_c 个；
       sandbox: all=HOST，excl-cd=HOST\CD。
 默认 HOST 不含 CPU 0，故 containerd / sandbox / workers 都不会落到 core0。
 绑核: 通过 systemctl show FragmentPath 定位实际加载的 containerd.service 再改；
@@ -90,7 +94,8 @@ usage() {
   ./scripts/bench/throughput_sweep.sh \
     --containerd-cpus 2,4,8 \
     --worker-cpus 64,128 \
-    --worker-numa 0,1 \
+    --worker-numa 1 \
+    --containerd-numa 0 \
     --workers 64,128,256 \
     --sandbox-modes all,excl-cd \
     --duration 30 --preconfig 50
@@ -98,7 +103,7 @@ usage() {
   # 只打印组合、不压测:
   ./scripts/bench/throughput_sweep.sh \
     --containerd-cpus 2,4 --worker-cpus 64,128 \
-    --worker-numa 0,1 --workers 64,128 --dry-run
+    --worker-numa 1 --containerd-numa 0 --workers 64,128 --dry-run
 EOF
     exit 1
 }
@@ -110,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --containerd-cpus) CONTAINERD_COUNTS="$2"; shift 2 ;;
         --worker-cpus) WORKER_COUNTS="$2"; shift 2 ;;
         --worker-numa) WORKER_NUMA="$2"; shift 2 ;;
+        --containerd-numa) CONTAINERD_NUMA="$2"; shift 2 ;;
         --workers) WORKERS_K="$2"; shift 2 ;;
         --sandbox-modes) SANDBOX_MODES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -142,6 +148,10 @@ esac
 [[ -n "$CONTAINERD_COUNTS" ]] || { echo "错误: 需要 --containerd-cpus"; usage; }
 [[ -n "$WORKER_COUNTS" ]] || { echo "错误: 需要 --worker-cpus"; usage; }
 [[ -n "$WORKER_NUMA" ]] || { echo "错误: 需要 --worker-numa"; usage; }
+if ! [[ "$CONTAINERD_NUMA" =~ ^[0-9]+$ ]]; then
+    echo "错误: --containerd-numa 须为非负整数，收到: $CONTAINERD_NUMA"
+    exit 1
+fi
 [[ -f "$MULTI_SCRIPT" ]] || { echo "错误: 未找到 $MULTI_SCRIPT"; exit 1; }
 
 # ---------- CPU set helpers（空格分隔的排序数字列表）----------
@@ -279,6 +289,16 @@ list_to_spec() {
     echo "${arr[*]}"
 }
 
+# CSV 字段：逗号改空格，避免与列分隔符冲突（读回用 spec_from_csv）
+spec_for_csv() {
+    echo "${1//,/ }"
+}
+
+# CSV 读回 → numactl / multi_single 规格（空格改逗号；range 如 1-4 不变）
+spec_from_csv() {
+    echo "${1// /,}"
+}
+
 parse_csv_ints() {
     local s="$1" out=() x
     IFS=',' read -ra parts <<< "$s"
@@ -361,6 +381,7 @@ save_containerd_affinity_state() {
 
 apply_containerd_cpus() {
     local spec="$1"
+    local mem_node="${2:-$CONTAINERD_NUMA}"
     local bin numa_bin tmp
     bin=$(detect_containerd_bin)
     numa_bin=$(detect_numactl_bin)
@@ -371,10 +392,11 @@ apply_containerd_cpus() {
 
     tmp=$(mktemp)
     # 只改主进程 ExecStart=…containerd…；保留其它行
-    awk -v numa="$numa_bin" -v spec="$spec" -v bin="$bin" '
+    # 绑核到 spec，内存绑到 containerd NUMA，避免跨节点
+    awk -v numa="$numa_bin" -v spec="$spec" -v mem="$mem_node" -v bin="$bin" '
       BEGIN { done=0 }
       /^ExecStart=.*containerd/ && !done {
-        print "ExecStart=" numa " -C " spec " " bin
+        print "ExecStart=" numa " -C " spec " -m " mem " " bin
         done=1
         next
       }
@@ -389,18 +411,18 @@ apply_containerd_cpus() {
     if ! grep -qE "^ExecStart=.*-C ${spec} .*containerd" "$tmp"; then
         # 原文件可能没有 containerd ExecStart，尝试在第一个 ExecStart= 处替换，或追加
         if grep -qE '^ExecStart=' "$UNIT_FILE"; then
-            awk -v numa="$numa_bin" -v spec="$spec" -v bin="$bin" '
+            awk -v numa="$numa_bin" -v spec="$spec" -v mem="$mem_node" -v bin="$bin" '
               BEGIN { done=0 }
               /^ExecStart=/ && !/^ExecStartPre=/ && !done {
-                print "ExecStart=" numa " -C " spec " " bin
+                print "ExecStart=" numa " -C " spec " -m " mem " " bin
                 done=1
                 next
               }
               { print }
             ' "$UNIT_FILE" > "$tmp"
         else
-            awk -v numa="$numa_bin" -v spec="$spec" -v bin="$bin" '
-              /^\[Service\]/ { print; print "ExecStart=" numa " -C " spec " " bin; next }
+            awk -v numa="$numa_bin" -v spec="$spec" -v mem="$mem_node" -v bin="$bin" '
+              /^\[Service\]/ { print; print "ExecStart=" numa " -C " spec " -m " mem " " bin; next }
               { print }
             ' "$UNIT_FILE" > "$tmp"
         fi
@@ -414,7 +436,7 @@ apply_containerd_cpus() {
 
     sudo cp "$tmp" "$UNIT_FILE"
     rm -f "$tmp"
-    echo "  已写 $UNIT_FILE → ExecStart=${numa_bin} -C ${spec} ${bin}"
+    echo "  已写 $UNIT_FILE → ExecStart=${numa_bin} -C ${spec} -m ${mem_node} ${bin}"
 
     sudo systemctl daemon-reload
     sudo systemctl restart containerd
@@ -427,7 +449,7 @@ apply_containerd_cpus() {
     pid=$(pgrep -nx containerd || true)
     if [ -n "$pid" ]; then
         aff=$(taskset -pc "$pid" 2>/dev/null | awk -F': ' '{print $NF}')
-        echo "  containerd pid=$pid affinity=$aff (期望 $spec)"
+        echo "  containerd pid=$pid affinity=$aff (期望 $spec, membind=$mem_node)"
     fi
 }
 
@@ -499,6 +521,17 @@ for _n in "${NUMA_ARR[@]}"; do
         exit 1
     fi
 done
+if [ ! -f "/sys/devices/system/node/node${CONTAINERD_NUMA}/cpulist" ]; then
+    echo "错误: 不存在 NUMA node${CONTAINERD_NUMA}（--containerd-numa）"
+    exit 1
+fi
+CD_NODE_SPEC=$(numa_cpulist_spec "$CONTAINERD_NUMA")
+CD_NODE_LIST=$(expand_spec_to_list "$CD_NODE_SPEC")
+CD_HOST_POOL=$(list_intersect "$CD_NODE_LIST" "$HOST_LIST")
+if [ -z "${CD_HOST_POOL// }" ]; then
+    echo "错误: --containerd-numa $CONTAINERD_NUMA 与 HOST 无交集"
+    exit 1
+fi
 
 TS=$(date +%Y%m%d%H%M%S)
 if [ -n "$OUT_ROOT_OVERRIDE" ]; then
@@ -649,6 +682,7 @@ else
 fi
 echo "  containerd-cpus:  $CONTAINERD_COUNTS  (counts)"
 echo "  worker-cpus:      $WORKER_COUNTS  (counts)"
+echo "  containerd-numa:  $CONTAINERD_NUMA  (cpus $CD_NODE_SPEC, usable $(list_count "$CD_HOST_POOL"))"
 echo "  worker-numa:      $WORKER_NUMA"
 for _n in "${NUMA_ARR[@]}"; do
     echo "    node${_n}: $(numa_cpulist_spec "$_n")"
@@ -710,19 +744,20 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
             WR_LIST=$(list_take_highest "$N_w" "$NODE_HOST_LIST")
             WR_SPEC=$(list_to_spec "$WR_LIST")
 
-            REST=$(list_diff "$HOST_LIST" "$WR_LIST")
-            avail_cd=$(list_count "$REST")
+            # containerd 只从 --containerd-numa∩HOST\WR 取核（交错 NUMA 下避免跨节点）
+            CD_POOL=$(list_diff "$CD_HOST_POOL" "$WR_LIST")
+            avail_cd=$(list_count "$CD_POOL")
             if [ "$avail_cd" -lt "$N_c" ]; then
-                echo "[skip] numa=$NUMA_NODE N_c=$N_c N_w=$N_w WR=$WR_SPEC: HOST\\WR 仅 ${avail_cd} 核 < N_c"
-                echo "$NUMA_NODE,$N_c,$N_w,,,${WR_SPEC},,skip,,,,,,,\"\",insufficient_cpus,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+                echo "[skip] numa=$NUMA_NODE N_c=$N_c N_w=$N_w WR=$WR_SPEC: containerd-numa${CONTAINERD_NUMA}\\WR 仅 ${avail_cd} 核 < N_c"
+                echo "$NUMA_NODE,$N_c,$N_w,,,$(spec_for_csv "$WR_SPEC"),,skip,,,,,,,\"\",insufficient_cpus,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
-            CD_LIST=$(list_take_lowest "$N_c" "$REST")
+            CD_LIST=$(list_take_lowest "$N_c" "$CD_POOL")
             CD_SPEC=$(list_to_spec "$CD_LIST")
 
             if list_intersect_nonempty "$CD_LIST" "$WR_LIST"; then
                 echo "[skip] 内部错误: CD 与 WR 重叠"
-                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,skip,,,,,,,\"\",overlap,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),,skip,,,,,,,\"\",overlap,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
 
@@ -742,7 +777,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
             fi
 
             echo ""
-            echo ">>> 划核: NUMA=$NUMA_NODE | CD($N_c)=$CD_SPEC | WR($N_w)=$WR_SPEC | K=${K_RUN[*]}"
+            echo ">>> 划核: wr_numa=$NUMA_NODE | CD(numa${CONTAINERD_NUMA},$N_c)=$CD_SPEC | WR($N_w)=$WR_SPEC | K=${K_RUN[*]}"
 
             if $DRY_RUN; then
                 for K in "${K_RUN[@]}"; do
@@ -753,14 +788,14 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                             *) echo "[skip] 未知 sandbox mode: $mode"; continue ;;
                         esac
                         echo "[dry-run] numa=$NUMA_NODE N_c=$N_c N_w=$N_w K=$K mode=$mode cd=$CD_SPEC wr=$WR_SPEC sb=$SB_SPEC runtime=$RUNTIME"
-                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,dry-run,,,,,,,\"\",\"\",${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),dry-run,,,,,,,\"\",\"\",${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                     done
                 done
                 continue
             fi
 
             if ! apply_containerd_cpus "$CD_SPEC"; then
-                echo "$NUMA_NODE,$N_c,$N_w,,,${CD_SPEC},${WR_SPEC},,fail,,,,,,,\"\",containerd_restart_failed,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+                echo "$NUMA_NODE,$N_c,$N_w,,,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),,fail,,,,,,,\"\",containerd_restart_failed,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                 continue
             fi
 
@@ -800,7 +835,7 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                     parsed=$(parse_all_line < "$run_log" || true)
                     if [ -z "$parsed" ]; then
                         echo "  结果: FAIL/无 ALL 行 (rc=$rc) 见 $run_log"
-                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,fail,,,,,,${run_dir},no_all_line,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+                        echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),fail,,,,,,${run_dir},no_all_line,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
                         continue
                     fi
                     # shellcheck disable=SC2086
@@ -808,13 +843,13 @@ for NUMA_NODE in "${NUMA_ARR[@]}"; do
                     total=$1; success=$2; p50=$3; p95=$4; p99=$5; mean=$6; tps=$7
                     echo "  结果: tps=$tps total=$total success=$success p50=$p50 p95=$p95 mean=$mean"
 
-                    echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,ok,$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" \
+                    echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),ok,$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" \
                         >> "$SUMMARY_CSV"
 
                     awk_best=$(awk -v t="$tps" -v b="$best_tps" 'BEGIN{print (t+0>b+0)?"1":"0"}')
                     if [ "$awk_best" = "1" ]; then
                         best_tps="$tps"
-                        best_line="$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir}"
+                        best_line="$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),$tps,$total,$success,$p50,$p95,$p99,$mean,${run_dir}"
                     fi
                 done
             done
@@ -826,10 +861,13 @@ done
 if ! $DRY_RUN && [ "${CONFIRM_TOP:-0}" -gt 0 ] && [ -n "${CONFIRM_DURATION:-}" ]; then
     echo ""
     echo "=== 复核 Top ${CONFIRM_TOP}（duration=${CONFIRM_DURATION}s）==="
-    # csv: numa,cd_n,wr_n,K,mode,cd,wr,sb,status,tps,...
+    # csv: numa,cd_n,wr_n,K,mode,cd,wr,sb,status,tps,...（cd/wr/sb 为空格分隔）
     mapfile -t TOP_LINES < <(awk -F, 'NR>1 && $9=="ok" {print $10","$0}' "$SUMMARY_CSV" | sort -t, -k1,1nr | head -n "$CONFIRM_TOP")
     for row in "${TOP_LINES[@]}"; do
         IFS=',' read -r _tps NUMA_NODE N_c N_w K mode CD_SPEC WR_SPEC SB_SPEC _rest <<< "$row"
+        CD_SPEC=$(spec_from_csv "$CD_SPEC")
+        WR_SPEC=$(spec_from_csv "$WR_SPEC")
+        SB_SPEC=$(spec_from_csv "$SB_SPEC")
         MEMS_VAL="${MEMS_OVERRIDE:-$NUMA_NODE}"
         echo "复核: numa=$NUMA_NODE CD=$CD_SPEC WR=$WR_SPEC K=$K mode=$mode"
         apply_containerd_cpus "$CD_SPEC" || continue
@@ -852,11 +890,11 @@ if ! $DRY_RUN && [ "${CONFIRM_TOP:-0}" -gt 0 ] && [ -n "${CONFIRM_DURATION:-}" ]
             # shellcheck disable=SC2086
             set -- $parsed
             echo "  confirm tps=$7 (was $_tps)"
-            echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,confirm,$7,$1,$2,$3,$4,$5,$6,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
+            echo "$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),confirm,$7,$1,$2,$3,$4,$5,$6,${run_dir},,${LABEL_CNI},${RUNTIME},${LABEL_HYPERVISOR}" >> "$SUMMARY_CSV"
             awk_best=$(awk -v t="$7" -v b="$best_tps" 'BEGIN{print (t+0>b+0)?"1":"0"}')
             if [ "$awk_best" = "1" ]; then
                 best_tps="$7"
-                best_line="$NUMA_NODE,$N_c,$N_w,$K,$mode,$CD_SPEC,$WR_SPEC,$SB_SPEC,$7,$1,$2,$3,$4,$5,$6,${run_dir}"
+                best_line="$NUMA_NODE,$N_c,$N_w,$K,$mode,$(spec_for_csv "$CD_SPEC"),$(spec_for_csv "$WR_SPEC"),$(spec_for_csv "$SB_SPEC"),$7,$1,$2,$3,$4,$5,$6,${run_dir}"
             fi
         fi
     done

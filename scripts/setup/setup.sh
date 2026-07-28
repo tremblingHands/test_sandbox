@@ -1081,6 +1081,108 @@ check_kernel_params() {
 }
 
 # ============================================================
+# cgroup v2: cpu controller + BPF device（runc 硬性依赖）
+# ============================================================
+# 探测 BPF_CGROUP_DEVICE 是否可用（cgroup v2 设备权限依赖 CONFIG_CGROUP_BPF）
+_cgroup_bpf_device_ok() {
+    python3 - <<'PY' 2>/dev/null
+import ctypes, ctypes.util, os, platform, sys
+# bpf() syscall number
+NR_BPF = {"x86_64": 321, "aarch64": 280, "arm64": 280}.get(platform.machine(), 321)
+BPF_PROG_QUERY, BPF_CGROUP_DEVICE = 17, 15
+libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+fd = os.open("/sys/fs/cgroup", os.O_RDONLY)
+class Attr(ctypes.Structure):
+    _fields_ = [
+        ("target_fd", ctypes.c_uint32),
+        ("attach_type", ctypes.c_uint32),
+        ("query_flags", ctypes.c_uint32),
+        ("attach_flags", ctypes.c_uint32),
+        ("prog_ids", ctypes.c_uint64),
+        ("prog_cnt", ctypes.c_uint32),
+        ("prog_attach_flags", ctypes.c_uint64),
+    ]
+attr = Attr(target_fd=fd, attach_type=BPF_CGROUP_DEVICE)
+ret = libc.syscall(NR_BPF, BPF_PROG_QUERY, ctypes.byref(attr), ctypes.sizeof(attr))
+err = ctypes.get_errno()
+os.close(fd)
+# 成功或 ENOSPC/E2BIG 说明支持；EINVAL/ENOTSUPP/ENOSYS 则不支持
+sys.exit(0 if ret == 0 or err in (7, 28) else 1)
+PY
+}
+
+check_cgroup_v2_cpu() {
+    echo ""
+    echo "--- cgroup v2 (cpu + BPF device) ---"
+
+    if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)" != "cgroup2fs" ]; then
+        pass "非 cgroup v2（或未挂载），跳过"
+        return 0
+    fi
+
+    local errors_local=0
+    local root_sub k8s_ctrl
+
+    # ---- BPF device（缺则 runc: bpf_prog_query(BPF_CGROUP_DEVICE) failed）----
+    if _cgroup_bpf_device_ok; then
+        pass "BPF_CGROUP_DEVICE 可用"
+    else
+        fail "内核不支持 cgroup BPF device（bpf_prog_query BPF_CGROUP_DEVICE → EINVAL）"
+        echo "  典型原因: CONFIG_CGROUP_BPF 未开启（本机 /boot/config-* 可查）"
+        echo "  runc 在 cgroup v2 上用 eBPF 替代 v1 devices 控制器，缺则无法创建容器"
+        echo "  修复任选:"
+        echo "    A) 换回 cgroup v1: 去掉 cmdline 中 systemd.unified_cgroup_hierarchy=1 后 reboot"
+        echo "    B) 换/重编启用 CONFIG_CGROUP_BPF=y 的内核"
+        errors_local=$((errors_local + 1))
+    fi
+
+    # ---- cpu controller ----
+    root_sub=$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true)
+    if echo " $root_sub " | grep -qw cpu; then
+        pass "root cgroup.subtree_control 含 cpu: $root_sub"
+    else
+        if ! $CHECK_ONLY; then
+            if echo '+cpu' | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1; then
+                root_sub=$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true)
+                pass "已写入 +cpu → $root_sub"
+            fi
+        fi
+        if ! echo " $(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true) " | grep -qw cpu; then
+            fail "cgroup v2 root 未启用 cpu（当前: ${root_sub:-empty}）"
+            echo "  runc 会因缺少 cpu.weight 失败"
+            echo "  修复: DefaultCPUAccounting=yes + reboot"
+            if ! $CHECK_ONLY; then
+                sudo mkdir -p /etc/systemd/system.conf.d
+                if [ ! -f /etc/systemd/system.conf.d/50-cpu-accounting.conf ]; then
+                    sudo tee /etc/systemd/system.conf.d/50-cpu-accounting.conf >/dev/null <<'EOF'
+[Manager]
+DefaultCPUAccounting=yes
+EOF
+                    pass "已写入 DefaultCPUAccounting=yes（需 reboot 生效）"
+                else
+                    pass "已存在 50-cpu-accounting.conf（需 reboot 若尚未重启）"
+                fi
+            fi
+            errors_local=$((errors_local + 1))
+        fi
+    fi
+
+    if [ -d /sys/fs/cgroup/k8s.io ]; then
+        k8s_ctrl=$(cat /sys/fs/cgroup/k8s.io/cgroup.controllers 2>/dev/null || true)
+        if echo " $k8s_ctrl " | grep -qw cpu; then
+            pass "k8s.io cgroup.controllers 含 cpu"
+        else
+            fail "k8s.io 无 cpu controller（$k8s_ctrl）"
+            errors_local=$((errors_local + 1))
+        fi
+    else
+        pass "k8s.io 尚未创建（首次 runp 时会继承 root 的 cpu）"
+    fi
+
+    [ "$errors_local" -eq 0 ]
+}
+
+# ============================================================
 # 输出 containerd 当前 CPU 亲和性（绑核）
 # ============================================================
 print_containerd_cpus() {
@@ -1149,6 +1251,7 @@ main() {
     check_snapshotter     || errors=$((errors + 1))
     check_pause_image     || errors=$((errors + 1))
     check_kernel_params
+    check_cgroup_v2_cpu   || errors=$((errors + 1))
 
     echo ""
     echo "=============================================="
@@ -1171,7 +1274,7 @@ main() {
             warn "未找到 $warmup_py，跳过 warmup"
         else
             set +e
-            (cd "$REPO_ROOT" && python3 "$warmup_py" --runtime "$CONTAINERD_RUNTIME")
+            (cd "$REPO_ROOT" && python3 "$warmup_py" --runtime "$CONTAINERD_RUNTIME" --runs 3)
             local warmup_rc=$?
             set -e
             if [ "$warmup_rc" -eq 0 ]; then
