@@ -22,7 +22,7 @@
 #     --containerd-cpus 2,4,8,16 \
 #     --worker-cpus 64,128 \
 #     --workers 64,128,256 \
-#     --duration 30 --max-mean-ms 200
+#     --duration-force 30 --max-mean-ms 200
 #
 #   ./scripts/bench/config_matrix_sweep.sh ... --profile          # 编译 debug
 #   ./scripts/bench/config_matrix_sweep.sh ... --skip-build       # 跳过编译
@@ -48,7 +48,8 @@ SANDBOX_MODES="excl-cd"
 CONTAINERD_COUNTS=""
 WORKER_COUNTS=""
 WORKERS_K=""
-DURATION=30
+DURATION=""                     # 空=按 CNI 自动：bridge→20，其它→60；--duration-force 显式覆盖
+DURATION_EXPLICIT=false
 PRECONFIG=50
 MAX_MEAN_MS=""
 MEMS_OVERRIDE=""
@@ -94,7 +95,8 @@ usage() {
   --worker-numa LIST          默认 1
   --containerd-numa N         默认 0（containerd 只从该 NUMA 取核）
   --sandbox-modes LIST        默认 excl-cd
-  --duration SEC              默认 30
+  --duration-force SEC        强制全局 duration（覆盖按 CNI 的默认：bridge=20，其它=60）
+                              （原 --duration 已废弃，不可用）
   --preconfig N               默认 50
   --max-mean-ms N
   --mems SPEC
@@ -116,7 +118,7 @@ usage() {
     --containerd-cpus 2,4,8,16 \
     --worker-cpus 64,128 \
     --workers 64,128,256 \
-    --duration 30 --max-mean-ms 200
+    --duration-force 30 --max-mean-ms 200
 
   # profile（debug 编译）矩阵:
   ./scripts/bench/config_matrix_sweep.sh ... --profile
@@ -138,7 +140,15 @@ while [[ $# -gt 0 ]]; do
         --worker-numa) WORKER_NUMA="$2"; shift 2 ;;
         --containerd-numa) CONTAINERD_NUMA="$2"; shift 2 ;;
         --sandbox-modes) SANDBOX_MODES="$2"; shift 2 ;;
-        --duration) DURATION="$2"; shift 2 ;;
+        --duration-force)
+            DURATION="$2"
+            DURATION_EXPLICIT=true
+            shift 2
+            ;;
+        --duration)
+            echo "错误: --duration 已废弃，请改用 --duration-force" >&2
+            exit 1
+            ;;
         --preconfig) PRECONFIG="$2"; shift 2 ;;
         --max-mean-ms) MAX_MEAN_MS="$2"; shift 2 ;;
         --mems) MEMS_OVERRIDE="$2"; shift 2 ;;
@@ -173,6 +183,26 @@ if ! [[ "$COLD_START_RUNS" =~ ^[1-9][0-9]*$ ]]; then
     echo "错误: --cold-start-runs 须为正整数，收到: $COLD_START_RUNS"
     exit 1
 fi
+
+if $DURATION_EXPLICIT; then
+    if ! [[ "$DURATION" =~ ^[1-9][0-9]*$ ]]; then
+        echo "错误: --duration-force 须为正整数，收到: $DURATION"
+        exit 1
+    fi
+fi
+
+# 未显式 --duration-force 时：bridge→20s，其它 CNI→60s
+duration_for_cni() {
+    local cni="$1"
+    if $DURATION_EXPLICIT; then
+        echo "$DURATION"
+        return 0
+    fi
+    case "$cni" in
+        bridge) echo 20 ;;
+        *) echo 60 ;;
+    esac
+}
 
 case "$IP_MASQ" in
     true|false) ;;
@@ -257,7 +287,11 @@ write_env_baseline() {
         echo "=== matrix args ==="
         echo "cnis=$CNIS runtimes=$RUNTIMES hypervisors=$HYPERVISORS ip_masq=$IP_MASQ"
         echo "containerd_cpus=$CONTAINERD_COUNTS worker_cpus=$WORKER_COUNTS workers=$WORKERS_K"
-        echo "worker_numa=$WORKER_NUMA containerd_numa=$CONTAINERD_NUMA sandbox_modes=$SANDBOX_MODES duration=$DURATION max_mean_ms=$MAX_MEAN_MS"
+        if $DURATION_EXPLICIT; then
+            echo "worker_numa=$WORKER_NUMA containerd_numa=$CONTAINERD_NUMA sandbox_modes=$SANDBOX_MODES duration_force=$DURATION max_mean_ms=$MAX_MEAN_MS"
+        else
+            echo "worker_numa=$WORKER_NUMA containerd_numa=$CONTAINERD_NUMA sandbox_modes=$SANDBOX_MODES duration=auto(bridge=20,other=60) max_mean_ms=$MAX_MEAN_MS"
+        fi
     } > "$txt"
 
     # 结构化 JSON：优先 resource_sampler，再叠矩阵字段
@@ -429,7 +463,11 @@ echo "  sandbox-modes:    $SANDBOX_MODES"
 echo "  containerd-cpus:  $CONTAINERD_COUNTS"
 echo "  worker-cpus:      $WORKER_COUNTS"
 echo "  workers K:        ${WORKERS_K:-(auto)}"
-echo "  duration:         $DURATION"
+if $DURATION_EXPLICIT; then
+    echo "  duration:         ${DURATION}s（--duration-force 全局覆盖）"
+else
+    echo "  duration:         bridge=20s，其它 CNI=60s（未指定 --duration-force）"
+fi
 echo "  max-mean-ms:      ${MAX_MEAN_MS:-(未启用)}"
 echo "  cold-start-runs:  $COLD_START_RUNS$($SKIP_COLD_START && echo ' (skip)' || true)"
 echo "  skip-setup:       $SKIP_SETUP"
@@ -440,10 +478,11 @@ echo ""
 echo "将运行的组合:"
 for combo in "${COMBOS[@]}"; do
     IFS='|' read -r cni rt hv <<< "$combo"
+    local_dur=$(duration_for_cni "$cni")
     if [ "$rt" = "runc" ]; then
-        echo "  - cni=$cni runtime=runc"
+        echo "  - cni=$cni runtime=runc duration=${local_dur}s"
     else
-        echo "  - cni=$cni runtime=kata hypervisor=$hv"
+        echo "  - cni=$cni runtime=kata hypervisor=$hv duration=${local_dur}s"
     fi
 done
 echo ""
@@ -539,6 +578,8 @@ append_best_csv() {
 run_one_combo() {
     local cni="$1" rt="$2" hv="$3"
     local slug sweep_dir status note setup_args=() sweep_args=()
+    local combo_duration
+    combo_duration=$(duration_for_cni "$cni")
 
     slug=$(combo_slug "$cni" "$rt" "$hv")
     sweep_dir="${MATRIX_ROOT}/${slug}"
@@ -547,7 +588,7 @@ run_one_combo() {
     note=""
 
     echo ""
-    echo "######## 组合: cni=$cni runtime=$rt hypervisor=${hv:--} ########"
+    echo "######## 组合: cni=$cni runtime=$rt hypervisor=${hv:--} duration=${combo_duration}s ########"
 
     local cold_report="${sweep_dir}/cold_start_report.json"
 
@@ -556,7 +597,7 @@ run_one_combo() {
         if ! $SKIP_COLD_START; then
             echo "[dry-run] cold_start_bench --runtime $rt --runs $COLD_START_RUNS --output $cold_report"
         fi
-        echo "[dry-run] throughput_sweep --out-root $sweep_dir --runtime $rt ..."
+        echo "[dry-run] throughput_sweep --out-root $sweep_dir --runtime $rt --duration $combo_duration ..."
         echo "$cni,$rt,$hv,dry-run,$sweep_dir,,$cold_report,dry-run" >> "$INDEX_CSV"
         return 0
     fi
@@ -617,7 +658,7 @@ run_one_combo() {
         --worker-numa "$WORKER_NUMA"
         --containerd-numa "$CONTAINERD_NUMA"
         --sandbox-modes "$SANDBOX_MODES"
-        --duration "$DURATION"
+        --duration "$combo_duration"
         --preconfig "$PRECONFIG"
         --runtime "$rt"
         --label-cni "$cni"
