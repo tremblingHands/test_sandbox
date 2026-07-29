@@ -53,6 +53,8 @@ SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs | devmapper�
 KATA_VERSION="4.0.0"           # kata containers 版本
 KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
 IP_MASQ="false"                 # bridge 专用: CNI ipMasq（默认 false；出网用节点级 MASQUERADE）
+# 默认用 RFC6598 CGNAT 段，避开常见 10/8、172.16/12、192.168/16；可用 --cni-subnet 覆盖
+CNI_SUBNET="${CNI_SUBNET:-100.64.0.0/12}"
 VM_TEMPLATE=false               # Kata VM templating（factory）；仅 qemu + Go runtime
 VM_CACHE_NUMBER=0               # Kata VM Cache 池大小；>0 启用（与 template 互斥；仅 qemu + Go）
 VM_CACHE_ENDPOINT="/var/run/kata-containers/cache.sock"
@@ -93,6 +95,8 @@ usage() {
 选项（括号内为默认值）:
   --cni-type TYPE          CNI 类型: bridge | ipvlan-l2 | ipvlan-l3
                            (默认: ${CNI_TYPE})
+  --cni-subnet CIDR        CNI IPAM 子网（写入 10-mynet.conf + 节点级 MASQ）
+                           (默认: ${CNI_SUBNET}；可用环境变量 CNI_SUBNET 覆盖)
   --ip-masq true|false     bridge 的 CNI ipMasq；false 时用节点级 MASQUERADE
                            (默认: ${IP_MASQ})
   --runtime RUNTIME        OCI 运行时: runc | kata
@@ -129,6 +133,7 @@ usage() {
 示例:
   $0
   $0 --cni-type bridge
+  $0 --cni-type bridge --cni-subnet 100.64.0.0/12
   $0 --cni-type bridge --ip-masq true
   $0 --runtime kata --hypervisor qemu
   $0 --runtime kata --hypervisor qemu --vm-template
@@ -163,6 +168,13 @@ while [[ $# -gt 0 ]]; do
                 bridge|ipvlan-l2|ipvlan-l3) ;;
                 *) echo "ERROR: --cni-type 必须是 bridge | ipvlan-l2 | ipvlan-l3"; exit 1 ;;
             esac
+            shift 2 ;;
+        --cni-subnet)
+            CNI_SUBNET="$2"
+            if ! [[ "$CNI_SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+                echo "ERROR: --cni-subnet 须为 IPv4 CIDR，如 100.64.0.0/12；收到: $CNI_SUBNET"
+                exit 1
+            fi
             shift 2 ;;
         --runtime)
             CONTAINERD_RUNTIME="$2"
@@ -408,7 +420,7 @@ check_containerd() {
 # 支持 bridge / ipvlan-l2 / ipvlan-l3，默认 ipvlan-l3（百万 pod 规模无瓶颈）
 # ============================================================
 CNI_CONF_FILE="/etc/cni/net.d/10-mynet.conf"
-CNI_SUBNET="10.0.0.0/12"          # ~100 万 IP
+# CNI_SUBNET 默认/CLI/环境变量见脚本顶部与 --cni-subnet
 
 # 自动检测默认路由对应的物理网卡（ipvlan master）
 detect_master_iface() {
@@ -1386,21 +1398,24 @@ check_cni_network() {
         return 1
     fi
 
-    local mask
-    mask=$(echo "$current_subnet" | cut -d'/' -f2)
-
-    if [ "$mask" -le 12 ] 2>/dev/null; then
-        pass "CNI subnet 已足够大: $current_subnet"
+    if [ "$current_subnet" = "$CNI_SUBNET" ]; then
+        pass "CNI subnet 已匹配: $current_subnet"
     else
         if $CHECK_ONLY; then
-            warn "CNI subnet 太小: $current_subnet (推荐 /12 或更小)"
+            warn "CNI subnet 不匹配: 当前=$current_subnet, 需要=$CNI_SUBNET"
             return 1
         fi
-        echo "  扩大 CNI subnet: $current_subnet → $CNI_SUBNET ..."
+        echo "  更新 CNI subnet: $current_subnet → $CNI_SUBNET ..."
         sudo sed -i "s|\"subnet\": \"[^\"]*\"|\"subnet\": \"$CNI_SUBNET\"|" "$CNI_CONF_FILE"
         sudo rm -rf /var/lib/cni/networks/mynet/
         if [ "$CNI_TYPE" = "bridge" ]; then
             sudo ip link delete cni0 2>/dev/null || true
+            # 清掉旧网段节点级 MASQUERADE，避免残留
+            if [ -n "$current_subnet" ] && \
+               sudo iptables -t nat -C POSTROUTING -s "$current_subnet" ! -o cni0 -j MASQUERADE 2>/dev/null; then
+                echo "  删除旧节点级 MASQUERADE: -s $current_subnet ! -o cni0 ..."
+                sudo iptables -t nat -D POSTROUTING -s "$current_subnet" ! -o cni0 -j MASQUERADE || true
+            fi
         fi
         pass "CNI subnet 已更新为: $CNI_SUBNET"
         sudo systemctl restart containerd
@@ -2215,6 +2230,7 @@ main() {
         fi
     fi
     echo "  CNI 类型:    $CNI_TYPE"
+    echo "  CNI subnet:  $CNI_SUBNET"
     if [ "$CNI_TYPE" = "bridge" ]; then
         echo "  CNI ipMasq:  $IP_MASQ"
     fi
