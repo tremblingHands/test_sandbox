@@ -14,6 +14,7 @@
 #   ./setup.sh --snapshotter erofs           # 使用 erofs snapshotter
 #   ./setup.sh --runtime kata --hypervisor firecracker  # 自动切 devmapper（块设备 rootfs）
 #   ./setup.sh --runtime kata --hypervisor qemu --vm-template  # VM 模板加速冷启动（Go+qemu）
+#   ./setup.sh --runtime kata --hypervisor qemu --vm-cache 3   # VM Cache 预热池（Go+qemu，常驻服务）
 #   ./setup.sh --check-only                   # 仅检查，不安装
 #   ./setup.sh --no-warmup                    # 成功后不跑 cold_start_bench warmup
 #
@@ -53,6 +54,9 @@ KATA_VERSION="4.0.0"           # kata containers 版本
 KATA_HYPERVISOR="qemu"          # kata 默认 hypervisor（仅 --runtime kata 生效）
 IP_MASQ="false"                 # bridge 专用: CNI ipMasq（默认 false；出网用节点级 MASQUERADE）
 VM_TEMPLATE=false               # Kata VM templating（factory）；仅 qemu + Go runtime
+VM_CACHE_NUMBER=0               # Kata VM Cache 池大小；>0 启用（与 template 互斥；仅 qemu + Go）
+VM_CACHE_ENDPOINT="/var/run/kata-containers/cache.sock"
+VM_CACHE_UNIT="kata-vmcache.service"
 HYPERVISOR_EXPLICIT=false
 SNAPSHOTTER_EXPLICIT=false
 CHECK_ONLY=false
@@ -100,6 +104,10 @@ usage() {
   --vm-template            启用 Kata VM templating（factory）；强制 qemu + Go runtime
                            需 initrd、shared_fs≠virtio-fs；ARM64 上官方测试曾标记不稳定
                            (默认: ${VM_TEMPLATE})
+  --vm-cache N             启用 Kata VM Cache（预热 N 台 VM）；强制 qemu + Go + devmapper
+                           与 --vm-template 互斥；shared_fs=none（factory 预热无 sharePath）
+                           会安装并启动 ${VM_CACHE_UNIT}
+                           (默认: ${VM_CACHE_NUMBER}=关闭；endpoint=${VM_CACHE_ENDPOINT})
   --snapshotter NAME       snapshotter: overlayfs | erofs | devmapper
                            (默认: ${SNAPSHOTTER}；firecracker 自动强制 devmapper)
   --check-only             仅检查，不安装/不修改
@@ -124,6 +132,7 @@ usage() {
   $0 --cni-type bridge --ip-masq true
   $0 --runtime kata --hypervisor qemu
   $0 --runtime kata --hypervisor qemu --vm-template
+  $0 --runtime kata --hypervisor qemu --vm-cache 3
   $0 --runtime kata --hypervisor firecracker
   $0 --check-only
   $0 --no-warmup
@@ -142,6 +151,12 @@ while [[ $# -gt 0 ]]; do
             NO_WARMUP=true; shift ;;
         --vm-template)
             VM_TEMPLATE=true; shift ;;
+        --vm-cache)
+            VM_CACHE_NUMBER="$2"
+            if ! [[ "$VM_CACHE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: --vm-cache 需要正整数（预热 VM 数量）"; exit 1
+            fi
+            shift 2 ;;
         --cni-type)
             CNI_TYPE="$2"
             case "$CNI_TYPE" in
@@ -217,21 +232,25 @@ if [ "$CONTAINERD_RUNTIME" = "kata" ] && [ "$KATA_HYPERVISOR" = "firecracker" ];
     fi
 fi
 
-# VM template + shared_fs=none 需要块设备 rootfs（overlayfs 无法给 guest 提供 rootfs）
-if $VM_TEMPLATE && [ "$SNAPSHOTTER" != "devmapper" ]; then
+# VM template / VM Cache + shared_fs=none 需要块设备 rootfs（overlayfs 无法给 guest 提供 rootfs）
+if { $VM_TEMPLATE || [ "$VM_CACHE_NUMBER" -gt 0 ]; } && [ "$SNAPSHOTTER" != "devmapper" ]; then
+    local_why="--vm-template"
+    [ "$VM_CACHE_NUMBER" -gt 0 ] && local_why="--vm-cache"
     if $SNAPSHOTTER_EXPLICIT; then
-        warn "--vm-template 需要块 rootfs；忽略 --snapshotter $SNAPSHOTTER → devmapper"
+        warn "$local_why 需要块 rootfs；忽略 --snapshotter $SNAPSHOTTER → devmapper"
     else
-        warn "--vm-template 需要块 rootfs；切换 snapshotter → devmapper"
+        warn "$local_why 需要块 rootfs；切换 snapshotter → devmapper"
     fi
     SNAPSHOTTER="devmapper"
 fi
-
 
 # VM templating：仅 qemu；切到 Go runtime（kata-runtime factory init）
 if $VM_TEMPLATE; then
     if [ "$CONTAINERD_RUNTIME" != "kata" ]; then
         echo "ERROR: --vm-template 需要 --runtime kata"; exit 1
+    fi
+    if [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+        echo "ERROR: --vm-template 与 --vm-cache 互斥"; exit 1
     fi
     if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
         echo "ERROR: --vm-template 与 stratovirt 互斥"; exit 1
@@ -239,6 +258,22 @@ if $VM_TEMPLATE; then
     if [ "$KATA_HYPERVISOR" != "qemu" ]; then
         if $HYPERVISOR_EXPLICIT; then
             warn "--vm-template 仅支持 qemu；忽略 --hypervisor $KATA_HYPERVISOR"
+        fi
+        KATA_HYPERVISOR="qemu"
+    fi
+fi
+
+# VM Cache：仅 qemu + Go；常驻 factory init（gRPC server）
+if [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+    if [ "$CONTAINERD_RUNTIME" != "kata" ]; then
+        echo "ERROR: --vm-cache 需要 --runtime kata"; exit 1
+    fi
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ]; then
+        echo "ERROR: --vm-cache 与 stratovirt 互斥"; exit 1
+    fi
+    if [ "$KATA_HYPERVISOR" != "qemu" ]; then
+        if $HYPERVISOR_EXPLICIT; then
+            warn "--vm-cache 仅支持 qemu；忽略 --hypervisor $KATA_HYPERVISOR"
         fi
         KATA_HYPERVISOR="qemu"
     fi
@@ -453,7 +488,7 @@ check_kata_runtime() {
     local kata_go_static_bundled="${INSTALL_FILES_DIR}/go-shim-static/containerd-shim-kata-v2"
     local use_go_runtime=false
 
-    if [ "$KATA_HYPERVISOR" = "stratovirt" ] || $VM_TEMPLATE; then
+    if [ "$KATA_HYPERVISOR" = "stratovirt" ] || $VM_TEMPLATE || [ "$VM_CACHE_NUMBER" -gt 0 ]; then
         use_go_runtime=true
     fi
 
@@ -493,13 +528,13 @@ check_kata_runtime() {
         # 安装/选用静态 Go shim（避免官方 /opt/kata/bin/... 的 GLIBC_2.32+ 依赖）
         if [ ! -x "$kata_go_static_shim" ] || ! "$kata_go_static_shim" --version &>/dev/null; then
             if [ -x "$kata_go_static_bundled" ]; then
-                echo "  安装捆绑的静态 Go shim（stratovirt 需要）..."
+                echo "  安装捆绑的静态 Go shim（Go runtime / stratovirt / factory）..."
                 sudo install -m 0755 "$kata_go_static_bundled" "$kata_go_static_shim"
             elif [ -x "$kata_shim" ] && "$kata_shim" --version &>/dev/null; then
                 # 官方动态链接 shim 若在本机可跑则直接用
                 kata_go_static_shim="$kata_shim"
             else
-                fail "stratovirt 需要 Go shim，但本机 glibc 过旧且缺少 ${kata_go_static_bundled}"
+                fail "需要静态 Go shim，但本机 glibc 过旧且缺少 ${kata_go_static_bundled}"
                 echo "  构建方法见: ${KATA_CONFIG_DIR}/go-shim-static/README.md"
                 echo "  （或在 kata-containers 4.0.0 源码树）:"
                 echo "    cd src/runtime && make pkg/katautils/config-settings.go"
@@ -512,7 +547,7 @@ check_kata_runtime() {
             return 1
         fi
         kata_shim="$kata_go_static_shim"
-        pass "kata Go shim（stratovirt）: $kata_shim ($("$kata_shim" --version 2>/dev/null | head -1))"
+        pass "kata Go shim: $kata_shim ($("$kata_shim" --version 2>/dev/null | head -1))"
     else
         if [ -x "$kata_rs_shim" ]; then
             pass "kata runtime-rs shim 可用: $kata_rs_shim"
@@ -545,8 +580,8 @@ check_kata_runtime() {
             target_link_name="configuration-dragonball.toml"
             ;;
         qemu)
-            if $VM_TEMPLATE; then
-                # Go runtime + factory（官方 kata-runtime factory init 路径）
+            if $VM_TEMPLATE || [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+                # Go runtime + factory（template / VM Cache）
                 target_link_name="configuration-qemu.toml"
             else
                 target_link_name="configuration-qemu-runtime-rs.toml"
@@ -763,6 +798,10 @@ check_kata_runtime() {
         if ! grep -qE '^template_path\s*=' "$target_config" 2>/dev/null; then
             sudo sed -i '/^enable_template = /a template_path = "/run/vc/vm/template"' "$target_config"
         fi
+        # 与 VM Cache 互斥
+        if grep -qE '^vm_cache_number\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^vm_cache_number = .*|vm_cache_number = 0|' "$target_config"
+        fi
         # ARM64 qemu 常用修补
         if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
             sudo sed -i 's|machine_type = "q35"|machine_type = "virt"|' "$target_config"
@@ -807,6 +846,72 @@ check_kata_runtime() {
             sudo sed -i '/^\[runtime\]/a sandbox_cgroup_only = true' "$target_config"
         fi
         pass "vm-template: enable_template=true, initrd, shared_fs=none, hot_plug_vfio=root-port, pcie_root_port=1, default_maxvcpus=$def_vcpus, sandbox_cgroup_only=true"
+    fi
+
+    # VM Cache（Go qemu）：预热池；与 template 互斥；factory 预热同样要求 shared_fs≠virtio-fs
+    if [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+        echo "  配置 Go runtime QEMU VM Cache (n=${VM_CACHE_NUMBER})..."
+        if ! grep -qE '^\[factory\]' "$target_config" 2>/dev/null; then
+            printf '\n[factory]\n' | sudo tee -a "$target_config" >/dev/null
+        fi
+        if grep -qE '^enable_template\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^enable_template = .*|enable_template = false|' "$target_config"
+        else
+            sudo sed -i '/^\[factory\]/a enable_template = false' "$target_config"
+        fi
+        if grep -qE '^vm_cache_number\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^vm_cache_number = .*|vm_cache_number = ${VM_CACHE_NUMBER}|" "$target_config"
+        elif grep -qE '^#\s*vm_cache_number\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^#\s*vm_cache_number = .*|vm_cache_number = ${VM_CACHE_NUMBER}|" "$target_config"
+        else
+            sudo sed -i "/^\[factory\]/a vm_cache_number = ${VM_CACHE_NUMBER}" "$target_config"
+        fi
+        if grep -qE '^vm_cache_endpoint\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^vm_cache_endpoint = .*|vm_cache_endpoint = \"${VM_CACHE_ENDPOINT}\"|" "$target_config"
+        elif grep -qE '^#\s*vm_cache_endpoint\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i "s|^#\s*vm_cache_endpoint = .*|vm_cache_endpoint = \"${VM_CACHE_ENDPOINT}\"|" "$target_config"
+        else
+            sudo sed -i "/^vm_cache_number = /a vm_cache_endpoint = \"${VM_CACHE_ENDPOINT}\"" "$target_config"
+        fi
+        # factory GetBaseVM 时 SharedPath 为空 → virtio-fs 报 virtiofsd source path is empty
+        if grep -qE '^shared_fs\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^shared_fs = .*|shared_fs = "none"|' "$target_config"
+        else
+            sudo sed -i '/^\[hypervisor\.qemu\]/a shared_fs = "none"' "$target_config"
+        fi
+        if grep -qE '^disable_block_device_use\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^disable_block_device_use = .*|disable_block_device_use = false|' "$target_config"
+        fi
+        # 热插网卡需要 root-port（与 template 同因）
+        if grep -qE '^hot_plug_vfio\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^hot_plug_vfio = .*|hot_plug_vfio = "root-port"|' "$target_config"
+        elif grep -qE '^#\s*hot_plug_vfio\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^#\s*hot_plug_vfio = .*|hot_plug_vfio = "root-port"|' "$target_config"
+        else
+            sudo sed -i '/^default_bridges = /a hot_plug_vfio = "root-port"' "$target_config"
+        fi
+        if grep -qE '^pcie_root_port\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^pcie_root_port = .*|pcie_root_port = 1|' "$target_config"
+        else
+            sudo sed -i '/^hot_plug_vfio = /a pcie_root_port = 1' "$target_config" 2>/dev/null || true
+            if ! grep -qE '^pcie_root_port\s*=' "$target_config" 2>/dev/null; then
+                sudo sed -i '/^default_bridges = /a pcie_root_port = 1' "$target_config"
+            fi
+        fi
+        if grep -qE '^sandbox_cgroup_only\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^sandbox_cgroup_only = .*|sandbox_cgroup_only = true|' "$target_config"
+        elif grep -qE '^#\s*sandbox_cgroup_only\s*=' "$target_config" 2>/dev/null; then
+            sudo sed -i 's|^#\s*sandbox_cgroup_only = .*|sandbox_cgroup_only = true|' "$target_config"
+        else
+            sudo sed -i '/^\[runtime\]/a sandbox_cgroup_only = true' "$target_config"
+        fi
+        if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            sudo sed -i 's|machine_type = "q35"|machine_type = "virt"|' "$target_config"
+            if grep -qE '^firmware\s*=' "$target_config" 2>/dev/null; then
+                sudo sed -i 's|^firmware = .*|firmware = ""|' "$target_config"
+            fi
+        fi
+        pass "vm-cache: enable_template=false, vm_cache_number=${VM_CACHE_NUMBER}, shared_fs=none, sandbox_cgroup_only=true"
     fi
 
 
@@ -856,8 +961,8 @@ check_kata_runtime() {
     fi
 
 
-    # VM template：安装静态 kata-runtime 并 factory init
-    if $VM_TEMPLATE; then
+    # VM template / VM Cache：安装静态 kata-runtime；template 同步 init，cache 走常驻服务
+    _ensure_kata_runtime_static() {
         local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
         local kata_rt_bundled="${INSTALL_FILES_DIR}/go-shim-static/kata-runtime"
         if [ ! -x "$kata_rt_static" ] || ! "$kata_rt_static" --version &>/dev/null; then
@@ -870,9 +975,96 @@ check_kata_runtime() {
             fi
         fi
         pass "kata-runtime（factory）: $("$kata_rt_static" --version 2>/dev/null | head -1)"
+        return 0
+    }
+
+    _stop_vm_cache_server() {
+        if systemctl list-unit-files "${VM_CACHE_UNIT}" &>/dev/null || \
+           [ -f "/etc/systemd/system/${VM_CACHE_UNIT}" ]; then
+            sudo systemctl stop "${VM_CACHE_UNIT}" >/dev/null 2>&1 || true
+            sudo systemctl disable "${VM_CACHE_UNIT}" >/dev/null 2>&1 || true
+        fi
+        # 兜底：清掉残留 socket / 孤儿进程
+        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+        if [ -x "$kata_rt_static" ]; then
+            sudo "$kata_rt_static" --config "$default_config" factory destroy >/dev/null 2>&1 || true
+        fi
+        sudo rm -f "$VM_CACHE_ENDPOINT" >/dev/null 2>&1 || true
+    }
+
+    _start_vm_cache_server() {
+        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+        local unit_path="/etc/systemd/system/${VM_CACHE_UNIT}"
+        sudo tee "$unit_path" >/dev/null <<EOF
+[Unit]
+Description=Kata Containers VMCache server (pre-warmed VMs)
+Documentation=https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/what-is-vm-cache-and-how-do-I-use-it.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/run/vc/vm
+ExecStartPre=/bin/mkdir -p /run/vc/vm
+ExecStart=${kata_rt_static} --config ${default_config} factory init
+ExecStop=${kata_rt_static} --config ${default_config} factory destroy
+Restart=on-failure
+RestartSec=3
+# factory init 常驻；池大小由 configuration.toml 的 vm_cache_number 决定
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        # 先停旧实例，避免 socket 占用
+        sudo systemctl stop "${VM_CACHE_UNIT}" >/dev/null 2>&1 || true
+        sudo rm -f "$VM_CACHE_ENDPOINT" >/dev/null 2>&1 || true
+        if ! sudo systemctl enable --now "${VM_CACHE_UNIT}"; then
+            fail "启动 ${VM_CACHE_UNIT} 失败"
+            sudo journalctl -u "${VM_CACHE_UNIT}" -n 40 --no-pager 2>/dev/null || true
+            return 1
+        fi
+        # 等待池中至少有一台预热 VM（workers 失败会永久退出，不能只看 socket）
+        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+        local i status_out
+        for i in $(seq 1 120); do
+            if ! systemctl is-active --quiet "${VM_CACHE_UNIT}"; then
+                fail "${VM_CACHE_UNIT} 已退出"
+                sudo journalctl -u "${VM_CACHE_UNIT}" -n 40 --no-pager 2>/dev/null || true
+                return 1
+            fi
+            status_out=$(sudo "$kata_rt_static" --config "$default_config" factory status 2>/dev/null || true)
+            if echo "$status_out" | grep -qE '^VM pid ='; then
+                local nready
+                nready=$(echo "$status_out" | grep -cE '^VM pid =' || true)
+                pass "vm-cache server 就绪（${VM_CACHE_UNIT}, 池中 ${nready}/${VM_CACHE_NUMBER}）"
+                return 0
+            fi
+            # 早期失败特征：virtiofsd / create new vm
+            if journalctl -u "${VM_CACHE_UNIT}" -n 30 --no-pager 2>/dev/null | grep -q 'failed to create new vm'; then
+                # 给一点时间看是否仍有 worker 在重试；cache 实现失败即退出 worker
+                sleep 2
+                status_out=$(sudo "$kata_rt_static" --config "$default_config" factory status 2>/dev/null || true)
+                if ! echo "$status_out" | grep -qE '^VM pid ='; then
+                    fail "vm-cache 预热失败（池为空）。详见: journalctl -u ${VM_CACHE_UNIT}"
+                    sudo journalctl -u "${VM_CACHE_UNIT}" -n 40 --no-pager 2>/dev/null || true
+                    return 1
+                fi
+            fi
+            sleep 1
+        done
+        fail "等待 vm-cache 预热超时（${VM_CACHE_NUMBER} 台）"
+        sudo "$kata_rt_static" --config "$default_config" factory status 2>/dev/null || true
+        sudo journalctl -u "${VM_CACHE_UNIT}" -n 40 --no-pager 2>/dev/null || true
+        return 1
+    }
+
+    if $VM_TEMPLATE; then
+        _ensure_kata_runtime_static || return 1
         if ! $CHECK_ONLY; then
-            echo "  初始化 VM factory（kata-runtime factory init）..."
-            # 先 destroy 残留，忽略失败
+            _stop_vm_cache_server
+            echo "  初始化 VM factory（kata-runtime factory init / template）..."
+            local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
             sudo "$kata_rt_static" --config "$default_config" factory destroy >/dev/null 2>&1 || true
             if sudo "$kata_rt_static" --config "$default_config" factory init; then
                 pass "vm factory 已初始化（template_path=/run/vc/vm/template）"
@@ -881,14 +1073,46 @@ check_kata_runtime() {
                 return 1
             fi
         fi
-    elif [ -d /run/vc/vm/template ] && ! $CHECK_ONLY; then
-        # 离开 template 模式时清理残留 factory（避免占 tmpfs）
-        local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
-        if [ -x "$kata_rt_static" ]; then
-            echo "  清理旧 VM factory..."
-            sudo "$kata_rt_static" factory destroy >/dev/null 2>&1 || \
-                sudo umount /run/vc/vm/template >/dev/null 2>&1 || true
-            sudo rm -rf /run/vc/vm/template >/dev/null 2>&1 || true
+    elif [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+        _ensure_kata_runtime_static || return 1
+        if ! $CHECK_ONLY; then
+            # 与 template 互斥：清掉残留 template
+            if [ -d /run/vc/vm/template ]; then
+                echo "  清理旧 VM template（与 vm-cache 互斥）..."
+                local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+                sudo "$kata_rt_static" --config "$default_config" factory destroy >/dev/null 2>&1 || \
+                    sudo umount /run/vc/vm/template >/dev/null 2>&1 || true
+                sudo rm -rf /run/vc/vm/template >/dev/null 2>&1 || true
+            fi
+            echo "  启动 VM Cache server（预热 ${VM_CACHE_NUMBER} 台）..."
+            _start_vm_cache_server || return 1
+        fi
+    else
+        if ! $CHECK_ONLY; then
+            # 离开 cache：停常驻服务
+            if systemctl is-active --quiet "${VM_CACHE_UNIT}" 2>/dev/null || \
+               [ -S "$VM_CACHE_ENDPOINT" ]; then
+                echo "  停止 VM Cache server..."
+                _stop_vm_cache_server
+                pass "vm-cache server 已停止"
+            fi
+            # 离开 template：清理残留 factory（避免占 tmpfs）
+            if [ -d /run/vc/vm/template ]; then
+                local kata_rt_static="$KATA_BIN_DIR/kata-runtime-go-static"
+                if [ -x "$kata_rt_static" ]; then
+                    echo "  清理旧 VM factory..."
+                    sudo "$kata_rt_static" factory destroy >/dev/null 2>&1 || \
+                        sudo umount /run/vc/vm/template >/dev/null 2>&1 || true
+                    sudo rm -rf /run/vc/vm/template >/dev/null 2>&1 || true
+                fi
+            fi
+            # 若仍指向 Go qemu 配置，把 cache number 归零以免下次误连
+            if [ -f /opt/kata/share/defaults/kata-containers/configuration-qemu.toml ]; then
+                local go_qemu=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+                if grep -qE '^vm_cache_number\s*=\s*[1-9]' "$go_qemu" 2>/dev/null; then
+                    sudo sed -i 's|^vm_cache_number = .*|vm_cache_number = 0|' "$go_qemu"
+                fi
+            fi
         fi
     fi
 
@@ -924,6 +1148,7 @@ check_kata_runtime() {
         if [ "$SNAPSHOTTER" = "devmapper" ]; then
             snap_line="  snapshotter = 'devmapper'"
         fi
+        # 注意：整块末尾必须有空行，便于后续按 section 清理；options 用完整表路径（与本机 dump 风格一致）
         sudo tee -a "$config_file" > /dev/null <<KATAEOF
 
 ${kata_runtime_section}
@@ -932,15 +1157,40 @@ ${kata_runtime_section}
   privileged_without_host_devices = true
 ${snap_line}
   pod_annotations = ['io.katacontainers.*']
-  ${kata_options_section}
-    ConfigPath = '${kata_config_path}'
+${kata_options_section}
+  ConfigPath = '${kata_config_path}'
+
 KATAEOF
     }
 
     _strip_stale_kata_sections() {
-        # 删掉任意路径下的 kata runtime 段（含旧 grpc.v1.cri 残留）
-        sudo sed -i '/\[plugins.*runtimes\.kata\]/,/^$/d' "$config_file"
-        sudo sed -i '/^$/{N;/^\n$/d;}' "$config_file"
+        # 不能用 sed '/runtimes.kata/,/^$/d'：会误匹配 .kata.options，且嵌套无空行时会留下碎片
+        # （曾导致 toml: table options already exists，containerd 无法启动）
+        # 注意：错误写入时 section 头可能带缩进，必须 trim 后再判断
+        local tmp
+        tmp=$(mktemp)
+        awk '
+            {
+                raw = $0
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+            }
+            line ~ /^\[/ {
+                if (line ~ /runtimes\.kata(\.options)?[[:space:]]*\]/) {
+                    skip = 1
+                } else {
+                    skip = 0
+                }
+            }
+            skip { next }
+            # 清理曾残留在其它 section 末尾的碎片行
+            line ~ /^pod_annotations[[:space:]]*=[[:space:]]*\[.*katacontainers/ { next }
+            line ~ /^ConfigPath[[:space:]]*=[[:space:]]*.*kata-containers/ { next }
+            { print raw }
+        ' "$config_file" > "$tmp"
+        # 压缩多余空行
+        sudo awk 'BEGIN{blank=0} /^$/{blank++; if(blank<=1) print; next} {blank=0; print}' "$tmp" | sudo tee "$config_file" >/dev/null
+        rm -f "$tmp"
     }
 
     local need_restart=false
@@ -951,6 +1201,16 @@ KATAEOF
         local cur_path cur_cfg
         cur_path=$(awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/runtime_path/{print; exit}' "$config_file")
         cur_cfg=$(awk '/\[plugins.*runtimes\.kata(\.options)?\]/{p=1} p&&/ConfigPath/{print; exit}' "$config_file")
+        # 重复的 kata.options / 无法 parse → 强制重写（曾拖垮 containerd）
+        local kata_opt_count
+        kata_opt_count=$(grep -cE 'runtimes\.kata\.options' "$config_file" 2>/dev/null || echo 0)
+        if [ "${kata_opt_count:-0}" -gt 1 ] 2>/dev/null; then
+            warn "检测到重复的 kata.options 段（${kata_opt_count}），正在清理重写..."
+            need_fix=true
+        elif ! sudo containerd config dump >/dev/null 2>&1; then
+            warn "containerd config.toml 无法解析，正在清理重写 kata 段..."
+            need_fix=true
+        fi
         if $use_go_runtime; then
             if ! echo "$cur_path" | grep -qE 'go-static|/opt/kata/bin/containerd-shim-kata-v2'; then
                 warn "kata runtime_path 未指向 Go shim，正在修正..."
@@ -1308,6 +1568,8 @@ EOF
         fail "crictl 无法连接到 containerd，请检查:"
         echo "  1. containerd 是否已启动: systemctl status containerd"
         echo "  2. socket 路径是否正确: ls -la /run/containerd/containerd.sock"
+        echo "  3. 默认 snapshotter 插件是否 ok: ctr plugins ls | grep snapshotter"
+        echo "     （erofs 需先 modprobe erofs，否则 CRI ImageService 会 Unimplemented）"
         return 1
     fi
 
@@ -1556,6 +1818,65 @@ EOF
 }
 
 # ============================================================
+# 确保 erofs 内核模块可用（否则 containerd 会 skip 插件并拖垮 CRI）
+# ============================================================
+ensure_erofs() {
+    echo ""
+    echo "--- erofs 内核模块 ---"
+
+    if $CHECK_ONLY; then
+        if lsmod 2>/dev/null | grep -q '^erofs\b' \
+            && ctr plugins ls 2>/dev/null | grep -E 'snapshotter\.v1[[:space:]]+erofs' | grep -q 'ok'; then
+            pass "erofs 模块与 snapshotter 插件就绪"
+            return 0
+        fi
+        warn "erofs 未就绪（需 modprobe erofs，且插件状态 ok）"
+        return 1
+    fi
+
+    if ! command -v mkfs.erofs >/dev/null 2>&1; then
+        fail "缺少 mkfs.erofs（erofs-utils），无法使用 erofs snapshotter"
+        return 1
+    fi
+
+    if ! lsmod 2>/dev/null | grep -q '^erofs\b'; then
+        echo "  加载 erofs 内核模块..."
+        if ! sudo modprobe erofs 2>/dev/null; then
+            fail "modprobe erofs 失败（内核未启用 CONFIG_EROFS_FS？）"
+            return 1
+        fi
+        pass "erofs 模块已加载"
+    else
+        pass "erofs 模块已加载"
+    fi
+
+    # 开机自动加载，避免重启后 CRI 因 snapshotter=erofs 而挂掉
+    if [ ! -f /etc/modules-load.d/erofs.conf ]; then
+        echo "erofs" | sudo tee /etc/modules-load.d/erofs.conf >/dev/null
+        pass "已写入 /etc/modules-load.d/erofs.conf"
+    fi
+
+    return 0
+}
+
+# 切换/确认 snapshotter 后校验插件与 CRI（erofs 未加载时会 failed to find snapshotter）
+_verify_snapshotter_ready() {
+    local name="$1"
+    if ! ctr plugins ls 2>/dev/null | grep -E "snapshotter\\.v1[[:space:]]+${name}" | grep -q 'ok'; then
+        fail "snapshotter \"$name\" 插件未就绪（ctr plugins ls | grep $name）"
+        if [ "$name" = "erofs" ]; then
+            echo "  提示: journalctl -u containerd 常见原因: EROFS unsupported, please \`modprobe erofs\`"
+        fi
+        return 1
+    fi
+    if ! crictl info >/dev/null 2>&1; then
+        fail "CRI 不可用：默认 snapshotter=$name 但插件加载失败，已拖垮 ImageService"
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
 # 检查 snapshotter 配置
 # ============================================================
 check_snapshotter() {
@@ -1564,6 +1885,9 @@ check_snapshotter() {
 
     if [ "$SNAPSHOTTER" = "devmapper" ]; then
         ensure_devmapper || return 1
+    fi
+    if [ "$SNAPSHOTTER" = "erofs" ]; then
+        ensure_erofs || return 1
     fi
 
     local config_file="/etc/containerd/config.toml"
@@ -1583,6 +1907,15 @@ check_snapshotter() {
                     fi
                 fi
             fi
+        fi
+        # 配置已是目标值，但仍可能因模块未加载导致 CRI 挂掉（尤其 erofs）
+        if ! $CHECK_ONLY; then
+            if ! ctr plugins ls 2>/dev/null | grep -E "snapshotter\\.v1[[:space:]]+${SNAPSHOTTER}" | grep -q 'ok'; then
+                warn "snapshotter=$SNAPSHOTTER 已配置但插件未 ok，重启 containerd..."
+                sudo systemctl restart containerd
+                sleep 2
+            fi
+            _verify_snapshotter_ready "$SNAPSHOTTER" || return 1
         fi
         pass "snapshotter 已配置: $SNAPSHOTTER"
         return 0
@@ -1619,6 +1952,7 @@ check_snapshotter() {
     echo "  重启 containerd..."
     sudo systemctl restart containerd
     sleep 2
+    _verify_snapshotter_ready "$SNAPSHOTTER" || return 1
     pass "snapshotter 已切换为: $SNAPSHOTTER"
 
     return 0
@@ -1876,6 +2210,8 @@ main() {
         echo "  Hypervisor:  $KATA_HYPERVISOR"
         if $VM_TEMPLATE; then
             echo "  VM template: on (Go factory)"
+        elif [ "$VM_CACHE_NUMBER" -gt 0 ]; then
+            echo "  VM cache:    on (n=${VM_CACHE_NUMBER}, Go factory server)"
         fi
     fi
     echo "  CNI 类型:    $CNI_TYPE"
@@ -1899,9 +2235,11 @@ main() {
     check_kata_runtime    || errors=$((errors + 1))
     check_cni_network     || errors=$((errors + 1))
     check_crictl          || errors=$((errors + 1))
+    # snapshotter 须在 CRI 连通性检查之前：默认 snapshotter 指向未加载的 erofs 时
+    # 会拖垮 ImageService，导致后续 crictl/pause 全部 Unimplemented
+    check_snapshotter     || errors=$((errors + 1))
     check_crictl_config   || { [[ $? -eq 1 ]] && errors=$((errors + 1)); }
     check_registry_mirror || errors=$((errors + 1))
-    check_snapshotter     || errors=$((errors + 1))
     check_pause_image     || errors=$((errors + 1))
     check_kernel_params
     check_cgroup_v2_cpu   || errors=$((errors + 1))

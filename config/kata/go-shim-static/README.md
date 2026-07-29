@@ -6,6 +6,7 @@
 
 - `stratovirt`：仅 Go runtime（runtime-rs 无后端）
 - `--vm-template`：官方 `kata-runtime factory init` 仅 Go qemu 路径
+- `--vm-cache N`：VMCache 常驻 server（Go qemu；runtime-rs 已废弃）
 
 ## 构建（Kata Containers 4.0.0）
 
@@ -15,8 +16,10 @@
 cd /path/to/kata-containers   # tag/commit 4.0.0
 cd src/runtime
 
-# 可选：VM template + shared_fs=none 需要（见下方补丁）
+# 应用补丁（见下方）
 patch -p1 < /path/to/sandbox-tests/config/kata/go-shim-static/patches/0001-factory-nosharedfs-mkdir-sharepath.patch
+patch -p1 < /path/to/sandbox-tests/config/kata/go-shim-static/patches/0002-factory-vmcache-default-vmstorepath.patch
+patch -p1 < /path/to/sandbox-tests/config/kata/go-shim-static/patches/0003-vmcache-grpc-vsock-contextid.patch
 
 make pkg/katautils/config-settings.go
 mkdir -p /path/to/sandbox-tests/install/go-shim-static
@@ -31,22 +34,36 @@ CGO_ENABLED=0 go build -mod=mod -ldflags '-s -w' \
 `setup.sh` 安装到：
 
 - `/opt/kata/bin/containerd-shim-kata-v2-go-static`
-- `/opt/kata/bin/kata-runtime-go-static`（`--vm-template` 时 `factory init/destroy`）
+- `/opt/kata/bin/kata-runtime-go-static`（factory / VMCache）
 
-## 补丁：factory + `shared_fs=none`
+## 补丁
+
+### 0001：factory + `shared_fs=none`
 
 `patches/0001-factory-nosharedfs-mkdir-sharepath.patch`：在 `FsSharing` 关闭时仍 `MkdirAll(sharePath)`。
 
-原因：`assignSandbox()` 会把沙箱 `mounts` 软链到 `/run/vc/vm/<vmid>/shared`；不建该目录时软链悬空，后续 `mkdir .../mounts` 报 `file exists`。
+原因：`assignSandbox()` 会把沙箱 `mounts` 软链到 `/run/vc/vm/<vmid>/shared`；不建该目录时软链悬空。
 
-## ARM64 / Kata 4.0 上 `--vm-template`
+### 0002：VMCache `VMStorePath` 默认值 + FromGrpc agent URL
 
-官方 Go template 测试在 **arm64 skip**。本机可行组合：
+`patches/0002-factory-vmcache-default-vmstorepath.patch`：
 
-| 项 | 要求 |
-|----|------|
-| `shared_fs` | `none`（virtio-fs 互斥；9p 已从 agent 移除） |
-| snapshotter | **devmapper**（块 rootfs） |
-| `sandbox_cgroup_only` | **true**（否则 qemu+devmapper 报 `cgroup.procs EINVAL`，kata#6977） |
+- `NewVM`：`VMStorePath`/`RunStorePath` 为空时填 `/run/vc/vm` 等
+- `NewVMFromGrpc`：调用 `setAgentURL()`（否则 agent URL 为空 → `Invalid scheme`）
 
-`setup.sh --vm-template` 会强制上述项。本机 smoke **3/3**，但 `t_runp` ~2.05s，同条件直启 ~1.04s——template 迁移开销大于收益。最短冷启动仍用 **clh/qemu + virtio-fs**（~0.8–1.0s）。
+### 0003：VMCache gRPC 传递 vsock ContextID
+
+`patches/0003-vmcache-grpc-vsock-contextid.patch`：`qemuGrpc` 序列化/恢复 guest CID；`GenerateSocket` 在 hand-off 后复用原 CID。
+
+本机 `--vm-cache 2` smoke：**3/3**，`t_runp` ~0.56–0.75s（优于同机 template ~2s）。
+
+## ARM64 / Kata 4.0 上 `--vm-template` / `--vm-cache`
+
+| 项 | template | vm-cache |
+|----|----------|----------|
+| `shared_fs` | `none` | `none`（factory 预热无 sharePath） |
+| snapshotter | **devmapper** | **devmapper** |
+| `sandbox_cgroup_only` | **true** | **true** |
+| 常驻进程 | 否（template 文件） | **`kata-vmcache.service`** |
+
+`setup.sh --vm-template` / `--vm-cache N` 会强制上述项。template 本机 smoke 可 3/3 但偏慢；vm-cache 需打 0002 补丁后的静态 `kata-runtime`。

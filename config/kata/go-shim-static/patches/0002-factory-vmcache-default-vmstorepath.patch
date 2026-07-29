@@ -1,0 +1,31 @@
+diff --git a/src/runtime/virtcontainers/vm.go b/src/runtime/virtcontainers/vm.go
+index 8c60a8980..47c3442c8 100644
+--- a/src/runtime/virtcontainers/vm.go
++++ b/src/runtime/virtcontainers/vm.go
+@@ -116,6 +116,16 @@ func NewVM(ctx context.Context, config VMConfig) (*VM, error) {
+ 		}
+ 	}()
+ 
++	// Factory / VMCache (kata-runtime factory init) builds VMConfig from toml without
++	// VMStorePath/RunStorePath. Empty values make QMP/console paths relative to CWD
++	// (often "/"), so the shim cannot reconnect after gRPC hand-off.
++	if config.HypervisorConfig.VMStorePath == "" {
++		config.HypervisorConfig.VMStorePath = store.RunVMStoragePath()
++	}
++	if config.HypervisorConfig.RunStorePath == "" {
++		config.HypervisorConfig.RunStorePath = store.RunStoragePath()
++	}
++
+ 	if err = hypervisor.CreateVM(ctx, id, network, &config.HypervisorConfig); err != nil {
+ 		return nil, err
+ 	}
+@@ -197,6 +207,9 @@ func NewVMFromGrpc(ctx context.Context, v *pb.GrpcVM, config VMConfig) (*VM, err
+ 	newAagentFunc := getNewAgentFunc(ctx)
+ 	agent := newAagentFunc()
+ 	agent.configureFromGrpc(ctx, hypervisor, v.Id, config.AgentConfig)
++	if err = agent.setAgentURL(); err != nil {
++		return nil, err
++	}
+ 
+ 	return &VM{
+ 		id:         v.Id,
