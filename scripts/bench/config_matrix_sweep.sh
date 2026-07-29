@@ -18,7 +18,7 @@
 #   ./scripts/bench/config_matrix_sweep.sh \
 #     --cnis bridge,ipvlan-l3 \
 #     --runtimes runc,kata \
-#     --hypervisors qemu,cloud-hypervisor \
+#     --hypervisors qemu,dragonball,clh,firecracker,stratovirt \
 #     --containerd-cpus 2,4,8,16 \
 #     --worker-cpus 64,128 \
 #     --workers 64,128,256 \
@@ -85,6 +85,9 @@ usage() {
   --cnis LIST                 默认 bridge,ipvlan-l3
   --runtimes LIST             默认 runc,kata
   --hypervisors LIST          默认 qemu；仅对 kata 展开
+                              可选: dragonball | qemu | cloud-hypervisor|clh |
+                                    firecracker | stratovirt
+                              （cloud-hypervisor 会规范为 clh，与 setup.sh 一致）
   --ip-masq true|false        默认 false（bridge 时传给 setup）
 
 拓扑 / 压测（默认已按方案固定）:
@@ -109,7 +112,7 @@ usage() {
   ./scripts/bench/config_matrix_sweep.sh \
     --cnis bridge,ipvlan-l3 \
     --runtimes runc,kata \
-    --hypervisors qemu,cloud-hypervisor \
+    --hypervisors qemu,dragonball,clh,firecracker,stratovirt \
     --containerd-cpus 2,4,8,16 \
     --worker-cpus 64,128 \
     --workers 64,128,256 \
@@ -363,12 +366,23 @@ for rt in "${RT_ARR[@]}"; do
         *) echo "错误: 未知 runtime: $rt"; exit 1 ;;
     esac
 done
+# 与 setup.sh --hypervisor 对齐；cloud-hypervisor → clh
+HV_NORM=()
 for hv in "${HV_ARR[@]}"; do
     case "$hv" in
-        dragonball|qemu|cloud-hypervisor|firecracker) ;;
-        *) echo "错误: 未知 hypervisor: $hv"; exit 1 ;;
+        dragonball|qemu|clh|firecracker|stratovirt) ;;
+        cloud-hypervisor) hv=clh ;;
+        *)
+            echo "错误: 未知 hypervisor: $hv"
+            echo "  支持: dragonball | qemu | cloud-hypervisor|clh | firecracker | stratovirt"
+            exit 1
+            ;;
     esac
+    HV_NORM+=("$hv")
 done
+HV_ARR=("${HV_NORM[@]}")
+# 回写展示用列表（去重保序）
+HYPERVISORS="$(IFS=,; echo "${HV_ARR[*]}")"
 
 # 展开组合: lines of "cni|runtime|hypervisor"
 COMBOS=()
@@ -538,7 +552,7 @@ run_one_combo() {
     local cold_report="${sweep_dir}/cold_start_report.json"
 
     if $DRY_RUN; then
-        echo "[dry-run] setup --cni-type $cni --runtime $rt ${hv:+--hypervisor $hv} --ip-masq $IP_MASQ --no-warmup"
+        echo "[dry-run] setup --cni-type $cni --runtime $rt ${hv:+--hypervisor $hv} --ip-masq $IP_MASQ"
         if ! $SKIP_COLD_START; then
             echo "[dry-run] cold_start_bench --runtime $rt --runs $COLD_START_RUNS --output $cold_report"
         fi
@@ -548,8 +562,8 @@ run_one_combo() {
     fi
 
     if ! $SKIP_SETUP; then
-        # setup 内默认 warmup 跳过；改由本脚本显式跑 cold_start_bench 并落盘
-        setup_args=(--cni-type "$cni" --runtime "$rt" --ip-masq "$IP_MASQ" --no-warmup)
+        # setup 默认会跑 warmup（3 次 cold_start）；正式时延仍由下方 cold_start_bench 落盘
+        setup_args=(--cni-type "$cni" --runtime "$rt" --ip-masq "$IP_MASQ")
         if [ "$rt" = "kata" ]; then
             setup_args+=(--hypervisor "$hv")
         fi
