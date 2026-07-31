@@ -23,12 +23,14 @@
 
 **不测什么：** 不是 `go test -bench` 微基准；默认路径不是长驻业务负载。
 
-| 模式 | 入口函数 | Worker | 单次负载（计时约等于） |
-|------|----------|--------|------------------------|
-| 默认 | `test` | `ctrWorker` | NewContainer→Task→等 `true`→Delete |
-| `--exec` | `test` + exec | `execWorker` | 长驻容器上循环 `Exec(true)` |
-| `--cri` | `criTest` | `criWorker` | RunPodSandbox→Stop→Remove |
-| `density` | 子命令 Action | （顺序创建） | 常驻后采 shim PSS/RSS |
+三者关系见代码：§2.2 的 Action（`--cri` ↔ `test` 互斥）；§2.3 `test()` 内起 worker（默认必有 `ctrWorker`，`--exec` 再并行附加）。
+
+| 主入口 | 变体 | Worker | 单次负载（计时约等于） |
+|--------|------|--------|------------------------|
+| `test`（client） | 默认 | `ctrWorker` | NewContainer→Task→等 `true`→Delete |
+| `test`（client） | + `--exec`（并行附加，不替换） | `ctrWorker` + `execWorker` | 另：长驻容器上循环 `Exec(true)` |
+| `criTest`（CRI） | — | `criWorker` | RunPodSandbox→Stop→Remove |
+| `density` 子命令 | — | （顺序创建） | 常驻后采 shim PSS/RSS |
 
 **模式选择总览（仅此一张总图）：**
 
@@ -54,20 +56,17 @@ flowchart TD
 
 各模式共用同一套「清理 → 起 worker → 限时循环 → 汇总」。
 
-**1）CLI 分支** — `func main()` 里设置 `app.Action`：
+**1）CLI 分支（默认 vs `--cri` 互斥；`--exec` 不在此层）** — `app.Action`：
 
 ```go
 // cmd/containerd-stress/main.go
-func main() {
-    app := cli.NewApp()
-    // ... Flag 省略 ...
-    app.Action = func(cliContext *cli.Context) error {
-        config := config{ /* address/duration/concurrent/cri/runtime/... */ }
-        if config.CRI {
-            return criTest(config)
-        }
-        return test(config)
+app.Action = func(cliContext *cli.Context) error {
+    config := config{ /* address/duration/concurrent/cri/exec/runtime/... */ }
+    // --cri 与 client 路径二选一；同一进程只会进入其中一个
+    if config.CRI {
+        return criTest(config) // → §2.4；此处无 --exec 逻辑
     }
+    return test(config) // → §2.3；若带 --exec，在 test() 内并行附加
 }
 ```
 
@@ -124,21 +123,110 @@ flowchart LR
   E -->|成功计时| A
 ```
 
-**准备** — `func test(c config) error`：
+**准备** — `func test(c config) error`（完整）：
 
 ```go
 // cmd/containerd-stress/main.go
 func test(c config) error {
-    ctx := namespaces.WithNamespace(context.Background(), "stress")
-    client, err := c.newClient() // WithDefaultRuntime(c.Runtime)
-    // cleanup(ctx, client)
-    image, err := client.Pull(ctx, c.Image,
-        containerd.WithPullUnpack,
-        containerd.WithPullSnapshotter(c.Snapshotter))
-    tctx, cancel := context.WithTimeout(ctx, c.Duration)
-    // 起 c.Concurrency 个 ctrWorker；若 c.Exec 再起同等数量 execWorker
-    // r.start(); go w.run(ctx, tctx); wg.Wait(); r.end(); gather
-    return nil
+	var (
+		wg  sync.WaitGroup
+		ctx = namespaces.WithNamespace(context.Background(), "stress")
+	)
+
+	client, err := c.newClient()
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := cleanup(ctx, client); err != nil {
+		return err
+	}
+
+	log.L.Infof("pulling %s", c.Image)
+	image, err := client.Pull(ctx, c.Image, containerd.WithPullUnpack, containerd.WithPullSnapshotter(c.Snapshotter))
+	if err != nil {
+		return err
+	}
+	v, err := client.Version(ctx)
+	if err != nil {
+		return err
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, c.Duration)
+	go func() {
+		s := make(chan os.Signal, 1)
+		signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
+		<-s
+		cancel()
+	}()
+
+	var (
+		workers []worker
+		r       = &run{}
+	)
+	log.L.Info("starting stress test run...")
+	// 必有：N 个 ctrWorker（默认生命周期路径，始终启动）
+	for i := 0; i < c.Concurrency; i++ {
+		wg.Add(1)
+
+		w := &ctrWorker{
+			id:          i,
+			wg:          &wg,
+			image:       image,
+			client:      client,
+			commit:      v.Revision,
+			snapshotter: c.Snapshotter,
+		}
+		workers = append(workers, w)
+	}
+	var exec *execWorker
+	// 可选附加：再并行 +N 个 execWorker（不替换上面的 ctrWorker；详见 §2.5）
+	if c.Exec {
+		for i := c.Concurrency; i < c.Concurrency+c.Concurrency; i++ {
+			wg.Add(1)
+			exec = &execWorker{
+				ctrWorker: ctrWorker{
+					id:          i,
+					wg:          &wg,
+					image:       image,
+					client:      client,
+					commit:      v.Revision,
+					snapshotter: c.Snapshotter,
+				},
+			}
+			go exec.exec(ctx, tctx)
+		}
+	}
+
+	// start the timer and run the worker
+	r.start()
+	for _, w := range workers {
+		go w.run(ctx, tctx) // 默认路径始终跑
+	}
+	// wait and end the timer
+	wg.Wait()
+	r.end()
+
+	results := r.gather(workers)
+	if c.Exec {
+		results.ExecTotal = exec.count
+		results.ExecFailures = exec.failures
+	}
+	log.L.Infof("ending test run in %0.3f seconds", results.Seconds)
+
+	log.L.WithField("failures", r.failures).Infof(
+		"create/start/delete %d containers in %0.3f seconds (%0.3f c/sec) or (%0.3f sec/c)",
+		results.Total,
+		results.Seconds,
+		results.ContainersPerSecond,
+		results.SecondsPerContainer,
+	)
+	if c.JSON {
+		if err := json.NewEncoder(os.Stdout).Encode(results); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 ```
 
@@ -308,6 +396,8 @@ containerd-stress --cri -a /run/containerd/containerd.sock --runtime runc -c 4 -
 
 ### 2.5 `--exec` 路径
 
+**关系：** 不是第三条主路径。入口仍是 §2.3 的 `test()`；本节展开其中的 `if c.Exec { ... go exec.exec }`——在已有 N 个 `ctrWorker` 之外再并行 +N 个 `execWorker`。与 `--cri` 互斥（`criTest` 内无此分支）。
+
 **目标：** 在已运行 task 上压 **`Exec`**（仅非 CRI）。
 
 **单次迭代：**
@@ -324,8 +414,6 @@ flowchart LR
   S2 --> E1
   E3 -->|成功记 execTimer| E1
 ```
-
-与 `ctrWorker` **并行**：`test()` 在起 N 个生命周期 worker 外，再起 N 个 `execWorker`。
 
 ```go
 // cmd/containerd-stress/exec_worker.go
