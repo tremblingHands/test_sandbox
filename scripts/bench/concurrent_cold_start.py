@@ -55,7 +55,7 @@ CPUSET_K8S_IO = "/sys/fs/cgroup/cpuset/k8s.io"
 # ============================================================
 class SandboxResult(object):
     def __init__(self, round_num, worker_id, task_index, sandbox_id,
-                 t_runp_ms, t_ready_ms, total_ms):
+                 t_runp_ms, t_ready_ms, total_ms, error=None):
         self.round_num = round_num
         self.worker_id = worker_id
         self.task_index = task_index
@@ -63,9 +63,10 @@ class SandboxResult(object):
         self.t_runp_ms = t_runp_ms
         self.t_ready_ms = t_ready_ms
         self.total_ms = total_ms
+        self.error = error
 
     def to_dict(self):
-        return {
+        d = {
             "round": self.round_num,
             "worker": self.worker_id,
             "task": self.task_index,
@@ -74,6 +75,39 @@ class SandboxResult(object):
             "t_ready_ms": self.t_ready_ms,
             "total_ms": self.total_ms,
         }
+        if self.error:
+            d["error"] = self.error
+        return d
+
+
+def _clip_error(err, limit=400):
+    import re
+    text = " ".join(str(err).split())
+    if "DeadlineExceeded" in text:
+        if "CANCEL" in text:
+            return "rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL"
+        return "rpc error: code = DeadlineExceeded"
+    m = re.search(r"rpc error: code = (\w+) desc = (.+?)(?:\s+time=\"|$)", text)
+    if m:
+        desc = m.group(2).strip().rstrip('"')
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        return "rpc error: code = {} desc = {}".format(m.group(1), desc)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _error_histogram(results, top_n=8):
+    counts = {}
+    for r in results:
+        if getattr(r, "sandbox_id", None) != "FAIL":
+            continue
+        err = getattr(r, "error", None)
+        if not err:
+            continue
+        counts[err] = counts.get(err, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
 
 
 class Stats(object):
@@ -298,23 +332,28 @@ def worker_counted_serial(worker_id, task_queue, round_num):
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
-        except Exception:
+        except Exception as e:
             add_result(SandboxResult(round_num, worker_id, task_index,
-                                     "FAIL", 0, G.runp_timeout * 1000, G.runp_timeout * 1000))
+                                     "FAIL", 0, G.runp_timeout * 1000,
+                                     G.runp_timeout * 1000,
+                                     error=_clip_error(e)))
             continue
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
+        ready_err = None
         try:
             poll_until_ready(sandbox_id)
             t_ready_ms = round((time.perf_counter() - t1) * 1000, 3)
-        except Exception:
+        except Exception as e:
             t_ready_ms = -1
+            ready_err = _clip_error(e)
 
         add_result(SandboxResult(round_num, worker_id, task_index,
                                  sandbox_id[:12], t_runp_ms,
                                  t_ready_ms if t_ready_ms >= 0 else 0,
-                                 round(t_runp_ms + max(t_ready_ms, 0), 3)))
+                                 round(t_runp_ms + max(t_ready_ms, 0), 3),
+                                 error=ready_err))
         if G.cleanup:
             cleanup_sandbox(sandbox_id)
 
@@ -330,8 +369,11 @@ def worker_counted_continuous_runp(worker_id, task_queue, ready_queue):
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
-        except Exception:
+        except Exception as e:
             sandbox_id = None
+            runp_err = _clip_error(e)
+        else:
+            runp_err = None
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
@@ -341,6 +383,7 @@ def worker_counted_continuous_runp(worker_id, task_queue, ready_queue):
             "sandbox_id": sandbox_id,
             "t_runp_ms": t_runp_ms,
             "t_after_runp": t1,
+            "error": runp_err,
         })
     ready_queue.put(None)
 
@@ -358,13 +401,16 @@ def worker_counted_continuous_poll(worker_id, round_num, ready_queue,
             continue
 
         sid = item["sandbox_id"]
+        err = item.get("error")
         if sid is not None:
             try:
                 poll_until_ready(sid)
                 t_ready_ms = round(
                     (time.perf_counter() - item["t_after_runp"]) * 1000, 3)
-            except Exception:
+            except Exception as e:
                 t_ready_ms = -1
+                if not err:
+                    err = _clip_error(e)
         else:
             t_ready_ms = -1
 
@@ -373,7 +419,8 @@ def worker_counted_continuous_poll(worker_id, round_num, ready_queue,
             (sid[:12] if sid else "FAIL"),
             item["t_runp_ms"],
             t_ready_ms if t_ready_ms >= 0 else 0,
-            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
+            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3),
+            error=err))
         if sid and G.cleanup:
             cleanup_sandbox(sid)
 
@@ -394,26 +441,31 @@ def worker_timed_serial(worker_id, round_num, stop_event):
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
-        except Exception:
+        except Exception as e:
             add_result(SandboxResult(round_num, worker_id, seq,
-                                     "FAIL", 0, G.runp_timeout * 1000, G.runp_timeout * 1000))
+                                     "FAIL", 0, G.runp_timeout * 1000,
+                                     G.runp_timeout * 1000,
+                                     error=_clip_error(e)))
             seq += 1
             continue
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
         # 检查 stop_event：如果 runp 期间时间到了，就绪等待后不再循环
+        ready_err = None
         try:
             poll_until_ready(sandbox_id)
             t_ready_ms = round((time.perf_counter() - t1) * 1000, 3)
-        except Exception:
+        except Exception as e:
             t_ready_ms = -1
+            ready_err = _clip_error(e)
 
         add_result(SandboxResult(
             round_num, worker_id, seq,
             sandbox_id[:12], t_runp_ms,
             t_ready_ms if t_ready_ms >= 0 else 0,
-            round(t_runp_ms + max(t_ready_ms, 0), 3)))
+            round(t_runp_ms + max(t_ready_ms, 0), 3),
+            error=ready_err))
         if G.cleanup:
             cleanup_sandbox(sandbox_id)
         seq += 1
@@ -430,8 +482,11 @@ def worker_timed_continuous_runp(worker_id, round_num, stop_event, ready_queue):
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
-        except Exception:
+        except Exception as e:
             sandbox_id = None
+            runp_err = _clip_error(e)
+        else:
+            runp_err = None
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
@@ -441,6 +496,7 @@ def worker_timed_continuous_runp(worker_id, round_num, stop_event, ready_queue):
             "sandbox_id": sandbox_id,
             "t_runp_ms": t_runp_ms,
             "t_after_runp": t1,
+            "error": runp_err,
         })
         seq += 1
 
@@ -470,13 +526,16 @@ def worker_timed_continuous_poll(worker_id, round_num, stop_event, ready_queue,
             continue
 
         sid = item["sandbox_id"]
+        err = item.get("error")
         if sid is not None:
             try:
                 poll_until_ready(sid)
                 t_ready_ms = round(
                     (time.perf_counter() - item["t_after_runp"]) * 1000, 3)
-            except Exception:
+            except Exception as e:
                 t_ready_ms = -1
+                if not err:
+                    err = _clip_error(e)
         else:
             t_ready_ms = -1
 
@@ -485,7 +544,8 @@ def worker_timed_continuous_poll(worker_id, round_num, stop_event, ready_queue,
             (sid[:12] if sid else "FAIL"),
             item["t_runp_ms"],
             t_ready_ms if t_ready_ms >= 0 else 0,
-            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3)))
+            round(item["t_runp_ms"] + max(t_ready_ms, 0), 3),
+            error=err))
         if sid and G.cleanup:
             cleanup_sandbox(sid)
 
@@ -729,6 +789,13 @@ def print_summary(all_wall_times):
         "total", t_stats.p50, t_stats.p95, t_stats.p99,
         t_stats.mean, t_stats.min_val, t_stats.max_val))
 
+    err_hist = _error_histogram(stats_source)
+    if err_hist:
+        print("")
+        print("FAIL 错误 Top{}:".format(len(err_hist)))
+        for err, cnt in err_hist:
+            print("  [{:>4}] {}".format(cnt, err))
+
     print("")
     print("各轮次耗时分布{}:".format("(窗口内)" if G.use_timed else ""))
     for rnd in range(1, args.rounds + 1):
@@ -872,6 +939,9 @@ if __name__ == "__main__":
             "total_sandboxes": sum(G.window_counts.values()) if G.use_timed and G.window_counts else len(_results),
             "success": sum(1 for r in _results if r.sandbox_id != "FAIL"),
             "failed": sum(1 for r in _results if r.sandbox_id == "FAIL"),
+            "errors": [
+                {"count": c, "error": e} for e, c in _error_histogram(_results, top_n=20)
+            ],
         },
         "wall_times_per_round": all_wall_times,
         "window_counts": {str(k): v for k, v in G.window_counts.items()} if G.use_timed else {},

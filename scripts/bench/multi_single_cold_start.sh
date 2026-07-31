@@ -677,12 +677,13 @@ done
 echo ""
 echo "--- 总计 ---"
 python3 -c "
-import json, glob, statistics
+import json, glob, statistics, collections
 
 all_results = []
 total_sandboxes = 0
 total_success = 0
 duration = None
+err_counts = collections.Counter()
 
 for f in sorted(glob.glob('$RESULT_DIR/proc*_cpu*_node*.json')):
     d = json.load(open(f))
@@ -692,6 +693,8 @@ for f in sorted(glob.glob('$RESULT_DIR/proc*_cpu*_node*.json')):
         duration = d['config']['duration']
     for r in d['results']:
         all_results.append(r['total_ms'])
+        if r.get('sandbox_id') == 'FAIL' and r.get('error'):
+            err_counts[r['error']] += 1
 
 if all_results:
     s = sorted(all_results)
@@ -703,6 +706,10 @@ if all_results:
     tps = total_sandboxes / duration if duration else 0
     print('{:<16} {:>10} {:>10} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}  {:>8.1f}/s'.format(
         'ALL', total_sandboxes, total_success, p50, p95, p99, mean, tps))
+    if err_counts:
+        print('FAIL 错误 Top:')
+        for err, cnt in err_counts.most_common(8):
+            print('  [{:>4}] {}'.format(cnt, err))
 else:
     print('(无数据)')
 "

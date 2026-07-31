@@ -34,18 +34,50 @@ CPUSET_K8S_IO = "/sys/fs/cgroup/cpuset/k8s.io"
 # ============================================================
 # 数据模型
 # ============================================================
+def _clip_error(err, limit=400):
+    """压缩异常文本，便于 JSON / 汇总去重。"""
+    import re
+    text = " ".join(str(err).split())
+    if "DeadlineExceeded" in text:
+        if "CANCEL" in text:
+            return "rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL"
+        return "rpc error: code = DeadlineExceeded"
+    m = re.search(r"rpc error: code = (\w+) desc = (.+?)(?:\s+time=\"|$)", text)
+    if m:
+        desc = m.group(2).strip().rstrip('"')
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        return "rpc error: code = {} desc = {}".format(m.group(1), desc)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _error_histogram(results, top_n=8):
+    counts = {}
+    for r in results:
+        if getattr(r, "sandbox_id", None) != "FAIL":
+            continue
+        err = getattr(r, "error", None)
+        if not err:
+            continue
+        counts[err] = counts.get(err, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+
+
 class SandboxResult(object):
     def __init__(self, task_index, sandbox_id,
-                 t_runp_ms, t_ready_ms, total_ms, elapsed_ms=0):
+                 t_runp_ms, t_ready_ms, total_ms, elapsed_ms=0, error=None):
         self.task_index = task_index
         self.sandbox_id = sandbox_id
         self.t_runp_ms = t_runp_ms
         self.t_ready_ms = t_ready_ms
         self.total_ms = total_ms
         self.elapsed_ms = elapsed_ms
+        self.error = error
 
     def to_dict(self):
-        return {
+        d = {
             "task": self.task_index,
             "sandbox_id": self.sandbox_id,
             "t_runp_ms": self.t_runp_ms,
@@ -53,6 +85,9 @@ class SandboxResult(object):
             "total_ms": self.total_ms,
             "elapsed_ms": self.elapsed_ms,
         }
+        if self.error:
+            d["error"] = self.error
+        return d
 
 
 class Stats(object):
@@ -265,7 +300,9 @@ def print_summary(results, duration):
     t_stats = compute_stats(totals)
 
     success = sum(1 for r in results if r.sandbox_id != "FAIL")
+    failed = len(results) - success
     tps = len(results) / duration if duration > 0 else 0
+    err_hist = _error_histogram(results)
 
     print("")
     print("=" * 70)
@@ -293,6 +330,12 @@ def print_summary(results, duration):
     print("{:<18} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f} {:>8.1f}/{:.1f}".format(
         "total", t_stats.p50, t_stats.p95, t_stats.p99,
         t_stats.mean, t_stats.min_val, t_stats.max_val))
+
+    if failed and err_hist:
+        print("")
+        print("FAIL 错误 Top{} (本 worker):".format(len(err_hist)))
+        for err, cnt in err_hist:
+            print("  [{:>4}] {}".format(cnt, err))
 
     print("")
     print("详细报告: {}".format(args.output))
@@ -397,21 +440,29 @@ if __name__ == "__main__":
         t0 = time.perf_counter()
         try:
             sandbox_id = run_pod_sandbox(pod_config_path, args.runtime)
-        except Exception:
+        except Exception as e:
             t1 = time.perf_counter()
             t_runp_ms = round((t1 - t0) * 1000, 3)
-            results.append(SandboxResult(seq, "FAIL", t_runp_ms, 0, t_runp_ms,
-                                         round((time.perf_counter() - t_start) * 1000, 3)))
+            err = _clip_error(e)
+            results.append(SandboxResult(
+                seq, "FAIL", t_runp_ms, 0, t_runp_ms,
+                round((time.perf_counter() - t_start) * 1000, 3),
+                error=err))
+            # 每个 worker 最多打印前 3 条，避免刷屏；完整直方图在汇总里
+            if sum(1 for r in results if r.sandbox_id == "FAIL") <= 3:
+                print("[FAIL] runp={:.1f}ms err={}".format(t_runp_ms, err))
             seq += 1
             continue
         t1 = time.perf_counter()
         t_runp_ms = round((t1 - t0) * 1000, 3)
 
+        ready_err = None
         try:
             poll_until_ready(sandbox_id)
             t_ready_ms = round((time.perf_counter() - t1) * 1000, 3)
-        except Exception:
+        except Exception as e:
             t_ready_ms = -1
+            ready_err = _clip_error(e)
 
         results.append(SandboxResult(
             seq,
@@ -419,7 +470,8 @@ if __name__ == "__main__":
             t_runp_ms,
             t_ready_ms if t_ready_ms >= 0 else 0,
             round(t_runp_ms + max(t_ready_ms, 0), 3),
-            round((time.perf_counter() - t_start) * 1000, 3)))
+            round((time.perf_counter() - t_start) * 1000, 3),
+            error=ready_err))
         if G.cleanup:
             cleanup_sandbox(sandbox_id)
         seq += 1
@@ -454,6 +506,9 @@ if __name__ == "__main__":
             "total_sandboxes": len(results),
             "success": sum(1 for r in results if r.sandbox_id != "FAIL"),
             "failed": sum(1 for r in results if r.sandbox_id == "FAIL"),
+            "errors": [
+                {"count": c, "error": e} for e, c in _error_histogram(results, top_n=20)
+            ],
         },
         "phases": {
             "t_runp": compute_stats(
