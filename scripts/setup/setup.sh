@@ -1669,22 +1669,31 @@ check_crictl_config() {
 
     local config_file="/etc/crictl.yaml"
     local expected_endpoint="unix:///run/containerd/containerd.sock"
+    local expected_timeout=30
+    local cur_timeout=""
 
-    if [ -f "$config_file" ]; then
-        pass "crictl 配置文件存在: $config_file"
-    else
-        if $CHECK_ONLY; then
-            warn "crictl 配置文件不存在，将使用默认 endpoint"
+    if $CHECK_ONLY; then
+        if [ ! -f "$config_file" ]; then
+            warn "crictl 配置文件不存在，将使用默认 endpoint/timeout"
         else
-            echo "  写入 crictl 配置..."
-            cat | sudo tee "$config_file" > /dev/null <<EOF
-runtime-endpoint: unix:///run/containerd/containerd.sock
-image-endpoint: unix:///run/containerd/containerd.sock
-timeout: 30
+            pass "crictl 配置文件存在: $config_file"
+            cur_timeout=$(grep -E '^timeout:' "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+            if [ "$cur_timeout" = "$expected_timeout" ]; then
+                pass "crictl timeout 已是 ${expected_timeout}s"
+            else
+                warn "crictl timeout 为 ${cur_timeout:-未设置}（期望 ${expected_timeout}s）"
+            fi
+        fi
+    else
+        # 强制写入：已有文件也会覆盖 timeout / endpoint，避免历史 5s/10s 残留
+        echo "  写入 crictl 配置 (timeout=${expected_timeout}s)..."
+        cat | sudo tee "$config_file" > /dev/null <<EOF
+runtime-endpoint: ${expected_endpoint}
+image-endpoint: ${expected_endpoint}
+timeout: ${expected_timeout}
 debug: false
 EOF
-            pass "crictl 配置已写入"
-        fi
+        pass "crictl 配置已强制写入: timeout=${expected_timeout}s endpoint=${expected_endpoint}"
     fi
 
     # 验证连接
