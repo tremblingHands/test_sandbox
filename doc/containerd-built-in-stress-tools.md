@@ -21,14 +21,14 @@
 
 对**已运行**的 containerd，在 `-d` 限时、`-c` 并发下反复打生命周期负载，得到粗吞吐（containers/sec）与失败数。本身是**客户端**，不启动 daemon。
 
-**不测什么：** 不是 `go test -bench` 微基准；默认路径不是长驻业务负载；`--cri` 不使用 `-i` 镜像。
+**不测什么：** 不是 `go test -bench` 微基准；默认路径不是长驻业务负载。
 
-| 模式 | 入口函数 | Worker | 单次负载（计时约等于） | 镜像来源 |
-|------|----------|--------|------------------------|----------|
-| 默认 | `test` | `ctrWorker` | NewContainer→Task→等 `true`→Delete | `-i` |
-| `--exec` | `test` + exec | `execWorker` | 长驻容器上循环 `Exec(true)` | `-i` |
-| `--cri` | `criTest` | `criWorker` | RunPodSandbox→Stop→Remove | CRI sandbox（pause） |
-| `density` | 子命令 Action | （顺序创建） | 常驻后采 shim PSS/RSS | `-i` |
+| 模式 | 入口函数 | Worker | 单次负载（计时约等于） |
+|------|----------|--------|------------------------|
+| 默认 | `test` | `ctrWorker` | NewContainer→Task→等 `true`→Delete |
+| `--exec` | `test` + exec | `execWorker` | 长驻容器上循环 `Exec(true)` |
+| `--cri` | `criTest` | `criWorker` | RunPodSandbox→Stop→Remove |
+| `density` | 子命令 Action | （顺序创建） | 常驻后采 shim PSS/RSS |
 
 **模式选择总览（仅此一张总图）：**
 
@@ -36,10 +36,7 @@
 flowchart TD
   Start[启动 containerd-stress] --> Parse{解析 CLI}
   Parse -->|子命令 density| Density[§2.6 常驻采 PSS/RSS]
-  Parse -->|默认 Action| MetricsQ{--metrics 非空?}
-  MetricsQ -->|是| Metrics[起 HTTP metrics 服务]
-  Metrics --> CriQ
-  MetricsQ -->|否| CriQ{--cri?}
+  Parse -->|默认 Action| CriQ{--cri?}
   CriQ -->|是| CriTest[criTest §2.4]
   CriQ -->|否| ClientTest[test]
   ClientTest --> ExecQ{--exec?}
@@ -66,9 +63,6 @@ func main() {
     // ... Flag 省略 ...
     app.Action = func(cliContext *cli.Context) error {
         config := config{ /* address/duration/concurrent/cri/runtime/... */ }
-        if config.Metrics != "" {
-            return serve(config) // 先起 metrics，内部仍走 criTest 或 test
-        }
         if config.CRI {
             return criTest(config)
         }
@@ -248,32 +242,59 @@ func criTest(c config) error {
 
 **Worker** — `func (w *criWorker) run(ctx, tctx context.Context)`：与默认相同的限时循环，调用 `runSandbox`，成功才 `UpdateSince`。
 
-**单次负载** — `func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error)`：
+**单次负载** — `func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error)`（完整）：
 
 ```go
 // cmd/containerd-stress/cri_worker.go
 func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error) {
-    sbConfig := &runtime.PodSandboxConfig{
-        Metadata: &runtime.PodSandboxMetadata{
-            Name: id, Uid: util.GenerateID(), Namespace: "stress",
-        },
-        Labels: map[string]string{podNamespaceLabel: stressNs},
-        Linux:  &runtime.LinuxPodSandboxConfig{},
-    }
-    sb, err := w.client.RunPodSandbox(sbConfig, w.runtimeHandler)
-    if err != nil {
-        w.failures++
-        return err
-    }
-    defer func() {
-        w.client.StopPodSandbox(sb)
-        w.client.RemovePodSandbox(sb)
-    }()
-    // 后台 PodSandboxStatus ticker：不阻塞；条件几乎无效
-    go func() { /* ... */ }()
-    return nil // 立刻返回 → 触发 Stop/Remove
+
+	sbConfig := &runtime.PodSandboxConfig{
+		Metadata: &runtime.PodSandboxMetadata{
+			Name: id,
+			// Using random id as uuid is good enough for local
+			// integration test.
+			Uid:       util.GenerateID(),
+			Namespace: "stress",
+		},
+		Labels: map[string]string{podNamespaceLabel: stressNs},
+		Linux:  &runtime.LinuxPodSandboxConfig{},
+	}
+
+	sb, err := w.client.RunPodSandbox(sbConfig, w.runtimeHandler)
+	if err != nil {
+		w.failures++
+		return err
+	}
+	defer func() {
+		w.client.StopPodSandbox(sb)
+		w.client.RemovePodSandbox(sb)
+	}()
+
+	// verify it is running ?
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-tctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				// do stuff
+				status, err := w.client.PodSandboxStatus(sb)
+				if err != nil && status.GetState() == runtime.PodSandboxState_SANDBOX_READY {
+					ticker.Stop()
+					return
+				}
+			}
+		}
+	}()
+
+	return nil
 }
 ```
+
+要点：`RunPodSandbox` 成功后立刻 `return nil`，`defer` 随即 `Stop`/`Remove`；后台 `PodSandboxStatus` 轮询**不阻塞**返回，且条件为 `err != nil && READY`（几乎无效）。
 
 **计时边界：** 整次 `runSandbox` ≈ RunPodSandbox + Stop + Remove。  
 **参数：** `-a/-c/-d/--runtime`（handler 名）生效；**`-i`、`--snapshotter` 不生效**。镜像 = CRI 配置的 sandbox（如 pause）。  
