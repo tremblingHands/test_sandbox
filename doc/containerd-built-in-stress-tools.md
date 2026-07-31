@@ -21,6 +21,57 @@
 
 对**已经运行**的 containerd daemon，在指定时长与并发度下反复创建/启动/销毁容器（或 CRI Pod），用于稳定性加压、粗粒度吞吐（containers/sec）与错误率观察。
 
+整体流程如下。
+
+**入口与模式选择：**
+
+```mermaid
+flowchart TD
+  A[启动 containerd-stress] --> B{解析 CLI}
+  B -->|子命令 density| D[density: 同时拉起 N 个长驻容器<br/>采样 shim PSS/RSS]
+  B -->|默认 Action| C{--metrics 非空?}
+  C -->|是| M[起 HTTP metrics 服务]
+  M --> E
+  C -->|否| E{--cri?}
+  E -->|是| F[criTest<br/>CRI RuntimeService]
+  E -->|否| G[test<br/>containerd Client API]
+  G --> H{--exec?}
+  H -->|是| I[额外起同等数量 execWorker]
+  H -->|否| J[仅 ctrWorker]
+  I --> K[并发限时循环加压]
+  J --> K
+  F --> K
+  K --> L[汇总 Total / failures / c/sec]
+  D --> L
+```
+
+**默认 client 路径（单次迭代）：**
+
+```mermaid
+flowchart LR
+  subgraph worker循环["ctrWorker 循环直到 -d 超时"]
+    P1[NewContainer<br/>snapshot + spec true] --> P2[NewTask]
+    P2 --> P3[Wait + Start]
+    P3 --> P4[等 true 退出]
+    P4 --> P5[Delete task / container / snapshot]
+  end
+  P5 -->|成功计时| P1
+```
+
+**`--cri` 路径（单次迭代）：**
+
+```mermaid
+flowchart LR
+  subgraph cri循环["criWorker 循环直到 -d 超时"]
+    C1[构造 PodSandboxConfig] --> C2[RunPodSandbox<br/>handler=--runtime]
+    C2 --> C3[StopPodSandbox]
+    C3 --> C4[RemovePodSandbox]
+  end
+  C4 -->|成功计时| C1
+```
+
+说明：`--cri` 使用 CRI 配置的 sandbox（pause）镜像，不依赖 `-i`；默认路径使用 `-i` 指定镜像，进程写死为 `true`。
+
 ### 2.2 编译方法
 
 源码目录：`cmd/containerd-stress/`。`Makefile` 将 `containerd-stress` 列入 `COMMANDS`（与 `containerd`、`ctr` 同级），通过规则 `bin/%: cmd/%` 编译到 `bin/containerd-stress`。
@@ -128,78 +179,117 @@ while 未超时:
 
 #### 2.6.1 入口分支
 
-`main` 解析到 `CRI=true` 后调用 `criTest`，不再走默认 `test()`：
+`main` 中为 CLI App 设置 `Action`；解析到 `CRI=true` 后调用 `criTest`，不再走默认 `test()`：
 
 ```go
 // cmd/containerd-stress/main.go
-app.Action = func(cliContext *cli.Context) error {
-    config := config{
-        Address:     cliContext.String("address"),
-        Duration:    cliContext.Duration("duration"),
-        Concurrency: cliContext.Int("concurrent"),
-        CRI:         cliContext.Bool("cri"),
-        Runtime:     cliContext.String("runtime"),
-        Snapshotter: cliContext.String("snapshotter"),
-        // Image 也会解析，但 criTest 路径不使用
+func main() {
+    app := cli.NewApp()
+    // ... Flag 定义省略 ...
+    app.Action = func(cliContext *cli.Context) error {
+        config := config{
+            Address:     cliContext.String("address"),
+            Duration:    cliContext.Duration("duration"),
+            Concurrency: cliContext.Int("concurrent"),
+            CRI:         cliContext.Bool("cri"),
+            Runtime:     cliContext.String("runtime"),
+            Snapshotter: cliContext.String("snapshotter"),
+            // Image 也会解析，但 criTest 路径不使用
+        }
+        if config.Metrics != "" {
+            return serve(config)
+        }
+        if config.CRI {
+            return criTest(config)
+        }
+        return test(config)
     }
-    if config.Metrics != "" {
-        return serve(config)
-    }
-    if config.CRI {
-        return criTest(config)
-    }
-    return test(config)
+    // app.Run(os.Args) ...
 }
 ```
 
 #### 2.6.2 `criTest`：连 CRI、清理、起并发 worker
 
 ```go
-// cmd/containerd-stress/main.go — criTest
-client, err := remote.NewRuntimeService(c.Address, timeout) // CRI RuntimeService，非 containerd.New
-if err := criCleanup(ctx, client); err != nil {
-    return err
-}
-tctx, cancel := context.WithTimeout(ctx, c.Duration) // -d 限时；SIGINT/SIGTERM → cancel
-
-for i := 0; i < c.Concurrency; i++ { // -c 个 worker
-    w := &criWorker{
-        id:             i,
-        client:         client,
-        runtimeHandler: c.Runtime,     // CLI --runtime → CRI handler 名
-        snapshotter:    c.Snapshotter, // 赋了值，runSandbox 未使用
+// cmd/containerd-stress/main.go
+func criTest(c config) error {
+    var (
+        timeout = 1 * time.Minute
+        wg      sync.WaitGroup
+        ctx     = namespaces.WithNamespace(context.Background(), stressNs)
+    )
+    client, err := remote.NewRuntimeService(c.Address, timeout) // CRI RuntimeService，非 containerd.New
+    if err != nil {
+        return err
     }
-    workers = append(workers, w)
+    defer client.Close(context.Background())
+
+    if err := criCleanup(ctx, client); err != nil {
+        return err
+    }
+    tctx, cancel := context.WithTimeout(ctx, c.Duration) // -d 限时；SIGINT/SIGTERM → cancel
+    // ... signal.Notify → cancel ...
+
+    var (
+        workers []worker
+        r       = &run{}
+    )
+    for i := 0; i < c.Concurrency; i++ { // -c 个 worker
+        wg.Add(1)
+        w := &criWorker{
+            id:             i,
+            wg:             &wg,
+            client:         client,
+            runtimeHandler: c.Runtime,     // CLI --runtime → CRI handler 名
+            snapshotter:    c.Snapshotter, // 赋了值，runSandbox 未使用
+        }
+        workers = append(workers, w)
+    }
+    r.start()
+    for _, w := range workers {
+        go w.run(ctx, tctx)
+    }
+    wg.Wait()
+    r.end()
+    results := r.gather(workers) // 算 containers/sec
+    // ... 打印 / JSON ...
+    return nil
 }
-r.start()
-for _, w := range workers {
-    go w.run(ctx, tctx)
-}
-wg.Wait()
-r.end()
-results := r.gather(workers) // 算 containers/sec
 ```
 
 压测前清理只处理带 stress 标签的沙箱：
 
 ```go
-// cmd/containerd-stress/cri_worker.go — criCleanup
-filter := &runtime.PodSandboxFilter{
-    LabelSelector: map[string]string{podNamespaceLabel: stressNs}, // "stress"
-}
-sandboxes, err := client.ListPodSandbox(filter)
-for _, sb := range sandboxes {
-    client.StopPodSandbox(sb.Id)
-    client.RemovePodSandbox(sb.Id)
+// cmd/containerd-stress/cri_worker.go
+func criCleanup(ctx context.Context, client *remote.RuntimeService) error {
+    filter := &runtime.PodSandboxFilter{
+        LabelSelector: map[string]string{podNamespaceLabel: stressNs}, // "stress"
+    }
+    sandboxes, err := client.ListPodSandbox(filter)
+    if err != nil {
+        return err
+    }
+    for _, sb := range sandboxes {
+        if err := client.StopPodSandbox(sb.Id); err != nil {
+            return err
+        }
+        if err := client.RemovePodSandbox(sb.Id); err != nil {
+            return err
+        }
+    }
+    return nil
 }
 ```
 
 #### 2.6.3 worker 循环：限时内反复 `runSandbox`
 
 ```go
-// cmd/containerd-stress/cri_worker.go — criWorker.run
+// cmd/containerd-stress/cri_worker.go
 func (w *criWorker) run(ctx, tctx context.Context) {
-    defer w.wg.Done()
+    defer func() {
+        w.wg.Done()
+        log.L.Infof("worker %d finished", w.id)
+    }()
     for {
         select {
         case <-tctx.Done():
@@ -224,7 +314,7 @@ func (w *criWorker) run(ctx, tctx context.Context) {
 #### 2.6.4 单次负载：`RunPodSandbox` + Stop + Remove
 
 ```go
-// cmd/containerd-stress/cri_worker.go — runSandbox
+// cmd/containerd-stress/cri_worker.go
 func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error) {
     sbConfig := &runtime.PodSandboxConfig{
         Metadata: &runtime.PodSandboxMetadata{
@@ -248,7 +338,8 @@ func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error)
 
     // 后台 250ms ticker 调 PodSandboxStatus；不阻塞
     // 条件写成 err != nil && READY，实际几乎不起等待作用
-    go func() { /* ... */ }()
+    ticker := time.NewTicker(250 * time.Millisecond)
+    go func() { /* PodSandboxStatus 轮询；省略 */ }()
 
     return nil // 立刻返回 → 触发上面的 Stop/Remove
 }
@@ -265,7 +356,7 @@ pause/sandbox 镜像来自 **daemon CRI 配置**（如 `sandbox = '…/pause:3.9
 #### 2.6.5 结果汇总
 
 ```go
-// cmd/containerd-stress/main.go — run.gather
+// cmd/containerd-stress/main.go
 func (r *run) gather(workers []worker) *result {
     for _, w := range workers {
         r.total += w.getCount()
@@ -274,9 +365,9 @@ func (r *run) gather(workers []worker) *result {
     sec := r.seconds()
     return &result{
         Total:               r.total,
+        Seconds:             sec,
         ContainersPerSecond: float64(r.total) / sec,
         SecondsPerContainer: sec / float64(r.total),
-        // ...
     }
 }
 ```
