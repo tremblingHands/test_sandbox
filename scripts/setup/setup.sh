@@ -47,6 +47,9 @@ fi
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.9"
 CRICTL_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.6.32"
+CNI_PLUGINS_VERSION="v1.5.1"    # containernetworking/plugins 发行包（缺本地构建产物时下载）
+CNI_BIN_DIR="${CNI_BIN_DIR:-/opt/cni/bin}"
+CNI_SRC="${CNI_SRC:-/home/nathan/plugins}"  # 本地编译产物优先: $CNI_SRC/bin/
 CNI_TYPE="ipvlan-l3"            # 默认: ipvlan L3（百万 pod 规模，无 bridge 瓶颈）
 CONTAINERD_RUNTIME="runc"       # 默认: runc
 SNAPSHOTTER="overlayfs"         # 默认: overlayfs（可选 erofs | devmapper）
@@ -362,21 +365,51 @@ check_containerd() {
     fi
 
     # 缺配置文件时生成默认 config.toml（否则 restart 会报 can't read .../config.toml）
+    # Docker 自带的 containerd 常写 disabled_plugins=["cri"]，会导致 crictl ImageService Unimplemented
     local config_file="/etc/containerd/config.toml"
-    if [ -f "$config_file" ]; then
+    local need_cri_config=false
+    if [ ! -f "$config_file" ]; then
+        need_cri_config=true
+    elif grep -Eq '^\s*disabled_plugins\s*=\s*\[[^]]*["'\'']cri["'\'']' "$config_file" 2>/dev/null; then
+        need_cri_config=true
+    elif ! grep -Eq 'io\.containerd\.(grpc\.v1\.cri|cri\.v1\.(images|runtime))' "$config_file" 2>/dev/null; then
+        need_cri_config=true
+    fi
+
+    if [ -f "$config_file" ] && ! $need_cri_config; then
         pass "containerd 配置已存在: $config_file"
-    else
+    elif $need_cri_config; then
         if $CHECK_ONLY; then
-            fail "缺少 $config_file"
+            if [ ! -f "$config_file" ]; then
+                fail "缺少 $config_file"
+            else
+                fail "containerd CRI 未启用（$config_file 禁用了 cri 或缺少 CRI 段）"
+            fi
             return 1
         fi
-        warn "未找到 $config_file，正在用 containerd config default 生成..."
         sudo mkdir -p /etc/containerd
+        if [ -f "$config_file" ]; then
+            local bak="${config_file}.bak.$(date +%Y%m%d%H%M%S)"
+            warn "检测到 CRI 未启用（常见于 Docker 默认 config），备份并重写: $bak"
+            sudo cp -a "$config_file" "$bak"
+        else
+            warn "未找到 $config_file，正在用 containerd config default 生成..."
+        fi
         if ! containerd config default | sudo tee "$config_file" >/dev/null; then
             fail "生成 $config_file 失败"
             return 1
         fi
-        pass "已生成 $config_file"
+        # 对齐本脚本 pause 镜像（默认 sandbox_image 指向 registry.k8s.io）
+        sudo sed -i \
+            -e "s|sandbox_image = \".*\"|sandbox_image = \"${PAUSE_IMAGE}\"|" \
+            -e "s|sandbox_image = '.*'|sandbox_image = '${PAUSE_IMAGE}'|" \
+            "$config_file"
+        pass "已生成启用 CRI 的 $config_file"
+        if systemctl is-active --quiet containerd 2>/dev/null; then
+            echo "  重启 containerd 以加载 CRI..."
+            sudo systemctl restart containerd
+            sleep 2
+        fi
     fi
 
     # 检查 runc
@@ -421,6 +454,86 @@ check_containerd() {
 # ============================================================
 CNI_CONF_FILE="/etc/cni/net.d/10-mynet.conf"
 # CNI_SUBNET 默认/CLI/环境变量见脚本顶部与 --cni-subnet
+
+# 确保 /opt/cni/bin 具备 runp 所需插件（loopback + host-local + bridge|ipvlan）
+ensure_cni_bins() {
+    local need=()
+    local p
+    case "$CNI_TYPE" in
+        bridge) need=(loopback bridge host-local) ;;
+        ipvlan-l2|ipvlan-l3) need=(loopback ipvlan host-local) ;;
+        *) need=(loopback host-local) ;;
+    esac
+
+    local missing=()
+    for p in "${need[@]}"; do
+        if [ ! -x "${CNI_BIN_DIR}/${p}" ]; then
+            missing+=("$p")
+        fi
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        pass "CNI 插件已就绪: ${CNI_BIN_DIR} (${need[*]})"
+        return 0
+    fi
+
+    if $CHECK_ONLY; then
+        fail "缺少 CNI 插件: ${missing[*]}（目录 ${CNI_BIN_DIR}）"
+        return 1
+    fi
+
+    warn "缺少 CNI 插件: ${missing[*]}，正在安装到 ${CNI_BIN_DIR} ..."
+    sudo mkdir -p "$CNI_BIN_DIR"
+
+    # 1) 优先本地源码构建产物（与 build_install_runtime.sh 对齐）
+    if [ -d "${CNI_SRC}/bin" ]; then
+        local f base
+        for f in "${CNI_SRC}"/bin/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in
+                *.tgz|*.tar|*.gz|LICENSE|README*) continue ;;
+            esac
+            sudo install -m 0755 "$f" "${CNI_BIN_DIR}/${base}"
+        done
+    fi
+
+    missing=()
+    for p in "${need[@]}"; do
+        if [ ! -x "${CNI_BIN_DIR}/${p}" ]; then
+            missing+=("$p")
+        fi
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        pass "已从 ${CNI_SRC}/bin 安装 CNI 插件 → ${CNI_BIN_DIR}"
+        return 0
+    fi
+
+    # 2) 下载官方 containernetworking plugins 发行包
+    local pkg url tarball
+    pkg="cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz"
+    url="https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/${pkg}"
+    tarball=$(fetch_pkg "$pkg" "$url") || {
+        fail "下载 CNI plugins 失败，且本地 ${CNI_SRC}/bin 缺少: ${missing[*]}"
+        return 1
+    }
+    if ! sudo tar -C "$CNI_BIN_DIR" -xzf "$tarball"; then
+        fail "解压 CNI plugins 失败: $tarball"
+        return 1
+    fi
+
+    missing=()
+    for p in "${need[@]}"; do
+        if [ ! -x "${CNI_BIN_DIR}/${p}" ]; then
+            missing+=("$p")
+        fi
+    done
+    if [ ${#missing[@]} -ne 0 ]; then
+        fail "安装后仍缺少 CNI 插件: ${missing[*]}"
+        return 1
+    fi
+    pass "已安装 CNI plugins ${CNI_PLUGINS_VERSION} → ${CNI_BIN_DIR}"
+    return 0
+}
 
 # 自动检测默认路由对应的物理网卡（ipvlan master）
 detect_master_iface() {
@@ -1330,6 +1443,8 @@ check_cni_network() {
     echo ""
     echo "--- CNI 网络配置 (类型: $CNI_TYPE) ---"
 
+    ensure_cni_bins || return 1
+
     local cni_dir
     cni_dir=$(dirname "$CNI_CONF_FILE")
     if [ ! -d "$cni_dir" ]; then
@@ -1602,6 +1717,20 @@ check_registry_mirror() {
     local hosts_file="$certs_dir/registry.k8s.io/hosts.toml"
 
     # ---- 1. hosts.toml: registry.k8s.io 映射到阿里云 ---- #
+    local need_restart=false
+    local config_file="/etc/containerd/config.toml"
+
+    # 即使 hosts.toml 已存在，也确保 config.toml 指向 certs.d（重写 CRI 配置后常丢）
+    if [ -f "$config_file" ] && ! grep -q "config_path.*certs.d" "$config_file" 2>/dev/null; then
+        if ! $CHECK_ONLY; then
+            if grep -q "config_path" "$config_file"; then
+                sudo sed -i -E "s|config_path = ['\"].*['\"]|config_path = \"${certs_dir}\"|" "$config_file"
+                need_restart=true
+                pass "已设置 registry config_path → $certs_dir"
+            fi
+        fi
+    fi
+
     if [ -f "$hosts_file" ]; then
         pass "registry.k8s.io → 阿里云镜像源 已配置"
     else
@@ -1610,13 +1739,15 @@ check_registry_mirror() {
             return 1
         fi
 
-        # 设置 containerd config_path
-        local config_file="/etc/containerd/config.toml"
+        # 设置 containerd config_path（兼容 1.6 grpc.v1.cri 与 2.x cri.v1.images）
         if ! grep -q "config_path.*certs.d" "$config_file" 2>/dev/null; then
             if grep -q "config_path" "$config_file"; then
-                sudo sed -i "s|config_path = .*|config_path = '$certs_dir'|" "$config_file"
-            else
-                sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'.registry\]/a\      config_path = '$certs_dir'" "$config_file"
+                sudo sed -i -E "s|config_path = ['\"].*['\"]|config_path = \"${certs_dir}\"|" "$config_file"
+            elif grep -q 'io.containerd.grpc.v1.cri".registry]' "$config_file" \
+                || grep -q "io.containerd.grpc.v1.cri'.registry]" "$config_file"; then
+                sudo sed -i "/\[plugins.*io\.containerd\.grpc\.v1\.cri.*\.registry\]/a\\      config_path = \"${certs_dir}\"" "$config_file"
+            elif grep -q "io.containerd.cri.v1.images" "$config_file"; then
+                sudo sed -i "/\[plugins.*io\.containerd\.cri\.v1\.images.*registry\]/a\\      config_path = \"${certs_dir}\"" "$config_file"
             fi
         fi
 
@@ -1632,7 +1763,6 @@ TOML
     fi
 
     # ---- 2. pinned_images: 替换为阿里云镜像 ---- #
-    local config_file="/etc/containerd/config.toml"
     if grep -q "pinned_images" "$config_file" 2>/dev/null; then
         if grep -q "registry.k8s.io/pause" "$config_file" 2>/dev/null; then
             if $CHECK_ONLY; then
@@ -1885,7 +2015,14 @@ _verify_snapshotter_ready() {
         return 1
     fi
     if ! crictl info >/dev/null 2>&1; then
-        fail "CRI 不可用：默认 snapshotter=$name 但插件加载失败，已拖垮 ImageService"
+        local cri_err
+        cri_err=$(crictl info 2>&1 | head -1 || true)
+        if echo "$cri_err" | grep -qiE 'Unimplemented|unknown service runtime\.v1'; then
+            fail "CRI 不可用（ImageService/RuntimeService Unimplemented）：检查 /etc/containerd/config.toml 是否 disabled_plugins=[\"cri\"]（Docker 默认会禁用 CRI）"
+        else
+            fail "CRI 不可用：snapshotter=$name 已 ok，但 crictl info 失败: ${cri_err:-unknown}"
+        fi
+        echo "  提示: ctr plugins ls | grep -E 'cri|snapshotter' ； journalctl -u containerd -n 50"
         return 1
     fi
     return 0
@@ -1907,7 +2044,8 @@ check_snapshotter() {
 
     local config_file="/etc/containerd/config.toml"
     local current_snapshotter
-    current_snapshotter=$(grep -oP "snapshotter\s*=\s*'\K[^']*" "$config_file" 2>/dev/null | head -1)
+    # containerd config default 用双引号；部分手写/旧配置用单引号
+    current_snapshotter=$(grep -oP "snapshotter\s*=\s*['\"]\K[^'\"]+" "$config_file" 2>/dev/null | head -1)
 
     if [ "$current_snapshotter" = "$SNAPSHOTTER" ]; then
         # kata runtime 段也尽量对齐 devmapper
@@ -1916,7 +2054,7 @@ check_snapshotter() {
                 if ! $CHECK_ONLY; then
                     if ! grep -A12 'runtimes\.kata\]' "$config_file" | grep -q "snapshotter"; then
                         warn "kata runtime 未声明 snapshotter=devmapper，正在补齐..."
-                        sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = 'devmapper'" "$config_file"
+                        sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = \"devmapper\"" "$config_file"
                         sudo systemctl restart containerd
                         sleep 2
                     fi
@@ -1947,19 +2085,26 @@ check_snapshotter() {
         warn "snapshotter 当前为 $current_snapshotter，正在切换为 $SNAPSHOTTER ..."
     fi
 
-    # 修改 containerd config 中的 snapshotter 设置
-    if grep -q "snapshotter\s*=" "$config_file" 2>/dev/null; then
-        sudo sed -i "s|snapshotter = '[^']*'|snapshotter = '$SNAPSHOTTER'|" "$config_file"
+    # 修改 containerd config 中的 snapshotter 设置（兼容 ' 与 "）
+    if grep -Eq "snapshotter\s*=" "$config_file" 2>/dev/null; then
+        sudo sed -i -E "s|snapshotter = ['\"][^'\"]*['\"]|snapshotter = \"${SNAPSHOTTER}\"|" "$config_file"
     else
-        # 如果没有 snapshotter 行，在 [plugins."io.containerd.cri.v1.images"] 下添加
-        sudo sed -i "/\[plugins.'io.containerd.cri.v1.images'\]/a\\
-      snapshotter = '$SNAPSHOTTER'" "$config_file"
+        # 1.6: grpc.v1.cri.containerd；2.x: cri.v1.images
+        if grep -q 'io.containerd.grpc.v1.cri".containerd]' "$config_file" \
+            || grep -q "io.containerd.grpc.v1.cri'.containerd]" "$config_file"; then
+            sudo sed -i "/\[plugins.*io\.containerd\.grpc\.v1\.cri.*\.containerd\]/a\\      snapshotter = \"${SNAPSHOTTER}\"" "$config_file"
+        elif grep -q "io.containerd.cri.v1.images" "$config_file"; then
+            sudo sed -i "/\[plugins.*io\.containerd\.cri\.v1\.images\]/a\\      snapshotter = \"${SNAPSHOTTER}\"" "$config_file"
+        else
+            fail "无法写入 snapshotter：config.toml 缺少 CRI containerd/images 段"
+            return 1
+        fi
     fi
 
     # kata + devmapper：runtime 段也写上
     if [ "$SNAPSHOTTER" = "devmapper" ] && [ "$CONTAINERD_RUNTIME" = "kata" ]; then
         if ! awk '/\[plugins.*runtimes\.kata\]/{p=1} p&&/snapshotter/{print; exit}' "$config_file" | grep -q devmapper; then
-            sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = 'devmapper'" "$config_file"
+            sudo sed -i "/\[plugins.*runtimes\.kata\]/a\\  snapshotter = \"devmapper\"" "$config_file"
         fi
     fi
 
