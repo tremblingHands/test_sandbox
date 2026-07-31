@@ -11,349 +11,88 @@
 | Snapshotter 环境 | `contrib/aws/snapshotter_bench_*` | 在 AWS 上跑 snapshotter benchsuite |
 | 外部（文档推荐） | [bucketbench](https://github.com/estesp/bucketbench) | 跨引擎生命周期对比，偏逐步耗时统计 |
 
-构建：见 §2.2；`make benchmark` 跑 Go 微基准。
+`containerd-stress` 详见 §2（编译见 §2.7）；`make benchmark` 跑 Go 微基准（§3）。
 
 ---
 
 ## 2. `containerd-stress`
 
-### 2.1 用途
+### 2.1 定位与模式总览
 
-对**已经运行**的 containerd daemon，在指定时长与并发度下反复创建/启动/销毁容器（或 CRI Pod），用于稳定性加压、粗粒度吞吐（containers/sec）与错误率观察。
+对**已运行**的 containerd，在 `-d` 限时、`-c` 并发下反复打生命周期负载，得到粗吞吐（containers/sec）与失败数。本身是**客户端**，不启动 daemon。
 
-整体流程如下。
+**不测什么：** 不是 `go test -bench` 微基准；默认路径不是长驻业务负载；`--cri` 不使用 `-i` 镜像。
 
-**入口与模式选择：**
+| 模式 | 入口函数 | Worker | 单次负载（计时约等于） | 镜像来源 |
+|------|----------|--------|------------------------|----------|
+| 默认 | `test` | `ctrWorker` | NewContainer→Task→等 `true`→Delete | `-i` |
+| `--exec` | `test` + exec | `execWorker` | 长驻容器上循环 `Exec(true)` | `-i` |
+| `--cri` | `criTest` | `criWorker` | RunPodSandbox→Stop→Remove | CRI sandbox（pause） |
+| `density` | 子命令 Action | （顺序创建） | 常驻后采 shim PSS/RSS | `-i` |
+
+**模式选择总览（仅此一张总图）：**
 
 ```mermaid
 flowchart TD
-  A[启动 containerd-stress] --> B{解析 CLI}
-  B -->|子命令 density| D[density: 同时拉起 N 个长驻容器<br/>采样 shim PSS/RSS]
-  B -->|默认 Action| C{--metrics 非空?}
-  C -->|是| M[起 HTTP metrics 服务]
-  M --> E
-  C -->|否| E{--cri?}
-  E -->|是| F[criTest<br/>CRI RuntimeService]
-  E -->|否| G[test<br/>containerd Client API]
-  G --> H{--exec?}
-  H -->|是| I[额外起同等数量 execWorker]
-  H -->|否| J[仅 ctrWorker]
-  I --> K[并发限时循环加压]
-  J --> K
-  F --> K
-  K --> L[汇总 Total / failures / c/sec]
-  D --> L
+  Start[启动 containerd-stress] --> Parse{解析 CLI}
+  Parse -->|子命令 density| Density[§2.6 常驻采 PSS/RSS]
+  Parse -->|默认 Action| MetricsQ{--metrics 非空?}
+  MetricsQ -->|是| Metrics[起 HTTP metrics 服务]
+  Metrics --> CriQ
+  MetricsQ -->|否| CriQ{--cri?}
+  CriQ -->|是| CriTest[criTest §2.4]
+  CriQ -->|否| ClientTest[test]
+  ClientTest --> ExecQ{--exec?}
+  ExecQ -->|是| WithExec[ctrWorker + execWorker §2.3/2.5]
+  ExecQ -->|否| OnlyCtr[仅 ctrWorker §2.3]
+  WithExec --> Loop[并发限时循环]
+  OnlyCtr --> Loop
+  CriTest --> Loop
+  Loop --> Summary[gather: Total / failures / c/sec]
 ```
 
-**默认 client 路径（单次迭代）：**
+---
 
-```mermaid
-flowchart LR
-  subgraph worker循环["ctrWorker 循环直到 -d 超时"]
-    P1[NewContainer<br/>snapshot + spec true] --> P2[NewTask]
-    P2 --> P3[Wait + Start]
-    P3 --> P4[等 true 退出]
-    P4 --> P5[Delete task / container / snapshot]
-  end
-  P5 -->|成功计时| P1
-```
+### 2.2 公共骨架
 
-**`--cri` 路径（单次迭代）：**
+各模式共用同一套「清理 → 起 worker → 限时循环 → 汇总」。
 
-```mermaid
-flowchart LR
-  subgraph cri循环["criWorker 循环直到 -d 超时"]
-    C1[构造 PodSandboxConfig] --> C2[RunPodSandbox<br/>handler=--runtime]
-    C2 --> C3[StopPodSandbox]
-    C3 --> C4[RemovePodSandbox]
-  end
-  C4 -->|成功计时| C1
-```
-
-说明：`--cri` 使用 CRI 配置的 sandbox（pause）镜像，不依赖 `-i`；默认路径使用 `-i` 指定镜像，进程写死为 `true`。
-
-### 2.2 编译方法
-
-源码目录：`cmd/containerd-stress/`。`Makefile` 将 `containerd-stress` 列入 `COMMANDS`（与 `containerd`、`ctr` 同级），通过规则 `bin/%: cmd/%` 编译到 `bin/containerd-stress`。
-
-**依赖：** 与构建 containerd 相同，需可用的 Go 工具链（见 `BUILDING.md` Build requirements）。仅编 stress 工具时一般不强制依赖 btrfs 头文件等 daemon 可选依赖。
-
-**推荐（Makefile）：**
-
-```bash
-# 在 containerd 仓库根目录
-make bin/containerd-stress
-# 或一并构建 ctr / containerd / containerd-stress：
-make binaries   # 等价于 make all
-```
-
-产物：`bin/containerd-stress`。
-
-**安装到系统 PATH（可选）：**
-
-```bash
-make install
-# 将 BINARIES（含 containerd-stress）安装到 $(DESTDIR)$(BINDIR)
-# 默认通常为 /usr/local/bin；可用 DESTDIR / PREFIX / BINDIR 覆盖
-```
-
-官方说明：`BUILDING.md` 写明 `containerd-stress` 随 `all` / `binaries` 构建，并在 `make install` 时安装。
-
-**直接用 go build（不经过 Makefile）：**
-
-```bash
-go build -o bin/containerd-stress ./cmd/containerd-stress
-```
-
-若需与官方二进制一致的 ldflags/tags，优先用 `make bin/containerd-stress`（会带上 `GO_LDFLAGS`、`GO_TAGS` 等）。
-
-**运行前：** 目标环境需已有可连接的 containerd（或 CRI）daemon；stress 本身只是客户端加压工具，不启动 daemon。
-
-### 2.3 入口与分支逻辑
-
-`main.go` 解析 CLI 后分支：
-
-1. 若 `--metrics` 非空：先起 HTTP metrics 服务，再进入压测（`serve`）
-2. 若 `--cri`：走 `criTest`（CRI RuntimeService）
-3. 否则：走 `test`（containerd client API）
-
-另有子命令 `density`（`density.go`）：不按时长循环销毁，而是同时拉起 `--count` 个长跑容器，采样 shim 进程 PSS/RSS。
-
-公共准备：
-
-- namespace 固定为 `stress`（client）或 CRI label `pod.namespace=stress`
-- 压测前 `cleanup` / `criCleanup` 清掉同 namespace残留
-- `context.WithTimeout(..., Duration)`，SIGTERM/SIGINT 取消
-
-### 2.4 默认路径压测逻辑（client API）
-
-实现：`test()` + `ctrWorker`（`worker.go`）。
-
-**准备（不计吞吐分子）：**
-
-1. `containerd.New(address, WithDefaultRuntime(runtime))`
-2. `Pull(image, WithPullUnpack, WithPullSnapshotter(snapshotter))`
-3. 起 `Concurrency` 个 `ctrWorker` 共享同一 `Client` 与已拉取的 `Image`
-
-**每个 worker 的循环（`ctrWorker.run`）：**
-
-```
-while 未超时:
-    count++
-    id = "{workerId}-{count}"
-    t0 = now
-    runContainer(id)   # 见下
-    成功则 ct.UpdateSince(t0)   # 仅成功计入 metrics 计时
-    失败则 failures++（超时 Deadline 不记失败）
-```
-
-**单次生命周期（`runContainer`）：**
-
-1. `NewContainer(id, WithSnapshotter, WithNewSnapshot(id, image), WithNewSpec(ImageConfig + Username("games") + ProcessArgs("true")))`
-2. defer：`Delete(..., WithSnapshotCleanup)`
-3. `NewTask(..., NullIO)`，defer：`task.Delete(..., WithProcessKill)`
-4. `task.Wait` → `task.Start` → 阻塞等到 `true` 退出
-5. 返回后由 defer 清理 task/container/snapshot
-
-设计要点：进程固定为快速退出的 `true`，从而测的是「create → start → 等退出 → delete」整链，而非长驻业务负载；失败路径故意不计入耗时，避免失败过快抬高吞吐。
-
-**汇总（`run.gather`）：**
-
-- `Total` = 各 worker `count` 之和  
-- `ContainersPerSecond = Total / Seconds`  
-- `SecondsPerContainer = Seconds / Total`
-
-### 2.5 `--exec` 路径
-
-在默认 `ctrWorker` 之外，再起同等数量的 `execWorker`（`exec_worker.go`）：
-
-1. 每个 worker **先**创建一个长驻容器：`sleep 30d`
-2. 循环：`task.Exec(id, Process{Args: ["true"]}, NullIO)` → Wait → Start → 等退出 → Delete process
-3. 成功记入 `execTimer`；结果里额外输出 `ExecTotal` / `ExecFailures`
-
-即：生命周期 worker 与 exec worker **并行**加压，exec 测的是已运行 task 上的二次进程创建开销。
-
-### 2.6 `--cri` 路径（结合代码）
-
-指定 `--cri` 时，压的不是 client API 的 `NewContainer`，而是 **CRI `RunPodSandbox` → Stop → Remove**。实现：`criTest()`（`main.go`）+ `criWorker`（`cri_worker.go`）。
-
-#### 2.6.1 入口分支
-
-`main` 中为 CLI App 设置 `Action`；解析到 `CRI=true` 后调用 `criTest`，不再走默认 `test()`：
+**1）CLI 分支** — `func main()` 里设置 `app.Action`：
 
 ```go
 // cmd/containerd-stress/main.go
 func main() {
     app := cli.NewApp()
-    // ... Flag 定义省略 ...
+    // ... Flag 省略 ...
     app.Action = func(cliContext *cli.Context) error {
-        config := config{
-            Address:     cliContext.String("address"),
-            Duration:    cliContext.Duration("duration"),
-            Concurrency: cliContext.Int("concurrent"),
-            CRI:         cliContext.Bool("cri"),
-            Runtime:     cliContext.String("runtime"),
-            Snapshotter: cliContext.String("snapshotter"),
-            // Image 也会解析，但 criTest 路径不使用
-        }
+        config := config{ /* address/duration/concurrent/cri/runtime/... */ }
         if config.Metrics != "" {
-            return serve(config)
+            return serve(config) // 先起 metrics，内部仍走 criTest 或 test
         }
         if config.CRI {
             return criTest(config)
         }
         return test(config)
     }
-    // app.Run(os.Args) ...
 }
 ```
 
-#### 2.6.2 `criTest`：连 CRI、清理、起并发 worker
+`density` 注册在 `app.Commands`，不走上述 Action。
 
-```go
-// cmd/containerd-stress/main.go
-func criTest(c config) error {
-    var (
-        timeout = 1 * time.Minute
-        wg      sync.WaitGroup
-        ctx     = namespaces.WithNamespace(context.Background(), stressNs)
-    )
-    client, err := remote.NewRuntimeService(c.Address, timeout) // CRI RuntimeService，非 containerd.New
-    if err != nil {
-        return err
-    }
-    defer client.Close(context.Background())
+**2）统一加压模型**
 
-    if err := criCleanup(ctx, client); err != nil {
-        return err
-    }
-    tctx, cancel := context.WithTimeout(ctx, c.Duration) // -d 限时；SIGINT/SIGTERM → cancel
-    // ... signal.Notify → cancel ...
-
-    var (
-        workers []worker
-        r       = &run{}
-    )
-    for i := 0; i < c.Concurrency; i++ { // -c 个 worker
-        wg.Add(1)
-        w := &criWorker{
-            id:             i,
-            wg:             &wg,
-            client:         client,
-            runtimeHandler: c.Runtime,     // CLI --runtime → CRI handler 名
-            snapshotter:    c.Snapshotter, // 赋了值，runSandbox 未使用
-        }
-        workers = append(workers, w)
-    }
-    r.start()
-    for _, w := range workers {
-        go w.run(ctx, tctx)
-    }
-    wg.Wait()
-    r.end()
-    results := r.gather(workers) // 算 containers/sec
-    // ... 打印 / JSON ...
-    return nil
-}
+```text
+cleanup
+  →（client 路径：Pull 一次镜像）
+  → 起 N=Concurrency 个 worker（共享 client）
+  → 每 worker：while 未超时 { 做一次负载；成功才记耗时 }
+  → gather → Total / failures / containersPerSecond
 ```
 
-压测前清理只处理带 stress 标签的沙箱：
+**3）计时约定**  
+`start := time.Now()` → 调用单次负载函数（**含其中 defer 清理**）→ 成功则 `UpdateSince`；失败通常不记耗时（避免失败过快抬高吞吐观感）。纯 `DeadlineExceeded` 一般不记 failure。
 
-```go
-// cmd/containerd-stress/cri_worker.go
-func criCleanup(ctx context.Context, client *remote.RuntimeService) error {
-    filter := &runtime.PodSandboxFilter{
-        LabelSelector: map[string]string{podNamespaceLabel: stressNs}, // "stress"
-    }
-    sandboxes, err := client.ListPodSandbox(filter)
-    if err != nil {
-        return err
-    }
-    for _, sb := range sandboxes {
-        if err := client.StopPodSandbox(sb.Id); err != nil {
-            return err
-        }
-        if err := client.RemovePodSandbox(sb.Id); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-#### 2.6.3 worker 循环：限时内反复 `runSandbox`
-
-```go
-// cmd/containerd-stress/cri_worker.go
-func (w *criWorker) run(ctx, tctx context.Context) {
-    defer func() {
-        w.wg.Done()
-        log.L.Infof("worker %d finished", w.id)
-    }()
-    for {
-        select {
-        case <-tctx.Done():
-            return
-        default:
-        }
-        w.count++
-        id := w.getID() // "{workerId}-{count}"
-        start := time.Now()
-        if err := w.runSandbox(tctx, ctx, id); err != nil {
-            // 非纯超时失败 → failures++、errCounter
-            continue
-        }
-        // 仅成功计入耗时，避免失败过快抬高吞吐观感
-        ct.WithValues(w.commit).UpdateSince(start)
-    }
-}
-```
-
-一次成功样本的计时范围 = **整次 `runSandbox` 调用**（含函数返回前执行的 defer 清理）。
-
-#### 2.6.4 单次负载：`RunPodSandbox` + Stop + Remove
-
-```go
-// cmd/containerd-stress/cri_worker.go
-func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error) {
-    sbConfig := &runtime.PodSandboxConfig{
-        Metadata: &runtime.PodSandboxMetadata{
-            Name:      id,
-            Uid:       util.GenerateID(),
-            Namespace: "stress",
-        },
-        Labels: map[string]string{podNamespaceLabel: stressNs},
-        Linux:  &runtime.LinuxPodSandboxConfig{},
-    }
-
-    sb, err := w.client.RunPodSandbox(sbConfig, w.runtimeHandler)
-    if err != nil {
-        w.failures++
-        return err
-    }
-    defer func() {
-        w.client.StopPodSandbox(sb)
-        w.client.RemovePodSandbox(sb)
-    }()
-
-    // 后台 250ms ticker 调 PodSandboxStatus；不阻塞
-    // 条件写成 err != nil && READY，实际几乎不起等待作用
-    ticker := time.NewTicker(250 * time.Millisecond)
-    go func() { /* PodSandboxStatus 轮询；省略 */ }()
-
-    return nil // 立刻返回 → 触发上面的 Stop/Remove
-}
-```
-
-因此每次迭代打到 containerd CRI 的序列是：
-
-1. **`RunPodSandbox(sbConfig, runtimeHandler)`** — 创建 Pod 沙箱  
-2. **`StopPodSandbox`**  
-3. **`RemovePodSandbox`**  
-
-pause/sandbox 镜像来自 **daemon CRI 配置**（如 `sandbox = '…/pause:3.9'`），**不是** CLI `-i`。`--runtime` 必须是 `config.toml` 里 `runtimes.<name>` 的 **handler 名**（如 `runc`、`kata`），不是 `io.containerd.runc.v2`（除非 handler 就叫这个名字）。
-
-#### 2.6.5 结果汇总
+**4）汇总**
 
 ```go
 // cmd/containerd-stress/main.go
@@ -372,88 +111,293 @@ func (r *run) gather(workers []worker) *result {
 }
 ```
 
-| 参数（`--cri` 下） | 代码中的去向 |
-|--------------------|--------------|
-| `-c` | `criTest` 里 `Concurrency` 个 `criWorker` |
-| `-d` | `WithTimeout(..., Duration)` → `tctx` |
-| `-a` | `NewRuntimeService(c.Address, …)` |
-| `--runtime` | `criWorker.runtimeHandler` → `RunPodSandbox(..., handler)` |
-| `--snapshotter` | 写入 `criWorker.snapshotter`，**`runSandbox` 未使用** |
-| `-i` / `--image` | **`criTest` 未使用**；沙箱镜像由 CRI sandbox 配置决定 |
+---
 
-示例：
+### 2.3 默认路径（client API）
 
-```bash
-containerd-stress --cri \
-  -a /run/containerd/containerd.sock \
-  --runtime runc \
-  -c 4 -d 5m
+**目标：** 压 containerd **client API** 的短命容器全生命周期。
+
+**单次迭代：**
+
+```mermaid
+flowchart LR
+  subgraph iter["ctrWorker：循环直到 -d 超时"]
+    A[NewContainer<br/>snapshot + true] --> B[NewTask]
+    B --> C[Wait + Start]
+    C --> D[等 true 退出]
+    D --> E[Delete task/container/snapshot]
+  end
+  E -->|成功计时| A
 ```
 
-### 2.7 `density` 子命令
+**准备** — `func test(c config) error`：
 
-1. Pull + unpack（指定 snapshotter）
-2. 顺序创建 `count+1` 个容器，进程为 `sleep 120m`，全部 Start 并保持存活
-3. 对每个容器 task PID 找父进程（shim），读 `/proc/<shim>/smaps` 累加 `Rss` / `Pss`
-4. 输出 JSON：`pss`、`rss`、`pssPerContainer`、`rssPerContainer`
+```go
+// cmd/containerd-stress/main.go
+func test(c config) error {
+    ctx := namespaces.WithNamespace(context.Background(), "stress")
+    client, err := c.newClient() // WithDefaultRuntime(c.Runtime)
+    // cleanup(ctx, client)
+    image, err := client.Pull(ctx, c.Image,
+        containerd.WithPullUnpack,
+        containerd.WithPullSnapshotter(c.Snapshotter))
+    tctx, cancel := context.WithTimeout(ctx, c.Duration)
+    // 起 c.Concurrency 个 ctrWorker；若 c.Exec 再起同等数量 execWorker
+    // r.start(); go w.run(ctx, tctx); wg.Wait(); r.end(); gather
+    return nil
+}
+```
 
-测的是**同时存活**时的 shim 内存密度，不是吞吐循环。
+**Worker 循环** — `func (w *ctrWorker) run(ctx, tctx context.Context)`：
 
-### 2.8 `--runtime` 可配置选项
+```go
+// cmd/containerd-stress/worker.go
+func (w *ctrWorker) run(ctx, tctx context.Context) {
+    defer w.wg.Done()
+    for {
+        select {
+        case <-tctx.Done():
+            return
+        default:
+        }
+        w.count++
+        id := w.getID()
+        start := time.Now()
+        if err := w.runContainer(ctx, id); err != nil {
+            // 非纯超时 → failures++
+            continue
+        }
+        ct.WithValues(w.commit).UpdateSince(start) // 仅成功计时
+    }
+}
+```
 
-CLI 默认值来自 `plugins.RuntimeRuncV2`，即 **`io.containerd.runc.v2`**。
+**单次负载** — `func (w *ctrWorker) runContainer(ctx context.Context, id string) (err error)`：
 
-| 使用场景 | `--runtime` 含义 | 典型取值 |
-|----------|------------------|----------|
-| 默认 / client API（`test`） | 传给 `WithDefaultRuntime`，作为容器默认 OCI runtime 类型 | **`io.containerd.runc.v2`**（Linux 默认，见 `defaults.DefaultRuntime`） |
-| | Windows 对应常量 | **`io.containerd.runhcs.v1`**（`plugins.RuntimeRunhcsV1`） |
-| `--cri` | CRI **RuntimeHandler** 名称 | 须与 daemon `config.toml` 里 `[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.<name>]` 的 **`<name>`** 一致，例如常见配置：`runc`、`kata`、自定义 handler；空字符串则用 CRI 的 `default_runtime_name` |
+```go
+// cmd/containerd-stress/worker.go
+func (w *ctrWorker) runContainer(ctx context.Context, id string) (err error) {
+    c, err := w.client.NewContainer(ctx, id,
+        containerd.WithSnapshotter(w.snapshotter),
+        containerd.WithNewSnapshot(id, w.image),
+        containerd.WithNewSpec(
+            oci.WithImageConfig(w.image),
+            oci.WithUsername("games"),
+            oci.WithProcessArgs("true"), // 写死：快速退出
+        ),
+    )
+    defer c.Delete(ctx, containerd.WithSnapshotCleanup)
+    task, err := c.NewTask(ctx, cio.NullIO)
+    defer task.Delete(ctx, containerd.WithProcessKill)
+    statusC, err := task.Wait(ctx)
+    if err := task.Start(ctx); err != nil {
+        return err
+    }
+    status := <-statusC
+    _, _, err = status.Result()
+    return err
+}
+```
 
-说明：
+**计时边界：** 整次 `runContainer`（含 defer Delete）。  
+**参数：** `-a/-c/-d/-i/--runtime/--snapshotter` 生效。进程/`games` 写死 → **pause 镜像不能直接作 `-i`**（无 `true`、无 `games` 用户）。  
+**与其它模式差：** 走 client 而非 CRI；会 `Pull(-i)`。
 
-- client API 路径下，值必须是 containerd 已注册的 **runtime type**（shim 插件 ID）。仓库内内置常量主要是 `io.containerd.runc.v2` / `io.containerd.runhcs.v1`；第三方 shim（如 kata）需已安装并可被解析，才能用对应 type / 通过 CRI handler 间接指定。
-- CRI 路径下**不要**把 handler 名和 `runtime_type` 混淆：handler 是 map key；`runtime_type` 才是类似 `io.containerd.runc.v2` 的字段。
+---
 
-### 2.9 `--snapshotter` 可配置选项
+### 2.4 `--cri` 路径
 
-CLI 默认：**`overlayfs`**（与 Linux `defaults.DefaultSnapshotter` 一致）。
+**目标：** 压 **CRI** `RunPodSandbox` 全链路（含 Stop/Remove）。
 
-该字符串作为 snapshotter **插件 ID**，用于：
+**单次迭代：**
 
-- `Pull(..., WithPullSnapshotter(snapshotter))`
-- `NewContainer(..., WithSnapshotter(snapshotter), WithNewSnapshot(...))`
+```mermaid
+flowchart LR
+  subgraph iter["criWorker：循环直到 -d 超时"]
+    A[PodSandboxConfig] --> B[RunPodSandbox<br/>handler=--runtime]
+    B --> C[StopPodSandbox]
+    C --> D[RemovePodSandbox]
+  end
+  D -->|成功计时| A
+```
 
-仓库内 Linux 相关内置插件（`plugins/snapshots/*/plugin` 的 `ID`）：
+**入口** — `func criTest(c config) error`：
+
+```go
+// cmd/containerd-stress/main.go
+func criTest(c config) error {
+    client, err := remote.NewRuntimeService(c.Address, timeout) // CRI，非 containerd.New
+    if err := criCleanup(ctx, client); err != nil {
+        return err
+    }
+    tctx, cancel := context.WithTimeout(ctx, c.Duration)
+    for i := 0; i < c.Concurrency; i++ {
+        w := &criWorker{
+            runtimeHandler: c.Runtime, // --runtime = CRI handler 名
+            snapshotter:    c.Snapshotter, // 赋值但 runSandbox 未用
+            // ...
+        }
+        go w.run(ctx, tctx)
+    }
+    // wait + gather
+    return nil
+}
+```
+
+**清理** — `func criCleanup(ctx context.Context, client *remote.RuntimeService) error`：按 label `pod.namespace=stress` List → Stop → Remove。
+
+**Worker** — `func (w *criWorker) run(ctx, tctx context.Context)`：与默认相同的限时循环，调用 `runSandbox`，成功才 `UpdateSince`。
+
+**单次负载** — `func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error)`：
+
+```go
+// cmd/containerd-stress/cri_worker.go
+func (w *criWorker) runSandbox(tctx, ctx context.Context, id string) (err error) {
+    sbConfig := &runtime.PodSandboxConfig{
+        Metadata: &runtime.PodSandboxMetadata{
+            Name: id, Uid: util.GenerateID(), Namespace: "stress",
+        },
+        Labels: map[string]string{podNamespaceLabel: stressNs},
+        Linux:  &runtime.LinuxPodSandboxConfig{},
+    }
+    sb, err := w.client.RunPodSandbox(sbConfig, w.runtimeHandler)
+    if err != nil {
+        w.failures++
+        return err
+    }
+    defer func() {
+        w.client.StopPodSandbox(sb)
+        w.client.RemovePodSandbox(sb)
+    }()
+    // 后台 PodSandboxStatus ticker：不阻塞；条件几乎无效
+    go func() { /* ... */ }()
+    return nil // 立刻返回 → 触发 Stop/Remove
+}
+```
+
+**计时边界：** 整次 `runSandbox` ≈ RunPodSandbox + Stop + Remove。  
+**参数：** `-a/-c/-d/--runtime`（handler 名）生效；**`-i`、`--snapshotter` 不生效**。镜像 = CRI 配置的 sandbox（如 pause）。  
+**与默认差：** API 是 CRI；镜像不来自 `-i`；`--runtime` 是 handler 名不是 `io.containerd.runc.v2`。
+
+```bash
+containerd-stress --cri -a /run/containerd/containerd.sock --runtime runc -c 4 -d 5m
+```
+
+---
+
+### 2.5 `--exec` 路径
+
+**目标：** 在已运行 task 上压 **`Exec`**（仅非 CRI）。
+
+**单次迭代：**
+
+```mermaid
+flowchart LR
+  subgraph setup["每 worker 一次"]
+    S1[NewContainer sleep 30d] --> S2[NewTask + Start]
+  end
+  subgraph loop["循环直到超时"]
+    E1[Exec true] --> E2[Wait + Start]
+    E2 --> E3[等退出 + Delete process]
+  end
+  S2 --> E1
+  E3 -->|成功记 execTimer| E1
+```
+
+与 `ctrWorker` **并行**：`test()` 在起 N 个生命周期 worker 外，再起 N 个 `execWorker`。
+
+```go
+// cmd/containerd-stress/exec_worker.go
+func (w *execWorker) exec(ctx, tctx context.Context) {
+    // NewContainer(..., ProcessArgs("sleep","30d")) → NewTask → Start
+    // 循环：runExec → 成功则 execTimer.UpdateSince
+}
+
+func (w *execWorker) runExec(ctx context.Context, task containerd.Task, id string, spec *specs.Process) (err error) {
+    process, err := task.Exec(ctx, id, spec, cio.NullIO) // Args 已改为 true
+    defer process.Delete(ctx, containerd.WithProcessKill)
+    statusC, err := process.Wait(ctx)
+    if err := process.Start(ctx); err != nil {
+        return err
+    }
+    status := <-statusC
+    _, _, err = status.Result()
+    return err
+}
+```
+
+**计时：** 单次 `runExec`；结果额外 `ExecTotal` / `ExecFailures`。  
+**与默认差：** 测二次进程创建，不是反复建容器。
+
+---
+
+### 2.6 `density` 子命令
+
+**目标：** 测**同时存活**时的 shim 内存密度，不是吞吐循环。
+
+**流程：** Pull → 顺序创建 `count+1` 个 `sleep 120m` 并 Start → 对 task 父进程（shim）读 `/proc/<pid>/smaps` → JSON：`pss`/`rss` 及 per-container。
+
+入口为 `densityCommand` 的 `Action: func(cliContext *cli.Context) error`（`density.go`）。
+
+**与默认差：** 不循环销毁；输出内存指标而非 c/sec。
+
+```bash
+containerd-stress density --count 100
+```
+
+---
+
+### 2.7 编译方法
+
+源码：`cmd/containerd-stress/`。`Makefile` 将 `containerd-stress` 列入 `COMMANDS`，规则 `bin/%: cmd/%` 产出 `bin/containerd-stress`。
+
+```bash
+make bin/containerd-stress   # 推荐
+make binaries                # 同时编 ctr / containerd / containerd-stress
+make install                 # 安装到 $(DESTDIR)$(BINDIR)，默认常为 /usr/local/bin
+go build -o bin/containerd-stress ./cmd/containerd-stress  # 不经 Makefile
+```
+
+依赖：可用 Go 工具链（见 `BUILDING.md`）。运行前需已有可连接的 containerd/CRI daemon。
+
+---
+
+### 2.8 参数说明
+
+#### `--runtime`
+
+| 场景 | 含义 | 典型值 |
+|------|------|--------|
+| 默认 / `--exec` / `density` | OCI runtime type（`WithDefaultRuntime`） | `io.containerd.runc.v2`（默认）；Windows：`io.containerd.runhcs.v1` |
+| `--cri` | CRI **RuntimeHandler** 名（`runtimes.<name>` 的 key） | `runc`、`kata` 等；勿与 `runtime_type` 字段混淆 |
+
+#### `--snapshotter`
+
+默认 `overlayfs`。作为插件 ID，用于 client 路径的 `Pull` / `NewContainer`。
 
 | ID | 说明 |
 |----|------|
-| **`overlayfs`** | 默认；基于 overlay |
-| **`native`** | 目录拷贝式 |
-| **`devmapper`** | device-mapper thin-pool |
-| **`btrfs`** | btrfs |
-| **`erofs`** | EROFS |
-| **`blockfile`** | blockfile |
+| `overlayfs` | 默认 |
+| `native` | 目录拷贝 |
+| `devmapper` | thin-pool |
+| `btrfs` / `erofs` / `blockfile` | 对应实现 |
 
-另有平台相关：`windows`、`lcow` 等（非 Linux 主路径）。
+另有 `windows` / `lcow` 等。须已在 daemon 启用且环境就绪。**`--cri` 下本 flag 不参与 `runSandbox`。**
 
-选用前提：对应插件已在 daemon 中启用，且底层环境就绪（如 `devmapper` 需 thin-pool）。未启用或不存在时 Pull/NewContainer 会失败。
+#### 参数速查（是否生效）
 
-### 2.10 常用参数速查
-
-| 参数 | 含义 | 默认 |
-|------|------|------|
-| `-c` / `--concurrent` | worker 并发数 | 1 |
-| `-d` / `--duration` | 压测时长 | 1m |
-| `-a` / `--address` | containerd/CRI socket | 系统默认 socket |
-| `-i` / `--image` | 测试镜像 | `docker.io/library/alpine:latest` |
-| `--runtime` | 见 §2.8 | `io.containerd.runc.v2` |
-| `--snapshotter` | 见 §2.9 | `overlayfs` |
-| `--cri` | 走 CRI | false |
-| `--exec` | 额外 exec worker | false |
-| `-j` / `--json` | JSON 输出结果 | false |
-| `-m` / `--metrics` | metrics HTTP 监听地址 | 空 |
-
-示例：
+| 参数 | 默认 | density | `--exec` | `--cri` | 含义 |
+|------|------|---------|----------|---------|------|
+| `-c` | ✓ | — | ✓ | ✓ | 并发 worker 数（默认 1） |
+| `-d` | ✓ | — | ✓ | ✓ | 时长（默认 1m） |
+| `-a` | ✓ | ✓ | ✓ | ✓ | socket |
+| `-i` | ✓ | ✓ | ✓ | ✗ | 镜像（默认 alpine） |
+| `--runtime` | type | type | type | **handler** | 见上表 |
+| `--snapshotter` | ✓ | ✓ | ✓ | ✗ | 见上表 |
+| `--cri` | | | | ✓ | 走 CRI |
+| `--exec` | | | ✓ | ✗ | 额外 exec worker |
+| `-j` / `-m` | ✓ | ✓ | ✓ | ✓ | JSON / metrics 地址 |
+| `density --count` | | ✓ | | | 同时存活容器数 |
 
 ```bash
 containerd-stress -c 5 -d 120m
