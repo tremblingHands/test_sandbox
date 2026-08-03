@@ -589,9 +589,126 @@ containerd-stress density --count 100
 
 组件级 / 集成级 `testing.B` 基准，产出 ns/op、MB/s 等，用于热点优化与回归对比，**不是**长时间 daemon 加压。
 
+以下命令均在 containerd 源码根目录执行。`-run '^$'` / `-run Benchmark` 用于跳过普通单元测试；`-benchmem` 输出 allocs/op、B/op。
+
+#### `make benchmark`（局限）
+
 ```bash
 make benchmark
-# 等价于：go test … -bench . -run Benchmark -test.root
+# 等价于：go test ${TESTFLAGS} -bench . -run Benchmark -test.root
+```
+
+Makefile **未**传入 `${PACKAGES}` / `./...`，只测当前目录包（`.`）。§3.2–3.8 的基准都在子包，**不会**被 `make benchmark` 自动覆盖，需按包用下面的 `go test`。
+
+#### 客户端 Create / Start（§3.2）
+
+默认 `TestMain` 会起临时 daemon，需 root（`-test.root`）：
+
+```bash
+sudo go test -bench='BenchmarkContainer(Create|Start)' -benchmem -run '^$' -test.root ./integration/client/
+
+# 只跑其中一个
+sudo go test -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root ./integration/client/
+sudo go test -bench=BenchmarkContainerStart  -benchmem -run '^$' -test.root ./integration/client/
+```
+
+连已有 daemon（不自启）：
+
+```bash
+sudo go test -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root \
+  -no-daemon -address /run/containerd/containerd.sock ./integration/client/
+```
+
+镜像默认 BusyBox，需能 `GetImage`（自启路径会先 Pull）。
+
+#### Snapshotter 套件（§3.3）
+
+必须传 root 目录，否则 `Skip`；overlay/native 实际要 mount，建议 root：
+
+```bash
+sudo go test -bench=BenchmarkOverlay -benchmem -run '^$' \
+  ./core/snapshots/benchsuite/ -overlay.rootPath=/tmp/ovl-bench
+
+sudo go test -bench=BenchmarkNative -benchmem -run '^$' \
+  ./core/snapshots/benchsuite/ -native.rootPath=/tmp/native-bench
+
+# device mapper（需预先准备 thin-pool）
+sudo go test -bench=BenchmarkDeviceMapper -benchmem -run '^$' \
+  ./core/snapshots/benchsuite/ \
+  -dm.thinPoolDev=<pool名> -dm.rootPath=/tmp/dm-bench
+```
+
+#### MetaStore / BoltDB（§3.4）
+
+一般不需 root：
+
+```bash
+go test -bench=BenchmarkSuite -benchmem -run '^$' ./core/snapshots/storage/
+
+# 只跑某个子项，例如 CreateActive
+go test -bench='BenchmarkSuite/BoltDBBench/CreateActive' -benchmem -run '^$' ./core/snapshots/storage/
+```
+
+#### Content ingest（§3.5）
+
+```bash
+go test -bench=BenchmarkIngests -benchmem -run '^$' ./plugins/content/local/
+
+# 指定大小子基准（名称是字节数）
+go test -bench='BenchmarkIngests/1024' -benchmem -run '^$' ./plugins/content/local/      # 1KiB
+go test -bench='BenchmarkIngests/1048576' -benchmem -run '^$' ./plugins/content/local/   # 1MiB
+```
+
+#### 解压（§3.6）
+
+需能访问样本 URL（`https://git.io/fADcl`）：
+
+```bash
+go test -bench=BenchmarkDecompression -benchmem -run '^$' ./pkg/archive/compression/
+
+# 例如只跑 64MiB 的 zstd
+go test -bench='BenchmarkDecompression/size=64MiB/zstd' -benchmem -run '^$' ./pkg/archive/compression/
+```
+
+#### 元数据 GC（§3.7）
+
+```bash
+go test -bench=BenchmarkGarbageCollect -benchmem -run '^$' ./core/metadata/
+
+go test -bench='BenchmarkGarbageCollect/100-Sets' -benchmem -run '^$' ./core/metadata/
+```
+
+#### 其它（§3.8）
+
+```bash
+go test -bench=BenchmarkTricolor -benchmem -run '^$' ./pkg/gc/
+
+go test -bench='BenchmarkUnpackWithChainID'  -benchmem -run '^$' ./core/unpack/
+go test -bench='BenchmarkUnpackWithChainIDs' -benchmem -run '^$' ./core/unpack/
+
+# userns FD（Linux；一般不需 -test.root）
+go test -bench='BenchmarkBatchRunGetUsernsFD' -benchmem -run '^$' ./core/mount/
+
+# overlay 探测（需 root + mkfs.ext4/xfs/fat + loop）
+sudo go test -bench='BenchmarkOverlay' -benchmem -run '^$' -test.root \
+  ./plugins/snapshots/overlay/overlayutils/
+```
+
+#### 常用附加参数
+
+| 参数 | 作用 |
+|------|------|
+| `-benchtime=3s` / `-benchtime=100x` | 控制每基准时长或次数 |
+| `-count=5` | 重复跑，便于对比 |
+| `-cpu=1,4` | 多 GOMAXPROCS |
+| `-benchmem` | 输出 allocs/op、B/op |
+
+对比两次结果可用 `benchstat`：
+
+```bash
+go test -bench=BenchmarkGarbageCollect -count=5 -run '^$' ./core/metadata/ | tee old.txt
+# …改代码后再跑…
+benchstat old.txt new.txt
 ```
 
 ### 3.2 客户端集成：`integration/client/benchmark_test.go`
@@ -683,10 +800,13 @@ make benchmark
 
 ### 3.9 示例
 
+完整按包跑法见 §3.1。速查：
+
 ```bash
-go test -bench=. -benchmem ./integration/client/
-go test -bench=. ./core/snapshots/benchsuite/ -overlay.rootPath=/tmp/ovl
-go test -bench=BenchmarkGarbageCollect ./core/metadata/
+sudo go test -bench=. -benchmem -run '^$' -test.root ./integration/client/
+sudo go test -bench=BenchmarkOverlay -benchmem -run '^$' \
+  ./core/snapshots/benchsuite/ -overlay.rootPath=/tmp/ovl
+go test -bench=BenchmarkGarbageCollect -benchmem -run '^$' ./core/metadata/
 ```
 
 ---
