@@ -1686,8 +1686,9 @@ check_crictl_config() {
         fi
     else
         # 强制写入：已有文件也会覆盖 timeout / endpoint，避免历史 5s/10s 残留
+        # 注意：勿用 `cat | tee <<EOF`——heredoc 会接到 tee，交互式终端下 cat 会一直等 stdin
         echo "  写入 crictl 配置 (timeout=${expected_timeout}s)..."
-        cat | sudo tee "$config_file" > /dev/null <<EOF
+        sudo tee "$config_file" > /dev/null <<EOF
 runtime-endpoint: ${expected_endpoint}
 image-endpoint: ${expected_endpoint}
 timeout: ${expected_timeout}
@@ -1761,7 +1762,8 @@ check_registry_mirror() {
         fi
 
         sudo mkdir -p "$(dirname "$hosts_file")"
-        cat | sudo tee "$hosts_file" > /dev/null <<TOML
+        # 勿用 `cat | tee <<TOML`：交互式终端下会卡住（见 check_crictl_config）
+        sudo tee "$hosts_file" > /dev/null <<TOML
 server = "https://registry.k8s.io"
 
 [host."https://registry.aliyuncs.com/google_containers"]

@@ -42,6 +42,10 @@
 #     - scripts/bench/single_cold_start.py 可用
 #     - scripts/setup/setup.sh 已执行
 #
+# 清理:
+#     pre/post 先 crictl rmp，再 scripts/bench/cleanup_orphans.sh（杀孤儿 shim/VM）。
+#     SKIP_ORPHAN_CLEANUP=1 可跳过孤儿清理。
+#
 
 set -euo pipefail
 
@@ -218,6 +222,9 @@ mkdir -p "$RESULT_DIR"
 CLEANUP_ROUNDS="${CLEANUP_ROUNDS:-8}"
 CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-60s}"
 CLEANUP_SLEEP="${CLEANUP_SLEEP:-2}"
+# 是否在 rmp 后再清脱离 CRI 的 shim/VM 孤儿（默认开；SKIP_ORPHAN_CLEANUP=1 关闭）
+SKIP_ORPHAN_CLEANUP="${SKIP_ORPHAN_CLEANUP:-0}"
+ORPHAN_CLEANUP_SH="${SCRIPT_DIR}/cleanup_orphans.sh"
 
 pod_count() {
     crictl -t "$CLEANUP_TIMEOUT" pods -q 2>/dev/null | grep -c . || true
@@ -234,39 +241,66 @@ cleanup_all_pods() {
     echo "[${label}] pod 残留: ${remain}（最多 ${CLEANUP_ROUNDS} 轮, -t ${CLEANUP_TIMEOUT}; 明细 → ${logfile}）"
 
     if [ "${remain:-0}" -eq 0 ]; then
-        echo "[${label}] 无需清理"
-        return 0
+        echo "[${label}] crictl pods=0，跳过 rmp"
+    else
+        while [ "$round" -le "$CLEANUP_ROUNDS" ]; do
+            remain=$(pod_count)
+            if [ "${remain:-0}" -eq 0 ]; then
+                echo "[${label}] 第 ${round} 轮前已清零"
+                break
+            fi
+            echo "[${label}] 第 ${round}/${CLEANUP_ROUNDS} 轮: 残留 ${remain}，rmp -a -f ..."
+            {
+                echo "===== round ${round} $(date '+%Y-%m-%d %H:%M:%S') remain=${remain} ====="
+                if ! crictl -t "$CLEANUP_TIMEOUT" rmp -a -f; then
+                    crictl -t "$CLEANUP_TIMEOUT" rmp --all --force || true
+                fi
+            } >>"$logfile" 2>&1
+            sleep "$CLEANUP_SLEEP"
+            remain=$(pod_count)
+            echo "[${label}] 第 ${round} 轮后残留: ${remain}"
+            if [ "${remain:-0}" -eq 0 ]; then
+                break
+            fi
+            round=$((round + 1))
+        done
+
+        remain=$(pod_count)
+        if [ "${remain:-0}" -eq 0 ]; then
+            echo "[${label}] crictl 清理完成（0 pods）"
+        else
+            echo "[${label}] 仍有 ${remain} 个 pod（见 ${logfile}；可手动: crictl -t ${CLEANUP_TIMEOUT} rmp -a -f）"
+        fi
     fi
 
-    while [ "$round" -le "$CLEANUP_ROUNDS" ]; do
-        remain=$(pod_count)
-        if [ "${remain:-0}" -eq 0 ]; then
-            echo "[${label}] 第 ${round} 轮前已清零"
-            break
-        fi
-        echo "[${label}] 第 ${round}/${CLEANUP_ROUNDS} 轮: 残留 ${remain}，rmp -a -f ..."
-        {
-            echo "===== round ${round} $(date '+%Y-%m-%d %H:%M:%S') remain=${remain} ====="
-            if ! crictl -t "$CLEANUP_TIMEOUT" rmp -a -f; then
-                crictl -t "$CLEANUP_TIMEOUT" rmp --all --force || true
-            fi
-        } >>"$logfile" 2>&1
-        sleep "$CLEANUP_SLEEP"
-        remain=$(pod_count)
-        echo "[${label}] 第 ${round} 轮后残留: ${remain}"
-        if [ "${remain:-0}" -eq 0 ]; then
-            break
-        fi
-        round=$((round + 1))
-    done
+    # rmp 之后仍可能有 Case B 孤儿（runp 超时已起 VM，但从未进 CRI store）
+    local orphan_rc=0
+    cleanup_orphan_procs "$label" || orphan_rc=$?
 
     remain=$(pod_count)
-    if [ "${remain:-0}" -eq 0 ]; then
-        echo "[${label}] 清理完成（0 残留）"
+    if [ "${remain:-0}" -ne 0 ]; then
+        return 1
+    fi
+    return "$orphan_rc"
+}
+
+# 杀脱离 CRI 的 shim / hypervisor，并以 pgrep 归零为成功标准
+cleanup_orphan_procs() {
+    local label="$1"
+    local logfile="${RESULT_DIR}/cleanup_orphans_${label}.log"
+
+    if [ "$SKIP_ORPHAN_CLEANUP" = "1" ]; then
+        echo "[${label}] 跳过孤儿清理（SKIP_ORPHAN_CLEANUP=1）"
         return 0
     fi
-    echo "[${label}] 仍有 ${remain} 个残留（见 ${logfile}；可手动: crictl -t ${CLEANUP_TIMEOUT} rmp -a -f）"
-    return 1
+    if [ ! -x "$ORPHAN_CLEANUP_SH" ] && [ ! -f "$ORPHAN_CLEANUP_SH" ]; then
+        echo "[${label}] 未找到 ${ORPHAN_CLEANUP_SH}，跳过孤儿清理"
+        return 0
+    fi
+
+    echo "[${label}] 清理 kata 孤儿进程/目录（明细 → ${logfile}）..."
+    CLEANUP_TIMEOUT="$CLEANUP_TIMEOUT" CLEANUP_ROUNDS=2 \
+        bash "$ORPHAN_CLEANUP_SH" --kill --log "$logfile"
 }
 
 # pprof 时长: 优先用户指定的，否则与 test duration 对齐
@@ -720,6 +754,7 @@ else:
 # 各 worker 带 --no-batch-cleanup，运行中除非透传 --cleanup，否则沙箱会堆积。
 # 单次 crictl rmp -fa 在高负载下常 DeadlineExceeded，且默认连接超时仅 ~2s，
 # 需加长 -t 并多次重试。rmp 明细写入结果目录日志，避免刷串口。
+# rmp 之后会再跑 cleanup_orphans.sh：杀脱离 CRI 的 shim/VM（Case B）。
 # ============================================================
 echo ""
 cleanup_all_pods post || true
