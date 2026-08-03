@@ -7,11 +7,11 @@
 | 类别 | 工具 | 定位 |
 |------|------|------|
 | 端到端加压 | `containerd-stress`（`cmd/containerd-stress`） | 对运行中 daemon 做并发生命周期加压 |
-| 组件微基准 | `make benchmark` / `go test -bench` | Create/Start、snapshot、GC 等热点 |
+| 组件微基准 | `go test -bench` | Create/Start、snapshot、GC 等热点 |
 | Snapshotter 环境 | `contrib/aws/snapshotter_bench_*` | 在 AWS 上跑 snapshotter benchsuite |
 | 外部（文档推荐） | [bucketbench](https://github.com/estesp/bucketbench) | 跨引擎生命周期对比，偏逐步耗时统计 |
 
-`containerd-stress` 详见 §2（编译见 §2.7）；`make benchmark` 跑 Go 微基准（§3）。
+`containerd-stress` 详见 §2（编译见 §2.7）；Go 微基准详见 §3。
 
 ---
 
@@ -583,22 +583,27 @@ containerd-stress density --count 100
 
 ---
 
-## 3. Go 微基准（`make benchmark`）
+## 3. Go 微基准（`go test -bench`）
+
+组件级 / 集成级 `testing.B` 基准，产出 ns/op、MB/s 等，用于热点优化与回归对比，**不是**长时间 daemon 加压。按包跑法见 §3.1；机制细节见 §3.2–3.8。
+
+| 场景 | 基准 | 位置 | 说明 |
+|------|------|------|------|
+| 空容器 + 根快照创建 | `BenchmarkContainerCreate` | `integration/client` | 计时 NewContainer + snapshot，不含 Task/Start |
+| 已有容器的 task 启动 | `BenchmarkContainerStart` | `integration/client` | 计时外先 Create，计时内 NewTask→Start |
+| Snapshotter 多层增删改 | `BenchmarkNative` / `Overlay` / `DeviceMapper` | `core/snapshots/benchsuite` | 16 层 Prepare/写/Commit，对比各 snapshotter |
+| Snapshot 元数据（BoltDB） | `BenchmarkSuite`（Stat/Create/Remove/Commit/…） | `core/snapshots/storage` | 只压 MetaStore，不走真实 FS 层 |
+| Content store 写入 | `BenchmarkIngests` | `plugins/content/local` | 1KiB–1MiB blob 写入吞吐 |
+| 镜像层解压 | `BenchmarkDecompression` | `pkg/archive/compression` | gzip/zstd（及可选 igzip/unpigz）在 32–256MiB 上的吞吐 |
+| 元数据 GC 全量扫描 | `BenchmarkGarbageCollect` | `core/metadata` | 随对象规模（10–10000 Sets）的 GC 耗时 |
+| GC 图算法 | `BenchmarkTricolor` | `pkg/gc` | 三色标记本身，不经 metadata |
+| Unpack chainID 计算 | `BenchmarkUnpackWithChainID(s)` | `core/unpack` | 旧逐层 ChainID vs 新一次 ChainIDs |
+| idmapped userns FD | `BenchmarkBatchRunGetUsernsFD_Concurrent{1,10}` | `core/mount` | 并发获取 userns FD |
+| Overlay 文件系统探测 | `BenchmarkOverlaySupportedOn*` | `overlayutils` | 临时 mkfs（ext4/XFS/FAT）上探测是否支持 overlay |
 
 ### 3.1 用途与跑法
 
-组件级 / 集成级 `testing.B` 基准，产出 ns/op、MB/s 等，用于热点优化与回归对比，**不是**长时间 daemon 加压。
-
-以下命令均在 containerd 源码根目录执行。`-run '^$'` / `-run Benchmark` 用于跳过普通单元测试；`-benchmem` 输出 allocs/op、B/op。
-
-#### `make benchmark`（局限）
-
-```bash
-make benchmark
-# 等价于：go test ${TESTFLAGS} -bench . -run Benchmark -test.root
-```
-
-Makefile **未**传入 `${PACKAGES}` / `./...`，只测当前目录包（`.`）。§3.2–3.8 的基准都在子包，**不会**被 `make benchmark` 自动覆盖，需按包用下面的 `go test`。
+以下命令均在 containerd 源码根目录执行。`-run '^$'` / `-run Benchmark` 用于跳过普通单元测试；`-benchmem` 输出 allocs/op、B/op。基准分散在各子包，需按包跑下面的 `go test`。
 
 #### 客户端 Create / Start（§3.2）
 
