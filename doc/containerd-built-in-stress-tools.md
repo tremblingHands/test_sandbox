@@ -605,41 +605,44 @@ containerd-stress density --count 100
 
 以下命令均在 containerd 源码根目录执行。`-run '^$'` / `-run Benchmark` 用于跳过普通单元测试；`-benchmem` 输出 allocs/op、B/op。基准分散在各子包，需按包跑下面的 `go test`。
 
+**写法约定：** 包路径放在 `go test` 之后、自定义 flag 之前（或对布尔 flag 写 `-test.root=true`）。若写成 `-test.root ./integration/client/`，`go test` 可能把包路径当成 flag 值，变成只测根目录（`no Go files`）。已是 root 时可去掉 `sudo`。
+
 #### 客户端 Create / Start（§3.2）
 
 默认 `TestMain` 会起临时 daemon，需 root（`-test.root`）：
 
 ```bash
-sudo go test -bench='BenchmarkContainer(Create|Start)' -benchmem -run '^$' -test.root ./integration/client/
+sudo go test ./integration/client/ -bench='BenchmarkContainer(Create|Start)' -benchmem -run '^$' -test.root
 
 # 只跑其中一个
-sudo go test -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root ./integration/client/
-sudo go test -bench=BenchmarkContainerStart  -benchmem -run '^$' -test.root ./integration/client/
+sudo go test ./integration/client/ -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root
+sudo go test ./integration/client/ -bench=BenchmarkContainerStart  -benchmem -run '^$' -test.root
 ```
 
 连已有 daemon（不自启）：
 
 ```bash
-sudo go test -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root \
-  -no-daemon -address /run/containerd/containerd.sock ./integration/client/
+sudo go test ./integration/client/ -bench=BenchmarkContainerCreate -benchmem -run '^$' -test.root \
+  -no-daemon -address /run/containerd/containerd.sock
 ```
 
 镜像默认 BusyBox，需能 `GetImage`（自启路径会先 Pull）。
+
+**已知问题：** 基准在 `NewContainer` 前用 `GenerateSpec(..., WithImageConfig, withTrue())`，容器尚无 snapshot/`Root.Path` 时会报 `rootfs absolute path is required` 并 FAIL（正常集成测试走 `WithNewSpec`，在建 snapshot 之后才解析镜像用户）。当前上游基准本身如此，不一定是环境问题。
 
 #### Snapshotter 套件（§3.3）
 
 必须传 root 目录，否则 `Skip`；overlay/native 实际要 mount，建议 root：
 
 ```bash
-sudo go test -bench=BenchmarkOverlay -benchmem -run '^$' \
-  ./core/snapshots/benchsuite/ -overlay.rootPath=/tmp/ovl-bench
+sudo go test ./core/snapshots/benchsuite/ -bench=BenchmarkOverlay -benchmem -run '^$' \
+  -overlay.rootPath=/tmp/ovl-bench
 
-sudo go test -bench=BenchmarkNative -benchmem -run '^$' \
-  ./core/snapshots/benchsuite/ -native.rootPath=/tmp/native-bench
+sudo go test ./core/snapshots/benchsuite/ -bench=BenchmarkNative -benchmem -run '^$' \
+  -native.rootPath=/tmp/native-bench
 
-# device mapper（需预先准备 thin-pool）
-sudo go test -bench=BenchmarkDeviceMapper -benchmem -run '^$' \
-  ./core/snapshots/benchsuite/ \
+# device mapper（需预先准备 thin-pool；未传 flag 会 Skip）
+sudo go test ./core/snapshots/benchsuite/ -bench=BenchmarkDeviceMapper -benchmem -run '^$' \
   -dm.thinPoolDev=<pool名> -dm.rootPath=/tmp/dm-bench
 ```
 
@@ -648,55 +651,54 @@ sudo go test -bench=BenchmarkDeviceMapper -benchmem -run '^$' \
 一般不需 root：
 
 ```bash
-go test -bench=BenchmarkSuite -benchmem -run '^$' ./core/snapshots/storage/
+go test ./core/snapshots/storage/ -bench=BenchmarkSuite -benchmem -run '^$'
 
 # 只跑某个子项，例如 CreateActive
-go test -bench='BenchmarkSuite/BoltDBBench/CreateActive' -benchmem -run '^$' ./core/snapshots/storage/
+go test ./core/snapshots/storage/ -bench='BenchmarkSuite/BoltDBBench/CreateActive' -benchmem -run '^$'
 ```
 
 #### Content ingest（§3.5）
 
 ```bash
-go test -bench=BenchmarkIngests -benchmem -run '^$' ./plugins/content/local/
+go test ./plugins/content/local/ -bench=BenchmarkIngests -benchmem -run '^$'
 
 # 指定大小子基准（名称是字节数）
-go test -bench='BenchmarkIngests/1024' -benchmem -run '^$' ./plugins/content/local/      # 1KiB
-go test -bench='BenchmarkIngests/1048576' -benchmem -run '^$' ./plugins/content/local/   # 1MiB
+go test ./plugins/content/local/ -bench='BenchmarkIngests/1024' -benchmem -run '^$'      # 1KiB
+go test ./plugins/content/local/ -bench='BenchmarkIngests/1048576' -benchmem -run '^$'   # 1MiB
 ```
 
 #### 解压（§3.6）
 
-需能访问样本 URL（`https://git.io/fADcl`）：
+源码写死样本 URL `https://git.io/fADcl`（git.io 短链，可能超时或不可达）。原始数据在 [gist](https://gist.github.com/mxpv/d9c87748d729afc915adecfecce101b0) 的 `test.json`；短链不通时可临时改 `benchmarkTestDataURL` 指向可下载地址再跑。
 
 ```bash
-go test -bench=BenchmarkDecompression -benchmem -run '^$' ./pkg/archive/compression/
+go test ./pkg/archive/compression/ -bench=BenchmarkDecompression -benchmem -run '^$'
 
 # 例如只跑 64MiB 的 zstd
-go test -bench='BenchmarkDecompression/size=64MiB/zstd' -benchmem -run '^$' ./pkg/archive/compression/
+go test ./pkg/archive/compression/ -bench='BenchmarkDecompression/size=64MiB/zstd' -benchmem -run '^$'
 ```
 
 #### 元数据 GC（§3.7）
 
 ```bash
-go test -bench=BenchmarkGarbageCollect -benchmem -run '^$' ./core/metadata/
+go test ./core/metadata/ -bench=BenchmarkGarbageCollect -benchmem -run '^$'
 
-go test -bench='BenchmarkGarbageCollect/100-Sets' -benchmem -run '^$' ./core/metadata/
+go test ./core/metadata/ -bench='BenchmarkGarbageCollect/100-Sets' -benchmem -run '^$'
 ```
 
 #### 其它（§3.8）
 
 ```bash
-go test -bench=BenchmarkTricolor -benchmem -run '^$' ./pkg/gc/
+go test ./pkg/gc/ -bench=BenchmarkTricolor -benchmem -run '^$'
 
-go test -bench='BenchmarkUnpackWithChainID'  -benchmem -run '^$' ./core/unpack/
-go test -bench='BenchmarkUnpackWithChainIDs' -benchmem -run '^$' ./core/unpack/
+go test ./core/unpack/ -bench='BenchmarkUnpackWithChainID'  -benchmem -run '^$'
+go test ./core/unpack/ -bench='BenchmarkUnpackWithChainIDs' -benchmem -run '^$'
 
 # userns FD（Linux；一般不需 -test.root）
-go test -bench='BenchmarkBatchRunGetUsernsFD' -benchmem -run '^$' ./core/mount/
+go test ./core/mount/ -bench='BenchmarkBatchRunGetUsernsFD' -benchmem -run '^$'
 
 # overlay 探测（需 root + mkfs.ext4/xfs/fat + loop）
-sudo go test -bench='BenchmarkOverlay' -benchmem -run '^$' -test.root \
-  ./plugins/snapshots/overlay/overlayutils/
+sudo go test ./plugins/snapshots/overlay/overlayutils/ -bench='BenchmarkOverlay' -benchmem -run '^$' -test.root
 ```
 
 #### 常用附加参数
@@ -711,7 +713,7 @@ sudo go test -bench='BenchmarkOverlay' -benchmem -run '^$' -test.root \
 对比两次结果可用 `benchstat`：
 
 ```bash
-go test -bench=BenchmarkGarbageCollect -count=5 -run '^$' ./core/metadata/ | tee old.txt
+go test ./core/metadata/ -bench=BenchmarkGarbageCollect -count=5 -run '^$' | tee old.txt
 # …改代码后再跑…
 benchstat old.txt new.txt
 ```
@@ -805,13 +807,13 @@ benchstat old.txt new.txt
 
 ### 3.9 示例
 
-完整按包跑法见 §3.1。速查：
+完整按包跑法见 §3.1。速查（包路径在前）：
 
 ```bash
-sudo go test -bench=. -benchmem -run '^$' -test.root ./integration/client/
-sudo go test -bench=BenchmarkOverlay -benchmem -run '^$' \
-  ./core/snapshots/benchsuite/ -overlay.rootPath=/tmp/ovl
-go test -bench=BenchmarkGarbageCollect -benchmem -run '^$' ./core/metadata/
+sudo go test ./integration/client/ -bench=. -benchmem -run '^$' -test.root
+sudo go test ./core/snapshots/benchsuite/ -bench=BenchmarkOverlay -benchmem -run '^$' \
+  -overlay.rootPath=/tmp/ovl
+go test ./core/metadata/ -bench=BenchmarkGarbageCollect -benchmem -run '^$'
 ```
 
 ---
