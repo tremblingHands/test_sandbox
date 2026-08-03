@@ -464,7 +464,15 @@ containerd-stress --cri -a /run/containerd/containerd.sock --runtime runc -c 4 -
 
 **关系：** 不是第三条主路径。入口仍是 §2.3 的 `test()`；本节展开其中的 `if c.Exec { ... go exec.exec }`——在已有 N 个 `ctrWorker` 之外再并行 +N 个 `execWorker`。与 `--cri` 互斥（`criTest` 内无此分支）。
 
-**目标：** 在已运行 task 上压 **`Exec`**（仅非 CRI）。
+**目标：** 在已运行 task 上压 **`Exec`**（仅非 CRI / client API）。
+
+**用法示例：**
+
+```bash
+containerd-stress --exec -a /run/containerd/containerd.sock -c 4 -d 5m -i docker.io/library/alpine:latest
+```
+
+`-c N` → N 个 `ctrWorker`（默认生命周期）+ N 个 `execWorker`。镜像需有 `sleep`/`true` 且含用户 `games`（默认 alpine 一般可用；pause 不行）。
 
 **单次迭代：**
 
@@ -481,28 +489,165 @@ flowchart LR
   E3 -->|成功记 execTimer| E1
 ```
 
+**编排侧（`test()` 内附加 exec worker）** — 完整片段：
+
 ```go
-// cmd/containerd-stress/exec_worker.go
-func (w *execWorker) exec(ctx, tctx context.Context) {
-    // NewContainer(..., ProcessArgs("sleep","30d")) → NewTask → Start
-    // 循环：runExec → 成功则 execTimer.UpdateSince
+// cmd/containerd-stress/main.go — test() 中 if c.Exec 分支
+var exec *execWorker
+if c.Exec {
+	for i := c.Concurrency; i < c.Concurrency+c.Concurrency; i++ {
+		wg.Add(1)
+		exec = &execWorker{
+			ctrWorker: ctrWorker{
+				id:          i,
+				wg:          &wg,
+				image:       image,
+				client:      client,
+				commit:      v.Revision,
+				snapshotter: c.Snapshotter,
+			},
+		}
+		go exec.exec(ctx, tctx) // 立刻启动；不进入 workers 切片
+	}
 }
 
-func (w *execWorker) runExec(ctx context.Context, task containerd.Task, id string, spec *specs.Process) (err error) {
-    process, err := task.Exec(ctx, id, spec, cio.NullIO) // Args 已改为 true
-    defer process.Delete(ctx, containerd.WithProcessKill)
-    statusC, err := process.Wait(ctx)
-    if err := process.Start(ctx); err != nil {
-        return err
-    }
-    status := <-statusC
-    _, _, err = status.Result()
-    return err
+r.start()
+for _, w := range workers {
+	go w.run(ctx, tctx) // 默认 ctrWorker 仍跑
+}
+wg.Wait()
+r.end()
+
+results := r.gather(workers) // 只汇总 ctrWorker
+if c.Exec {
+	results.ExecTotal = exec.count       // 注意：循环复用 exec 变量，只保留最后一个 worker
+	results.ExecFailures = exec.failures
 }
 ```
 
-**计时：** 单次 `runExec`；结果额外 `ExecTotal` / `ExecFailures`。  
-**与默认差：** 测二次进程创建，不是反复建容器。
+类型嵌入 `ctrWorker`（复用 `count`/`failures`/`getID` 等）：
+
+```go
+// cmd/containerd-stress/exec_worker.go
+type execWorker struct {
+	ctrWorker
+}
+```
+
+**Worker 入口** — `func (w *execWorker) exec(ctx, tctx context.Context)`（完整）：
+
+```go
+// cmd/containerd-stress/exec_worker.go
+func (w *execWorker) exec(ctx, tctx context.Context) {
+	defer func() {
+		w.wg.Done()
+		log.L.Infof("worker %d finished", w.id)
+	}()
+	id := fmt.Sprintf("exec-container-%d", w.id)
+	c, err := w.client.NewContainer(ctx, id,
+		containerd.WithNewSnapshot(id, w.image),
+		containerd.WithSnapshotter(w.snapshotter),
+		containerd.WithNewSpec(oci.WithImageConfig(w.image), oci.WithUsername("games"), oci.WithProcessArgs("sleep", "30d")),
+	)
+	if err != nil {
+		log.L.WithError(err).Error("create exec container")
+		return
+	}
+	defer c.Delete(ctx, containerd.WithSnapshotCleanup)
+
+	task, err := c.NewTask(ctx, cio.NullIO)
+	if err != nil {
+		log.L.WithError(err).Error("create exec container's task")
+		return
+	}
+	defer task.Delete(ctx, containerd.WithProcessKill)
+
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		log.L.WithError(err).Error("wait exec container's task")
+		return
+	}
+
+	if err := task.Start(ctx); err != nil {
+		log.L.WithError(err).Error("exec container start failure")
+		return
+	}
+
+	spec, err := c.Spec(ctx)
+	if err != nil {
+		log.L.WithError(err).Error("failed to get spec")
+		return
+	}
+
+	pspec := spec.Process
+	pspec.Args = []string{"true"}
+
+	for {
+		select {
+		case <-tctx.Done():
+			if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+				log.L.WithError(err).Error("kill exec container's task")
+			}
+			<-statusC
+			return
+		default:
+		}
+
+		w.count++
+		id := w.getID()
+		log.L.Debugf("starting exec %s", id)
+		start := time.Now()
+
+		if err := w.runExec(ctx, task, id, pspec); err != nil {
+			if err != context.DeadlineExceeded ||
+				!strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+				w.failures++
+				log.L.WithError(err).Errorf("running exec %s", id)
+				errCounter.WithValues(err.Error()).Inc()
+			}
+			continue // 失败不计时
+		}
+		execTimer.WithValues(w.commit).UpdateSince(start) // 仅成功：单次 runExec
+	}
+}
+```
+
+**单次 Exec** — `func (w *execWorker) runExec(...)`（完整）：
+
+```go
+// cmd/containerd-stress/exec_worker.go
+func (w *execWorker) runExec(ctx context.Context, task containerd.Task, id string, spec *specs.Process) (err error) {
+	process, err := task.Exec(ctx, id, spec, cio.NullIO)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if _, derr := process.Delete(ctx, containerd.WithProcessKill); err == nil {
+			err = derr
+		}
+	}()
+	statusC, err := process.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	if err := process.Start(ctx); err != nil {
+		return err
+	}
+	status := <-statusC
+	_, _, err = status.Result()
+	if err != nil {
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			return nil
+		}
+		w.failures++
+		errCounter.WithValues(err.Error()).Inc()
+	}
+	return nil
+}
+```
+
+**计时边界：** 单次 `runExec`（Exec→Wait→Start→等退出→Delete）；成功才 `execTimer.UpdateSince`。结果额外 `ExecTotal` / `ExecFailures`（实现上只取**最后一个** `execWorker`，见上）。  
+**与默认差：** 测二次进程创建，不是反复建/删容器；默认 `ctrWorker` 路径仍并行运行。
 
 ---
 
