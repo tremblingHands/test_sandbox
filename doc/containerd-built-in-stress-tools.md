@@ -123,8 +123,33 @@ func (w *ctrWorker) run(ctx, tctx context.Context) {
 }
 ```
 
-**3）计时约定**  
-见上：`start` → 整次负载函数（含 defer 清理）→ 成功才 `UpdateSince`；纯 `DeadlineExceeded` 一般不记 failure。
+**3）计时约定** — 两层时间：单次负载耗时（metrics）与整轮墙钟（吞吐分母）。
+
+单次负载（`ctrWorker.run` / `criWorker.run` / `execWorker` 循环同构）：
+
+```go
+// cmd/containerd-stress/worker.go
+start := time.Now()
+if err := w.runContainer(ctx, id); err != nil { // 含函数内 defer Delete
+    if err != context.DeadlineExceeded ||
+        !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+        w.failures++ // 非纯超时才记失败
+    }
+    continue // 失败：不 UpdateSince，避免失败过快抬高吞吐观感
+}
+ct.WithValues(w.commit).UpdateSince(start) // 仅成功：区间 = 整次负载（含 defer 清理）
+```
+
+整轮墙钟（编排侧；`gather` 用其算 c/sec）：
+
+```go
+// cmd/containerd-stress/main.go
+func (r *run) start() { r.started = time.Now() }
+func (r *run) end()   { r.ended = time.Now() }
+func (r *run) seconds() float64 {
+    return r.ended.Sub(r.started).Seconds()
+}
+```
 
 **4）汇总**
 
