@@ -51,7 +51,10 @@ log() {
 say() { printf '%s\n' "$*"; }
 
 # 匹配进程：打印 "pid cmd"，无匹配时空。
-# pattern 经 -v 传入 awk；排除扫描器自身（含 awk/本脚本）。
+# pattern 经 -v 传入 awk；排除扫描器自身与 bench 编排脚本。
+# 注意：不可用裸 'dragonball'/'stratovirt'——会误匹配
+#   config_matrix_sweep.sh --hypervisors ...,dragonball,... 进而 SIGKILL 矩阵父进程，
+#   表现为第一组 sweep 跑完后顶层 CSV 不追加、后续 ipvlan 永不执行。
 list_procs() {
     local pat="$1"
     local self=$$
@@ -65,6 +68,11 @@ list_procs() {
             sub(/^ +/, "", cmd)
             if (cmd ~ /(^|[ \/])awk([ ]|$)/) next
             if (cmd ~ /cleanup_orphans\.sh/) next
+            # 编排/压测脚本 argv 常含 hypervisor 名，绝不能当孤儿杀
+            if (cmd ~ /config_matrix_sweep\.sh/) next
+            if (cmd ~ /matrix_merge_resume\.sh/) next
+            if (cmd ~ /throughput_sweep\.sh/) next
+            if (cmd ~ /multi_single_cold_start\.sh/) next
             if (pat != "" && cmd ~ pat) print pid, cmd
         }'
 }
@@ -83,15 +91,26 @@ count_dir_entries() {
     fi
 }
 
+# HV 进程名：锚定为可执行名，避免匹配 --hypervisors dragonball 等参数
+# （与 firecracker 条目同一风格）
+PAT_SHIM='containerd-shim-kata'
+PAT_QEMU='qemu-system'
+PAT_CLH='cloud-hypervisor'
+PAT_FC='(^|/)firecracker( |$)'
+PAT_VIRTIOFSD='(^|/)virtiofsd( |$)'
+PAT_DB='(^|/)dragonball( |$)'
+PAT_SV='(^|/)stratovirt( |$)'
+PAT_ALL_HV="${PAT_SHIM}|${PAT_QEMU}|${PAT_CLH}|firecracker|virtiofsd|dragonball|stratovirt"
+
 # 各类孤儿计数（stdout: name=N 多行）
 snapshot() {
-    echo "shim_kata=$(count_procs 'containerd-shim-kata')"
-    echo "qemu=$(count_procs 'qemu-system')"
-    echo "cloud_hypervisor=$(count_procs 'cloud-hypervisor')"
-    echo "firecracker=$(count_procs '(^|/)firecracker( |$)')"
-    echo "virtiofsd=$(count_procs 'virtiofsd')"
-    echo "dragonball=$(count_procs 'dragonball')"
-    echo "stratovirt=$(count_procs 'stratovirt')"
+    echo "shim_kata=$(count_procs "$PAT_SHIM")"
+    echo "qemu=$(count_procs "$PAT_QEMU")"
+    echo "cloud_hypervisor=$(count_procs "$PAT_CLH")"
+    echo "firecracker=$(count_procs "$PAT_FC")"
+    echo "virtiofsd=$(count_procs "$PAT_VIRTIOFSD")"
+    echo "dragonball=$(count_procs "$PAT_DB")"
+    echo "stratovirt=$(count_procs "$PAT_SV")"
     echo "run_kata=$(count_dir_entries /run/kata)"
     echo "run_vc_sbs=$(count_dir_entries /run/vc/sbs)"
     echo "run_vc_vm=$(count_dir_entries /run/vc/vm)"
@@ -124,7 +143,7 @@ print_snapshot() {
     say "${prefix}$(printf '%s\n' "$snap" | tr '\n' ' ' | sed 's/ $//')  orphan_total=${ORPHAN_TOTAL}"
     log "===== ${prefix}$(date '+%Y-%m-%d %H:%M:%S') orphan_total=${ORPHAN_TOTAL} ====="
     log "$snap"
-    sample=$(list_procs 'containerd-shim-kata|qemu-system|cloud-hypervisor|firecracker|virtiofsd|dragonball|stratovirt' | head -n 8 || true)
+    sample=$(list_procs "$PAT_ALL_HV" | head -n 8 || true)
     if [ -n "$sample" ]; then
         log "sample processes:"
         log "$sample"
@@ -166,22 +185,22 @@ kill_pattern() {
 
 kill_orphans() {
     # 先 shim（可能是 hypervisor 父进程），再 HV / virtiofsd
-    kill_pattern 'containerd-shim-kata'
-    kill_pattern 'qemu-system'
-    kill_pattern 'cloud-hypervisor'
-    kill_pattern '(^|/)firecracker( |$)'
-    kill_pattern 'virtiofsd'
-    kill_pattern 'dragonball'
-    kill_pattern 'stratovirt'
+    kill_pattern "$PAT_SHIM"
+    kill_pattern "$PAT_QEMU"
+    kill_pattern "$PAT_CLH"
+    kill_pattern "$PAT_FC"
+    kill_pattern "$PAT_VIRTIOFSD"
+    kill_pattern "$PAT_DB"
+    kill_pattern "$PAT_SV"
     sleep 1
     # 第二轮：仍存活的再杀一次
-    kill_pattern 'containerd-shim-kata'
-    kill_pattern 'qemu-system'
-    kill_pattern 'cloud-hypervisor'
-    kill_pattern '(^|/)firecracker( |$)'
-    kill_pattern 'virtiofsd'
-    kill_pattern 'dragonball'
-    kill_pattern 'stratovirt'
+    kill_pattern "$PAT_SHIM"
+    kill_pattern "$PAT_QEMU"
+    kill_pattern "$PAT_CLH"
+    kill_pattern "$PAT_FC"
+    kill_pattern "$PAT_VIRTIOFSD"
+    kill_pattern "$PAT_DB"
+    kill_pattern "$PAT_SV"
 }
 
 clean_run_dirs() {
