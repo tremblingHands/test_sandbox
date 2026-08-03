@@ -72,18 +72,59 @@ app.Action = func(cliContext *cli.Context) error {
 
 `density` 注册在 `app.Commands`，不走上述 Action。
 
-**2）统一加压模型**
+**2）统一加压模型** — 编排与 worker 循环在 `test` / `criTest` 同构（差异只在 client 种类与单次负载函数）。
 
-```text
-cleanup
-  →（client 路径：Pull 一次镜像）
-  → 起 N=Concurrency 个 worker（共享 client）
-  → 每 worker：while 未超时 { 做一次负载；成功才记耗时 }
-  → gather → Total / failures / containersPerSecond
+编排侧（摘自 `criTest`；`test` 在 Pull 之后同样如此）：
+
+```go
+// cmd/containerd-stress/main.go — criTest / test 共用形态
+tctx, cancel := context.WithTimeout(ctx, c.Duration)
+// ... SIGTERM/SIGINT → cancel ...
+
+for i := 0; i < c.Concurrency; i++ {
+    wg.Add(1)
+    w := &criWorker{ /* 或 ctrWorker */ id: i, wg: &wg, client: client, ... }
+    workers = append(workers, w)
+}
+
+r.start()
+for _, w := range workers {
+    go w.run(ctx, tctx)
+}
+wg.Wait()
+r.end()
+results := r.gather(workers)
+```
+
+Worker 循环（`ctrWorker.run` / `criWorker.run` 同构；单次负载分别为 `runContainer` / `runSandbox`）：
+
+```go
+// cmd/containerd-stress/worker.go（cri_worker.go 中 criWorker.run 相同结构）
+func (w *ctrWorker) run(ctx, tctx context.Context) {
+    defer w.wg.Done()
+    for {
+        select {
+        case <-tctx.Done():
+            return
+        default:
+        }
+        w.count++
+        id := w.getID()
+        start := time.Now()
+        if err := w.runContainer(ctx, id); err != nil {
+            if err != context.DeadlineExceeded ||
+                !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+                w.failures++
+            }
+            continue // 失败不计耗时
+        }
+        ct.WithValues(w.commit).UpdateSince(start) // 仅成功计时
+    }
+}
 ```
 
 **3）计时约定**  
-`start := time.Now()` → 调用单次负载函数（**含其中 defer 清理**）→ 成功则 `UpdateSince`；失败通常不记耗时（避免失败过快抬高吞吐观感）。纯 `DeadlineExceeded` 一般不记 failure。
+见上：`start` → 整次负载函数（含 defer 清理）→ 成功才 `UpdateSince`；纯 `DeadlineExceeded` 一般不记 failure。
 
 **4）汇总**
 
