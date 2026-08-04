@@ -1006,90 +1006,445 @@ benchstat old.txt new.txt
 
 ### 3.2 客户端集成：`integration/client/benchmark_test.go`
 
-**`BenchmarkContainerCreate`**
+**关系：** 集成测试包；`TestMain` 默认可自启临时 containerd（或 `-no-daemon` 连已有）。连 sock 用 `newClient`，镜像为 BusyBox（`testImage`）。
 
-1. 连上已运行的 containerd，`GetImage(testImage)`，预生成 OCI `spec`（含 `withTrue()`）
-2. `b.ResetTimer()` 后循环 `b.N` 次：`NewContainer(id, WithNewSnapshot(id, image), WithSpec(spec))`
-3. 结束后统一 `Delete(..., WithSnapshotCleanup)`
+**单次 Create 计时段：**
 
-计时段覆盖：**元数据创建 + 新 snapshot**，**不含** `NewTask`/`Start`。用于衡量「空容器对象+根快照」创建成本。
+```mermaid
+flowchart LR
+  Prep[GetImage + GenerateSpec] --> Reset[ResetTimer]
+  Reset --> Loop["b.N × NewContainer<br/>WithNewSnapshot + WithSpec"]
+  Loop --> Stop[StopTimer + Delete]
+```
 
-**`BenchmarkContainerStart`**
+**`BenchmarkContainerCreate`（完整）：**
 
-1. 同样准备 image/spec
-2. **计时外**先循环创建 `b.N` 个 container（含 snapshot）
-3. `ResetTimer()` 后对每个容器：`NewTask` → `Start`
+```go
+// integration/client/benchmark_test.go
+func BenchmarkContainerCreate(b *testing.B) {
+	client, err := newClient(b, address)
+	defer client.Close()
+	ctx, cancel := testContext(b)
+	defer cancel()
 
-计时段覆盖：**task 创建与启动**。与 Create 基准刻意拆开，避免创建成本混进启动数字。
+	image, err := client.GetImage(ctx, testImage)
+	spec, err := oci.GenerateSpec(ctx, client, &containers.Container{ID: b.Name()},
+		oci.WithImageConfig(image), withTrue()) // withTrue = ProcessArgs("true")
+	// 注意：此处容器尚无 SnapshotKey/Root.Path，WithImageConfig 解析用户可能报
+	// "rootfs absolute path is required"（见 §3.1 已知问题）
+
+	var containers []Container
+	defer func() {
+		for _, c := range containers {
+			c.Delete(ctx, WithSnapshotCleanup)
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("%s-%d", b.Name(), i)
+		container, err := client.NewContainer(ctx, id,
+			WithNewSnapshot(id, image), WithSpec(spec))
+		containers = append(containers, container)
+	}
+	b.StopTimer()
+}
+```
+
+计时段：**元数据创建 + 新 snapshot**，不含 `NewTask`/`Start`。
+
+**`BenchmarkContainerStart`（完整）：**
+
+```go
+// integration/client/benchmark_test.go
+func BenchmarkContainerStart(b *testing.B) {
+	// 同样 newClient / GetImage / GenerateSpec …
+	var containers []Container
+	defer /* Delete each WithSnapshotCleanup */
+
+	for i := 0; i < b.N; i++ { // 计时外：先建齐 b.N 个容器+snapshot
+		id := fmt.Sprintf("%s-%d", b.Name(), i)
+		container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithSpec(spec))
+		containers = append(containers, container)
+	}
+
+	b.ResetTimer()
+	for _, c := range containers {
+		task, err := c.NewTask(ctx, empty())
+		defer task.Delete(ctx)
+		if err := task.Start(ctx); err != nil {
+			b.Error(err)
+			return
+		}
+	}
+	b.StopTimer()
+}
+```
+
+计时段：**仅 NewTask→Start**。与 Create 刻意拆开，避免创建成本混进启动数字。
+
+---
 
 ### 3.3 Snapshotter 套件：`core/snapshots/benchsuite`
 
-**入口：** `BenchmarkNative` / `BenchmarkOverlay` / `BenchmarkDeviceMapper`  
-分别 `NewSnapshotter` 后调用同一套 `benchmarkSnapshotter`；未传 root/设备 flag 则 `Skip`。
+**关系：** 三个入口各自 `NewSnapshotter` 后调用同一套 `benchmarkSnapshotter`；flag 未传则 `Skip`。不经 containerd daemon，直接压 snapshotter 插件。
 
-**机制（`benchmarkSnapshotter`）：**
+**入口形态（以 Overlay 为例）：**
 
-1. 构造 **16 层** `fstest.Applier`：按层索引交替「全新建文件 / 局部改中段 4 字节 / 删除」——刻意制造 overlay 全文件 copy-up 与 block-based（devmapper）局部写的差异
-2. 每层文件约 **1MiB**；`b.SetBytes` 按总写入量报告吞吐
-3. 每轮 `b.N`：对 16 层依次  
-   - `Prepare(current, parent)` → 累加 `prepareDuration`  
-   - `mount.WithTempMount` + Apply 写数据 → `writeDuration`  
-   - `Commit(parent', current)` → `commitDuration`
-4. 除整体 `BenchmarkResult` 外，额外打印 prepare/write/commit 分段耗时
+```go
+// core/snapshots/benchsuite/benchmark_test.go
+func BenchmarkOverlay(b *testing.B) {
+	if overlayRootPath == "" {
+		b.Skip("overlay root dir must be provided")
+	}
+	snapshotter, err := overlay.NewSnapshotter(overlayRootPath)
+	defer func() {
+		snapshotter.Close()
+		os.RemoveAll(overlayRootPath)
+	}()
+	benchmarkSnapshotter(b, snapshotter)
+}
+```
 
-用途：对比不同 snapshotter 在多层增删改下的 Prepare/IO/Commit 成本。
+`BenchmarkNative` / `BenchmarkDeviceMapper` 同构；后者还需 `-dm.thinPoolDev`，结束时 `ResetPool`。
+
+**核心循环 `benchmarkSnapshotter`（完整关键路径）：**
+
+```go
+// core/snapshots/benchsuite/benchmark_test.go
+func benchmarkSnapshotter(b *testing.B, snapshotter snapshots.Snapshotter) {
+	const layerCount = 16
+	const fileSizeBytes = int64(1 << 20) // 1MiB
+
+	// 预构造 16 层 Applier：按层索引 %3/%2 交替「全新建 / 局部改 4 字节 / 删除」
+	layers := make([]fstest.Applier, 0, layerCount)
+	for i := 1; i <= layerCount; i++ {
+		layers = append(layers, fstest.Apply(makeApplier(i, fileSizeBytes)...))
+	}
+
+	b.Run("run", func(b *testing.B) {
+		var parent, current string
+		b.SetBytes(int64(total) * fileSizeBytes)
+		for i := 0; i < b.N; i++ {
+			for l := range layerCount {
+				current = fmt.Sprintf("prepare-layer-%d", layerIndex.Add(1))
+				mounts, err := snapshotter.Prepare(ctx, current, parent) // → prepareDuration
+				err = mount.WithTempMount(ctx, mounts, layers[l].Apply)  // → writeDuration
+				parent = fmt.Sprintf("committed-%d", layerIndex.Add(1))
+				err = snapshotter.Commit(ctx, parent, current)           // → commitDuration
+			}
+		}
+	})
+	// 额外打印 BenchmarkXxx/prepare|write|commit 分段结果
+}
+```
+
+`updateFile` 只改文件中段 **4 字节**，刻意拉开 overlay（全文件 copy-up）与 block-based（devmapper）差异。
+
+---
 
 ### 3.4 MetaStore：`core/snapshots/storage`
 
-`bolt_test.go` 的 `BenchmarkSuite` 调用 `Benchmarks(...)`，在可写事务里跑子基准：
+**入口：**
 
-| 子项 | 机制 |
-|------|------|
-| `StatActive` / `StatCommitted` | 预先 Create/Commit 出 active 或 committed，循环 `GetInfo` |
-| `CreateActive` | 循环 `CreateSnapshot(KindActive)`，计时外 `Remove` |
-| `Remove` | 计时外 Create，计时内 Remove |
-| `Commit` | active → `CommitActive` |
-| `GetActive` | 查询 active 快照 |
-| `WriteTransaction` / `ReadTransaction` | 反复开事务 Commit / Rollback |
+```go
+// core/snapshots/storage/bolt_test.go
+func BenchmarkSuite(b *testing.B) {
+	Benchmarks(b, "BoltDBBench", func(root string) (*MetaStore, error) {
+		return NewMetaStore(filepath.Join(root, "metadata.db"))
+	})
+}
+```
 
-测的是 **snapshot 元数据（BoltDB）** 路径，不经过真实文件系统层实现。
+**套件注册与事务包装：**
+
+```go
+// core/snapshots/storage/metastore_bench_test.go
+func Benchmarks(b *testing.B, name string, metaFn metaFactory) {
+	b.Run("StatActive", makeBench(b, name, metaFn, statActiveBenchmark))
+	b.Run("StatCommitted", makeBench(b, name, metaFn, statCommittedBenchmark))
+	b.Run("CreateActive", makeBench(b, name, metaFn, createActiveBenchmark))
+	b.Run("Remove", makeBench(b, name, metaFn, removeBenchmark))
+	b.Run("Commit", makeBench(b, name, metaFn, commitBenchmark))
+	b.Run("GetActive", makeBench(b, name, metaFn, getActiveBenchmark))
+	b.Run("WriteTransaction", openCloseWritable(b, name, metaFn))
+	b.Run("ReadTransaction", openCloseReadonly(b, name, metaFn))
+}
+
+func makeBench(..., fn) func(b *testing.B) {
+	return func(b *testing.B) {
+		ms, _ := metaFn(b.TempDir())
+		ctx, t, _ := ms.TransactionContext(ctx, true) // 可写事务包住整个子基准
+		defer t.Commit()
+		b.ResetTimer()
+		fn(ctx, b, ms)
+	}
+}
+```
+
+**各子项机制（源码要点）：**
+
+```go
+// StatActive：预置 active，循环 GetInfo
+func statActiveBenchmark(ctx context.Context, b *testing.B, ms *MetaStore) {
+	createActiveFromBase(ctx, ms, "active", "base")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		GetInfo(ctx, "active")
+	}
+}
+
+// CreateActive：计时 CreateSnapshot；StopTimer 后 Remove 再 StartTimer
+func createActiveBenchmark(...) {
+	for i := 0; i < b.N; i++ {
+		CreateSnapshot(ctx, snapshots.KindActive, "active", "")
+		b.StopTimer()
+		Remove(ctx, "active")
+		b.StartTimer()
+	}
+}
+
+// Remove：StopTimer 建 active，StartTimer 后 Remove
+// Commit：建 active → 计时 CommitActive → 计时外 Remove committed
+// GetActive：先叠 10 层 parent 链，再循环 GetSnapshot("active")
+// WriteTransaction / ReadTransaction：循环 TransactionContext(true)+Commit / (false)+Rollback
+```
+
+测的是 **BoltDB MetaStore**，不经真实 FS snapshotter。
+
+---
 
 ### 3.5 Content ingest：`plugins/content/local`
 
-**`BenchmarkIngests`：**
+**`BenchmarkIngests`（完整）：**
 
-1. 对 blob 大小 `1KiB / 4KiB / 512KiB / 1MiB` 分子基准
-2. 计时外 `generateBlobs`（随机内容，SHA256+SHA512 digest）
-3. `SetBytes` 后循环 `checkWrite` 写入 content store
+```go
+// plugins/content/local/store_test.go
+func BenchmarkIngests(b *testing.B) {
+	ctx, _, cs, cleanup := contentStoreEnv(b)
+	defer cleanup()
 
-注释写明存在约数毫秒级插入开销（syscall/文件协调），用于衡量 **content store 写入吞吐**。
+	for _, size := range []int64{1 << 10, 4 << 10, 512 << 10, 1 << 20} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			b.StopTimer()
+			blobs := generateBlobs(b, int64(b.N), size) // 随机内容；同 blob 挂 SHA256+SHA512 两个 key
+			b.SetBytes(/* 所有 blob 总字节 */)
+			b.StartTimer()
+			for dgst, p := range blobs {
+				checkWrite(ctx, b, cs, dgst, p) // content.WriteBlob(...)
+			}
+		})
+	}
+}
+
+func checkWrite(ctx context.Context, t checker, cs content.Store, dgst digest.Digest, p []byte) digest.Digest {
+	content.WriteBlob(ctx, cs, dgst.String(), bytes.NewReader(p),
+		ocispec.Descriptor{Size: int64(len(p)), Digest: dgst})
+	return dgst
+}
+```
+
+注释写明约数毫秒级插入开销（syscall/文件协调）。测 **local content store 写入吞吐**。
+
+---
 
 ### 3.6 解压：`pkg/archive/compression`
 
-**`BenchmarkDecompression`：**
+**`BenchmarkDecompression`（完整）：**
 
-1. 下载样本数据，扩展到 32/64/128/256 MiB
-2. 预先压成 gzip / zstd
-3. 子基准：`zstd`、`gzipPureGo`，若系统有 `igzip`/`unpigz` 再测外部分解压器
+```go
+// pkg/archive/compression/benchmark_test.go
+const benchmarkTestDataURL = "https://git.io/fADcl"
 
-对比不同解压实现在镜像层解压场景下的吞吐。
+func BenchmarkDecompression(b *testing.B) {
+	resp, err := http.Get(benchmarkTestDataURL)
+	data, err := io.ReadAll(resp.Body)
+
+	for _, sizeInMiB := range []int{32, 64, 128, 256} {
+		// 把样本扩展/截到目标大小，预先压成 gzip / zstd
+		gz := testCompress(b, data, Gzip)
+		zstd := testCompress(b, data, Zstd)
+
+		b.Run(fmt.Sprintf("size=%dMiB", sizeInMiB), func(b *testing.B) {
+			b.Run("zstd", func(b *testing.B) { testDecompress(b, zstd) })
+
+			gzipPath = ""
+			b.Run("gzipPureGo", func(b *testing.B) { testDecompress(b, gz) })
+
+			if p, err := exec.LookPath("igzip"); err == nil {
+				gzipPath = p
+				b.Run("igzip", func(b *testing.B) { testDecompress(b, gz) })
+			}
+			if p, err := exec.LookPath("unpigz"); err == nil {
+				gzipPath = p
+				b.Run("unpigz", func(b *testing.B) { testDecompress(b, gz) })
+			}
+		})
+	}
+}
+```
+
+对比镜像层解压路径上不同实现的吞吐；短链不可达时见 §3.1。
+
+---
 
 ### 3.7 元数据 GC：`core/metadata`
 
-**`BenchmarkGarbageCollect`：** 子规模 `10/100/1000/10000-Sets`。
+**入口与规模：**
 
-每「套」预置：1 blob + 1 image + 7 层 snapshot 链 + 1 container，全部写入 Bolt 元数据后 `ResetTimer`，循环调用 `mdb.GarbageCollect(ctx)`。
+```go
+// core/metadata/db_test.go
+func BenchmarkGarbageCollect(b *testing.B) {
+	b.Run("10-Sets", benchmarkTrigger(10))
+	b.Run("100-Sets", benchmarkTrigger(100))
+	b.Run("1000-Sets", benchmarkTrigger(1000))
+	b.Run("10000-Sets", benchmarkTrigger(10000))
+}
+```
 
-测 **GC 扫描/回收** 随对象规模的耗时（当前实现未在循环内掺删除对象，主要压全量扫描路径）。
+**`benchmarkTrigger`（完整关键路径）：**
+
+```go
+func benchmarkTrigger(n int) func(b *testing.B) {
+	return func(b *testing.B) {
+		mdb, cs, sn, cleanup := newStores(b)
+		defer cleanup()
+
+		objects := []object{}
+		for i := range n { // 每「套」：
+			objects = append(objects,
+				blob(...), image(...),
+			)
+			for j := 0; j <= 6; j++ { // 7 层 snapshot 链
+				objects = append(objects, newSnapshot(...))
+			}
+			objects = append(objects, container(...)) // 挂最深层 snapshot
+		}
+
+		mdb.Update(func(tx *bolt.Tx) error {
+			for _, obj := range objects {
+				create(obj, tx, mdb, cs, sn)
+			}
+			return nil
+		})
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			mdb.GarbageCollect(ctx) // TODO: 循环内未掺删除对象 → 主要压全量扫描
+		}
+	}
+}
+```
+
+测 **metadata GC** 随对象规模的耗时，而非真实回收吞吐。
+
+---
 
 ### 3.8 其它微基准
 
-| 位置 | 机制要点 |
-|------|----------|
-| `pkg/gc` `BenchmarkTricolor` | 构造引用图，循环跑三色标记 `Tricolor`，测 GC 图算法本身 |
-| `core/unpack` `BenchmarkUnpackWithChainID(s)` | 模拟 unpack 时 chainID：旧路径每层反复 `identity.ChainID`；新路径一次 `ChainIDs`；层数 5/10/25/50 |
-| `core/mount` `BenchmarkBatchRunGetUsernsFD_Concurrent{1,10}` | 并发调用 `getUsernsFD`（固定 UID/GID map），测 idmapped mount 获取 userns FD |
-| `plugins/snapshots/overlay/overlayutils` `BenchmarkOverlaySupportedOn*` | 在临时 mkfs（ext4 / XFS ftype0/1 / FAT）上循环探测 overlay 是否支持 |
+#### `pkg/gc` — `BenchmarkTricolor`
+
+```go
+// pkg/gc/gc_test.go
+func BenchmarkTricolor(b *testing.B) {
+	roots := []string{"A", "C"}
+	refs := map[string][]string{ /* A/B/C/... 引用图；再挂 100 个 X_i→D */ }
+	for i := 0; i < b.N; i++ {
+		Tricolor(toNodes(roots), lookup(refs))
+	}
+}
+```
+
+只测三色标记图算法，不经 Bolt/metadata。
+
+#### `core/unpack` — ChainID 旧 vs 新
+
+```go
+// core/unpack/unpacker_test.go
+func BenchmarkUnpackWithChainID(b *testing.B) {
+	// 旧：每层反复 identity.ChainID(chain)
+	unpackWithChainID := func(diffIDs []digest.Digest) {
+		var chain []digest.Digest
+		for i := range diffIDs {
+			_ = identity.ChainID(chain)
+			chain = append(chain, diffIDs[i])
+			_ = identity.ChainID(chain).String()
+		}
+	}
+	for _, sz := range []int{5, 10, 25, 50} {
+		b.Run(fmt.Sprintf("num of layers: %d", sz), ...)
+	}
+}
+
+func BenchmarkUnpackWithChainIDs(b *testing.B) {
+	// 新：一次 identity.ChainIDs，再取各层 String()
+	chainIDs := identity.ChainIDs(copy(diffIDs))
+	// ...
+}
+```
+
+纯 CPU 模拟 unpack 时 chainID 计算，无真实解压/snapshot。
+
+#### `core/mount` — userns FD
+
+```go
+// core/mount/mount_idmapped_linux_test.go
+func BenchmarkBatchRunGetUsernsFD_Concurrent1(b *testing.B) {
+	for range b.N {
+		benchmarkBatchRunGetUsernsFD(1)
+	}
+}
+func BenchmarkBatchRunGetUsernsFD_Concurrent10(b *testing.B) {
+	for range b.N {
+		benchmarkBatchRunGetUsernsFD(10)
+	}
+}
+
+func benchmarkBatchRunGetUsernsFD(n int) {
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			fd, err := getUsernsFD(testUIDMaps, testGIDMaps) // 固定 UID/GID map
+			fd.Close()
+		}()
+	}
+	wg.Wait()
+}
+```
+
+测 idmapped mount 场景下并发取 userns FD。
+
+#### `overlayutils` — 文件系统探测
+
+```go
+// plugins/snapshots/overlay/overlayutils/check_test.go
+func testOverlaySupported(t testing.TB, expected bool, mkfs ...string) {
+	testutil.RequiresRoot(t)
+	loop, _ := loopback.New(100 << 20)
+	exec.Command(mkfs[0], append(mkfs[1:], loop.Device)...).Run()
+	exec.Command("mount", loop.Device, mnt).Run()
+	defer testutil.Unmount(t, mnt)
+
+	workload := func() {
+		err = Supported(mnt) // 期望 supported / unsupported
+	}
+	if b, ok := t.(*testing.B); ok {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			workload()
+		}
+	}
+}
+
+func BenchmarkOverlaySupportedOnExt4(b *testing.B) {
+	testOverlaySupported(b, true, "mkfs.ext4", "-F")
+}
+// FType0 XFS → false；FType1 XFS → true；FAT → false
+```
+
+计时段主要是反复 `Supported(mnt)`；mkfs/mount 在计时外（ResetTimer 之后才循环）。
 
 ### 3.9 示例
 
