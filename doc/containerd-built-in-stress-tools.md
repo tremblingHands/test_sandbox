@@ -653,17 +653,158 @@ func (w *execWorker) runExec(ctx context.Context, task containerd.Task, id strin
 
 ### 2.6 `density` 子命令
 
-**目标：** 测**同时存活**时的 shim 内存密度，不是吞吐循环。
+**关系：** 注册在 `app.Commands`（`main.go`），**不走**默认 Action / `--cri` / `--exec`。入口是 `densityCommand.Action`（`density.go`）。走 **client API**（`config.newClient()` → `-a` sock），namespace 固定为 `density`。
 
-**流程：** Pull → 顺序创建 `count+1` 个 `sleep 120m` 并 Start → 对 task 父进程（shim）读 `/proc/<pid>/smaps` → JSON：`pss`/`rss` 及 per-container。
+**目标：** 测**同时存活**时 shim 的内存密度（PSS/RSS），不是吞吐循环；无 `-d` 限时 worker。
 
-入口为 `densityCommand` 的 `Action: func(cliContext *cli.Context) error`（`density.go`）。
-
-**与默认差：** 不循环销毁；输出内存指标而非 c/sec。
+**用法：**
 
 ```bash
-containerd-stress density --count 100
+containerd-stress density --count 100 \
+  -a /run/containerd/containerd.sock \
+  -i docker.io/library/alpine:latest \
+  --snapshotter overlayfs
 ```
+
+`--count` 默认 10；镜像需有 `sleep` 且含用户 `games`。输出**始终 JSON**（不依赖 `-j`）。
+
+**流程：**
+
+```mermaid
+flowchart TD
+  Start[densityCommand.Action] --> Client[newClient + ns=density]
+  Client --> Cleanup[cleanup]
+  Cleanup --> Pull[Pull + Unpack]
+  Pull --> Loop["顺序创建 count+1 个容器<br/>sleep 120m + Start"]
+  Loop --> Collect["对每个 task.Pid 取 PPID=shim<br/>读 /proc/shim/smaps 累加 Rss/Pss"]
+  Collect --> JSON["输出 pss/rss 及 per-container"]
+```
+
+**命令定义与入口：**
+
+```go
+// cmd/containerd-stress/density.go
+var densityCommand = &cli.Command{
+	Name:  "density",
+	Usage: "Stress tests density of containers running on a system",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:  "count",
+			Usage: "Number of containers to run",
+			Value: 10,
+		},
+	},
+	Action: func(cliContext *cli.Context) error {
+		// ... 见下
+	},
+}
+```
+
+**准备与顺序建容器** — `Action` 主体（完整关键路径）：
+
+```go
+// cmd/containerd-stress/density.go — densityCommand.Action
+var (
+	pids  []uint32
+	count = cliContext.Int("count")
+)
+if count < 1 {
+	return errors.New("count cannot be less than one")
+}
+
+config := config{
+	Address:     cliContext.String("address"),
+	// Duration/Concurrency/Exec 会读全局 flag，但本 Action 未使用
+	Image:       cliContext.String("image"),
+	Snapshotter: cliContext.String("snapshotter"),
+	// ...
+}
+client, err := config.newClient()
+defer client.Close()
+ctx := namespaces.WithNamespace(context.Background(), "density")
+if err := cleanup(ctx, client); err != nil {
+	return err
+}
+image, err := client.Pull(ctx, config.Image, containerd.WithPullUnpack, containerd.WithPullSnapshotter(config.Snapshotter))
+
+s := make(chan os.Signal, 1)
+signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
+
+loop:
+for i := 0; i < count+1; i++ { // 实际创建 count+1 个
+	select {
+	case <-s:
+		break loop
+	default:
+		id := fmt.Sprintf("density-%d", i)
+		c, err := client.NewContainer(ctx, id,
+			containerd.WithSnapshotter(config.Snapshotter),
+			containerd.WithNewSnapshot(id, image),
+			containerd.WithNewSpec(
+				oci.WithImageConfig(image),
+				oci.WithProcessArgs("sleep", "120m"),
+				oci.WithUsername("games"),
+			),
+		)
+		defer c.Delete(ctx, containerd.WithSnapshotCleanup)
+
+		t, err := c.NewTask(ctx, cio.NullIO)
+		defer t.Delete(ctx, containerd.WithProcessKill)
+		if err := t.Start(ctx); err != nil {
+			return err
+		}
+		pids = append(pids, t.Pid()) // 容器 init 的 PID
+	}
+}
+```
+
+要点：循环上界是 `count+1`（`--count 10` 会起 **11** 个）；中途 SIGINT/SIGTERM 可提前跳出，已建容器靠 `defer` 清理。
+
+**采内存并输出：**
+
+```go
+// cmd/containerd-stress/density.go — Action 续
+var results struct {
+	PSS             int `json:"pss"`
+	RSS             int `json:"rss"`
+	PSSPerContainer int `json:"pssPerContainer"`
+	RSSPerContainer int `json:"rssPerContainer"`
+}
+
+for _, pid := range pids {
+	shimPid, err := getppid(int(pid)) // /proc/<taskPid>/stat → PPID（shim）
+	smaps, err := getMaps(shimPid)    // 读 /proc/<shimPid>/smaps，累加各映射的 Rss:/Pss:
+	results.RSS += smaps["Rss:"]
+	results.PSS += smaps["Pss:"]
+}
+results.PSSPerContainer = results.PSS / count // 分母是 --count，不是 len(pids)
+results.RSSPerContainer = results.RSS / count
+
+return json.NewEncoder(os.Stdout).Encode(results)
+```
+
+**辅助函数：**
+
+```go
+// cmd/containerd-stress/density.go
+func getMaps(pid int) (map[string]int, error) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/smaps", pid))
+	// 逐行 Fields：name=fields[0]，值=fields[1]（kB），同名键累加
+	// ...
+}
+
+func getppid(pid int) (int, error) {
+	bytes, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	s, err := parseStat(string(bytes)) // 解析 PPID 字段
+	return int(s.PPID), nil
+}
+```
+
+假设 task 父进程即 shim：对每个容器 init PID 取 PPID，再对 **shim** 的 smaps 求和。若多个容器共享同一 shim，同一 shim 的 RSS/PSS 会被**重复累加**（实现未按 shimPid 去重）。
+
+**输出示例字段：** `pss` / `rss`（总和，单位与 smaps 一致，一般为 kB）、`pssPerContainer` / `rssPerContainer`（总和 / `--count`）。
+
+**与默认 / `--cri` / `--exec` 差：** 不限时循环、不报 c/sec；顺序建常驻 `sleep 120m`；只采 shim 内存 JSON。`-c`/`-d`/`--exec`/`--cri` 对本子命令无加压语义（全局 flag 虽被读入 `config`，Action 未用）。
 
 ---
 
