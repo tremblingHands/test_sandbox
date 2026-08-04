@@ -11,7 +11,7 @@
 | Snapshotter 环境 | `contrib/aws/snapshotter_bench_*` | 在 AWS 上跑 snapshotter benchsuite |
 | 外部（文档推荐） | [bucketbench](https://github.com/estesp/bucketbench) | 跨引擎生命周期对比，偏逐步耗时统计 |
 
-`containerd-stress` 详见 §2（编译见 §2.7）；Go 微基准详见 §3；外部工具 bucketbench 详见 §5。
+`containerd-stress` 详见 §2（编译见 §2.7）；Go 微基准详见 §3；外部工具 bucketbench 详见 §5（编译见 §5.7）。
 
 ---
 
@@ -1496,7 +1496,7 @@ flowchart TD
   Stats --> Out[分步耗时 / 速率汇总]
 ```
 
-**用法：**
+**用法：**（编译见 §5.7）
 
 ```bash
 # 在 bucketbench 源码树
@@ -1824,6 +1824,31 @@ Pause/Unpause 为空实现。示例：`examples/cri-containerd.yaml`。
 | 并发 | threads × iterations | `-c` × `-d` 限时循环 |
 | CRI | 有；Create/Run 切分见上 | `--cri`：RunPodSandbox→Stop→Remove 循环 |
 | 配置 | YAML 命令序列 | CLI flag |
+
+---
+
+### 5.7 编译方法
+
+源码：独立仓库 [estesp/bucketbench](https://github.com/estesp/bucketbench)（本地如 `/home/nathan/bucketbench`）。`Makefile` 提供动态/静态链接目标，主包为 `github.com/estesp/bucketbench`，产出当前目录下的 `bucketbench` 二进制。`go.mod` 要求 Go ≥ 1.21（toolchain 示例为 1.22.1）。
+
+```bash
+cd /path/to/bucketbench
+
+make binary    # 推荐：动态链接 → ./bucketbench
+make static    # 静态链接（CGO_ENABLED=0 -tags netgo）
+make install   # 安装到 $(DESTDIR)/usr/bin（可用 PREFIX=... 覆盖）
+make clean     # 删除 ./bucketbench
+
+# 不经 Makefile
+go build -ldflags "-X github.com/estesp/bucketbench/cmd.gitCommit=$(git rev-parse HEAD)" \
+  -o bucketbench github.com/estesp/bucketbench
+# 或
+go install github.com/estesp/bucketbench@latest
+```
+
+`make binary` / `static` 会把当前 git commit（脏树则加 `-dirty`）写入 `cmd.gitCommit`。仓库自带 `vendor/`，一般无需额外 `go mod download`。
+
+运行前依赖对应引擎已就绪（如 containerd sock、`runc` 在 PATH、CRI sock）；Runc/CRun/Youki 还需要 YAML 中可用的 `rootfs` bundle。
 
 ---
 
