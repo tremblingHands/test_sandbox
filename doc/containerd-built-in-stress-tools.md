@@ -11,7 +11,7 @@
 | Snapshotter 环境 | `contrib/aws/snapshotter_bench_*` | 在 AWS 上跑 snapshotter benchsuite |
 | 外部（文档推荐） | [bucketbench](https://github.com/estesp/bucketbench) | 跨引擎生命周期对比，偏逐步耗时统计 |
 
-`containerd-stress` 详见 §2（编译见 §2.7）；Go 微基准详见 §3。
+`containerd-stress` 详见 §2（编译见 §2.7）；Go 微基准详见 §3；外部工具 bucketbench 详见 §5。
 
 ---
 
@@ -1465,15 +1465,365 @@ go test ./core/metadata/ -bench=BenchmarkGarbageCollect -benchmem -run '^$'
 
 ---
 
-## 5. 文档推荐的外部工具：bucketbench
+## 5. 外部工具：bucketbench
 
-`BUILDING.md` 推荐，不在 containerd 仓库内：
+源码不在 containerd 仓库内（[estesp/bucketbench](https://github.com/estesp/bucketbench)；本地可参考 `/home/nathan/bucketbench`）。`BUILDING.md` 推荐。下文路径均相对 bucketbench 仓库根目录。
 
-- YAML 配置 lifecycle（run/stop/remove/…）与 threads×iterations
-- 支持 Docker / containerd / runc / crun / youki / CRI 等
-- 输出逐步耗时统计；官方称其比 `containerd-stress` 更偏性能明细
+### 5.1 定位与模式总览
 
-与 `containerd-stress`：前者可配置命令序列、跨引擎；后者专注给运行中的 containerd 诱导负载并报 containers/sec。
+用 YAML 定义 **命令序列**（`run`/`stop`/`remove`/…）与 **threads × iterations**，通过统一 `driver.Driver` 接口驱动 Docker / containerd / runc / crun / youki / CRI 等，输出**逐步耗时**统计。偏跨引擎对比与分步明细，不是 `containerd-stress` 那种限时吞吐加压。
+
+**不测什么：** 不是 `go test -bench`；默认也不做「只报 containers/sec」的粗吞吐循环（虽可从耗时反推速率）。
+
+| 层次 | 位置 | 作用 |
+|------|------|------|
+| CLI | `cmd/run.go` | 读 YAML → 按 driver 跑 → 汇总输出 |
+| 编排 | `benches/custom.go` | threads 并发 × iterations；每步计时 |
+| 引擎 | `driver/*.go` | 实现 `Create`/`Run`/`Stop`/`Remove`/… |
+
+```mermaid
+flowchart TD
+  Start[bucketbench run -b YAML] --> Parse[readYaml]
+  Parse --> Drivers[遍历 drivers]
+  Drivers --> Init[bench.Init: New Driver + Clean]
+  Init --> Validate[可选 Validate: create→run→stop→remove]
+  Validate --> Run[CustomBench.Run]
+  Run --> Threads["N 线程各 New Driver"]
+  Threads --> Iter["每线程 iterations 次"]
+  Iter --> Create[Create 计时外]
+  Create --> Cmds["按 commands 顺序执行<br/>Run/Stop/Remove… 各记 Duration"]
+  Cmds --> Stats[收集 RunStatistics]
+  Stats --> Out[分步耗时 / 速率汇总]
+```
+
+**用法：**
+
+```bash
+# 在 bucketbench 源码树
+sudo ./bucketbench --log-level=debug run -b examples/ctrd.yaml
+sudo ./bucketbench run -b examples/cri-containerd.yaml
+sudo ./bucketbench run -b examples/basic.yaml   # 含 Runc，需 YAML rootfs
+```
+
+YAML 示例形态（`examples/ctrd.yaml`）：
+
+```yaml
+name: CtrdOnly
+image: alpine
+command: date
+detached: true
+drivers:
+  - type: Containerd
+    threads: 5
+    iterations: 10
+commands:
+  - run
+  - stop
+  - delete
+```
+
+---
+
+### 5.2 公共骨架：接口与编排
+
+**1）Driver 接口** — `driver/common.go`：
+
+```go
+// driver/common.go
+type Driver interface {
+	Type() Type
+	Info(ctx context.Context) (string, error)
+	Path() string
+	Create(ctx context.Context, name, image, cmdOverride string, detached bool, trace bool) (Container, error)
+	Clean(ctx context.Context) error
+	Run(ctx context.Context, ctr Container) (string, time.Duration, error)
+	Stop(ctx context.Context, ctr Container) (string, time.Duration, error)
+	Remove(ctx context.Context, ctr Container) (string, time.Duration, error)
+	Pause / Unpause / Wait / Stats / Close / PID / ProcNames …
+}
+
+func New(ctx context.Context, config *Config) (Driver, error) {
+	switch config.DriverType {
+	case Containerd:
+		return NewContainerdDriver(config)
+	case Runc:
+		return NewRuncDriver(config.Path)
+	case CRI:
+		return NewCRIDriver(config.Path)
+	// Docker / Ctr / CRun / Youki …
+	}
+}
+```
+
+容器名前缀常量：`ContainerNamePrefix = "bb-ctr"`。
+
+**2）CLI 跑一轮** — `cmd/run.go`：
+
+```go
+// cmd/run.go — runCmd
+benchmark, err := readYaml(yamlFile)
+for _, driverEntry := range benchmark.Drivers {
+	result, err := runBenchmark(ctx, benchType, driverEntry, benchmark, legacy)
+	results = append(results, result)
+}
+outputRunDetails(...)
+```
+
+`runBenchmarkOnce` 里：Runc/Ctr/CRun/Youki 用 YAML 的 `rootfs` 作 `imageInfo`；Containerd/CRI/Docker 用 `image` 镜像名。`clientpath` 传给 Driver 的 Path（sock 或二进制路径）。
+
+**3）并发迭代** — `CustomBench.Run` / `runThread`（完整关键路径）：
+
+```go
+// benches/custom.go
+func (cb *CustomBench) Run(ctx context.Context, threads, iterations int, commands []string) error {
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		drv, err := driver.New(ctx, &cb.Config) // 每线程独立 Driver（避免 gRPC client 非线程安全）
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			cb.runThread(ctx, drv, index, iterations, commands, statChan[index])
+		}(i)
+	}
+	wg.Wait()
+	// 汇总 statChan → cb.stats；最后 Clean
+}
+
+func (cb *CustomBench) runThread(..., commands []string, stats chan RunStatistics) {
+	for i := 0; i < iterations; i++ {
+		name := fmt.Sprintf("%s-%d-%d", driver.ContainerNamePrefix, threadNum, i)
+		ctr, err := runner.Create(ctx, name, cb.imageInfo, cb.cmdOverride, true, cb.trace)
+		// Create 耗时不进入 durations
+
+		durations := make(map[string]time.Duration)
+		for _, cmd := range commands {
+			switch strings.ToLower(cmd) {
+			case "run", "start":
+				_, runElapsed, err := runner.Run(ctx, ctr)
+				durations["run"] = runElapsed
+			case "stop", "kill":
+				_, stopElapsed, err := runner.Stop(ctx, ctr)
+				durations["stop"] = stopElapsed
+			case "remove", "erase", "delete":
+				_, rmElapsed, err := runner.Remove(ctx, ctr)
+				durations["delete"] = rmElapsed
+			case "pause", "unpause", "resume", "wait", "stats", "metrics":
+				// …
+			}
+		}
+		stats <- RunStatistics{Durations: durations, Errors: errors, Timestamp: time.Now().UTC()}
+	}
+}
+```
+
+要点：**Create 在计时外**；YAML 每个 command 各记一段 `Duration`；默认模式一次跑满 `threads`，`-l/--legacy` 则从 1…N 线程递增重跑。
+
+---
+
+### 5.3 Containerd 驱动（`type: Containerd`）
+
+**连接：** `containerd.New(path)`，默认 sock `/run/containerd/containerd.sock`；namespace 固定 **`bb`**。
+
+```go
+// driver/containerd.go
+const (
+	defaultContainerdPath = "/run/containerd/containerd.sock"
+	containerdNamespace   = "bb"
+)
+
+func NewContainerdDriver(config *Config) (*ContainerdDriver, error) {
+	path := config.Path
+	if path == "" {
+		path = defaultContainerdPath
+	}
+	client, err := containerd.New(path)
+	return &ContainerdDriver{ctrdAddress: path, client: client, ...}, nil
+}
+```
+
+**Create：** 构造 `ContainerdContainer` 元数据（name/image/command）；镜像 Pull 在准备阶段（`Info`/环境准备）完成。
+
+**Run（计时内，完整）：**
+
+```go
+// driver/containerd.go
+func (r *ContainerdDriver) Run(ctx context.Context, ctr Container) (string, time.Duration, error) {
+	start := time.Now()
+	ctx = namespaces.WithNamespace(ctx, containerdNamespace)
+
+	image, err := r.client.GetImage(ctx, ctr.Image())
+	var container containerd.Container
+	if ctr.Command() != "" {
+		container, err = r.client.NewContainer(ctx, ctr.Name(),
+			containerd.WithNewSnapshot(ctr.Name(), image),
+			containerd.WithNewSpec(oci.WithImageConfig(image),
+				oci.WithProcessArgs(strings.Split(ctr.Command(), " ")...)))
+	} else {
+		container, err = r.client.NewContainer(ctx, ctr.Name(),
+			containerd.WithNewSnapshot(ctr.Name(), image),
+			containerd.WithNewSpec(oci.WithImageConfig(image)))
+	}
+	task, err := container.NewTask(ctx, cio.NewCreator(...))
+	if err := task.Start(ctx); err != nil {
+		task.Delete(ctx)
+		return "", 0, err
+	}
+	return stdouterr.String(), time.Since(start), nil
+}
+```
+
+单次 `run` ≈ **NewContainer + Snapshot + NewTask + Start**（client API，同族于 `containerd-stress` 默认路径，但逐步拆开计时）。
+
+**Stop / Remove：**
+
+```go
+func (r *ContainerdDriver) Stop(ctx context.Context, ctr Container) (..., time.Duration, error) {
+	container, _ := r.client.LoadContainer(ctx, ctr.Name())
+	stopTask(ctx, container) // Running → Kill(SIGKILL) → Wait → task.Delete
+	return "", time.Since(start), nil
+}
+
+func (r *ContainerdDriver) Remove(ctx context.Context, ctr Container) (..., time.Duration, error) {
+	container, _ := r.client.LoadContainer(ctx, ctr.Name())
+	stopTask(ctx, container)
+	container.Delete(ctx, containerd.WithSnapshotCleanup)
+	return "", time.Since(start), nil
+}
+```
+
+另支持 Pause/Resume、Wait、Stats（拉 task Metrics）。示例：`examples/ctrd.yaml`、`examples/ctrd-run.yaml`。
+
+---
+
+### 5.4 Runc 驱动（`type: Runc`）
+
+**无 daemon：** 直接执行本机 `runc` 二进制。YAML 必须提供 **`rootfs:`**（展开的 OCI bundle），不用镜像名。
+
+```go
+// driver/runc.go
+func NewRuncDriver(binaryPath string) (Driver, error) {
+	if binaryPath == "" {
+		binaryPath = "runc"
+	}
+	resolvedBinPath, err := utils.ResolveBinary(binaryPath)
+	return &RuncDriver{runcBinary: resolvedBinPath}, nil
+}
+
+func (r *RuncDriver) Create(_ context.Context, name, image, _ string, detached bool, trace bool) (Container, error) {
+	return newRuncContainer(name, image /* = bundle path */, detached, trace), nil
+}
+```
+
+**Run / Stop / Remove（完整）：**
+
+```go
+func (r *RuncDriver) Run(ctx context.Context, ctr Container) (string, time.Duration, error) {
+	// 可选 --detach、--trace /tmp/<name>.trace
+	args := fmt.Sprintf("%srun %s --bundle %s %s", trace, detached, ctr.Image(), ctr.Name())
+	return utils.ExecTimedCmdNoOut(ctx, r.runcBinary, args) // stdio→/dev/null，返回耗时
+}
+
+func (r *RuncDriver) Stop(ctx context.Context, ctr Container) (string, time.Duration, error) {
+	return utils.ExecTimedCmd(ctx, r.runcBinary, "kill "+ctr.Name()+" KILL")
+}
+
+func (r *RuncDriver) Remove(ctx context.Context, ctr Container) (string, time.Duration, error) {
+	return utils.ExecTimedCmd(ctx, r.runcBinary, "delete "+ctr.Name())
+}
+```
+
+**Clean：** `runc list` 解析，只处理名字含 `bb-` 的项，按 state 做 stop/unpause/delete。测的是 **裸 OCI runtime**，无 containerd/CRI 编排层。示例见 `examples/basic.yaml` 的 Runc 段。
+
+---
+
+### 5.5 CRI 驱动（`type: CRI`）
+
+**连接：** gRPC Unix dial 到 `clientpath`（如 `/var/run/cri-containerd.sock`）。加载 `contrib/sandbox_config.json`、`contrib/container_config.json`。
+
+```go
+// driver/cri.go
+func NewCRIDriver(path string) (Driver, error) {
+	conn, err := getGRPCConn(path, 10*time.Second) // unix dial
+	runtimeClient := pb.NewRuntimeServiceClient(conn)
+	imageClient := pb.NewImageServiceClient(conn)
+	pconfig, _ := loadPodSandboxConfig(defaultSandboxConfig)
+	cconfig, _ := loadContainerConfig(defaultContainerConfig)
+	return &CRIDriver{criSocketAddress: path, runtimeClient: &runtimeClient, ...}, nil
+}
+```
+
+**Create（计时外，但含 RunPodSandbox）：**
+
+```go
+func (c *CRIDriver) Create(ctx context.Context, name, image, cmdOverride string, _ bool, trace bool) (Container, error) {
+	// 必要时 PullImage（业务镜像 + pause registry.k8s.io/pause:3.5）
+	pconfig.Metadata.Name = defaultPodNamePrefix + name
+	podInfo, err := (*c.runtimeClient).RunPodSandbox(ctx, &pb.RunPodSandboxRequest{Config: &pconfig})
+	return &CRIContainer{name: name, imageName: image, podID: podInfo.GetPodSandboxId(), ...}, nil
+}
+```
+
+**Run（计时内）——仅 CreateContainer，无 StartContainer：**
+
+```go
+func (c *CRIDriver) Run(ctx context.Context, ctr Container) (string, time.Duration, error) {
+	start := time.Now()
+	cconfig.Metadata.Name = ctr.Name()
+	_, err = (*c.runtimeClient).CreateContainer(ctx,
+		&pb.CreateContainerRequest{
+			PodSandboxId: ctr.GetPodID(),
+			Config:       &cconfig,
+			SandboxConfig: &pconfig,
+		})
+	return "", time.Since(start), err
+	// 注意：未调用 StartContainer
+}
+```
+
+**Stop / Remove：**
+
+```go
+func (c *CRIDriver) Stop(ctx context.Context, ctr Container) (..., time.Duration, error) {
+	// ListContainers(PodSandboxId) → StopContainer → StopPodSandbox
+}
+
+func (c *CRIDriver) Remove(ctx context.Context, ctr Container) (..., time.Duration, error) {
+	// ListContainers → RemoveContainer → RemovePodSandbox
+}
+```
+
+Pause/Unpause 为空实现。示例：`examples/cri-containerd.yaml`。
+
+**与 `crictl` / `containerd-stress --cri` 的语义差：**
+
+| 步骤 | bucketbench CRI | 常见完整 CRI 链路 |
+|------|-----------------|-------------------|
+| Create | 已 `RunPodSandbox` | `runp` |
+| Run | 仅 `CreateContainer` | `create` + **`start`** |
+| Stop/Remove | Stop/Remove 容器+Pod | `stop`/`rm` + `stopp`/`rmp` |
+
+因此 YAML 的 `run` **不等于**「容器进程已 Start」。
+
+---
+
+### 5.6 三引擎对照与选型
+
+| | Containerd | Runc | CRI |
+|--|------------|------|-----|
+| 通道 | containerd client gRPC（ns=`bb`） | 本地 `runc` 进程 | CRI Runtime/Image gRPC |
+| YAML 输入 | `image:` 镜像名 | **`rootfs:`** bundle | `image:` + `clientpath` sock |
+| Create | 轻量元数据 | 轻量元数据 | **含 RunPodSandbox** |
+| Run 实际 | NewContainer+Snapshot+Task+Start | `runc run --bundle` | **仅 CreateContainer** |
+| 计时粒度 | YAML 各 command | 同左 | 同左（语义见表） |
+
+与 `containerd-stress`：
+
+| | bucketbench | containerd-stress |
+|--|-------------|-------------------|
+| 目标 | 跨引擎、**分步**耗时 | 单 daemon **吞吐**（c/sec） |
+| 并发 | threads × iterations | `-c` × `-d` 限时循环 |
+| CRI | 有；Create/Run 切分见上 | `--cri`：RunPodSandbox→Stop→Remove 循环 |
+| 配置 | YAML 命令序列 | CLI flag |
 
 ---
 
@@ -1487,4 +1837,4 @@ go test ./core/metadata/ -bench=BenchmarkGarbageCollect -benchmem -run '^$'
 | 同时存活内存密度 | `containerd-stress density` |
 | 创建 vs 启动拆分微基准 | `integration/client` 的 Create/Start |
 | snapshotter / content / GC 热点 | 对应包内 `Benchmark*` |
-| 跨引擎生命周期明细 | bucketbench（外部） |
+| 跨引擎生命周期分步耗时 | bucketbench（§5；注意 CRI 的 Run≠Start） |
