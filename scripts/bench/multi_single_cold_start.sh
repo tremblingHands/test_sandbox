@@ -7,7 +7,7 @@
 #     ./multi_single_cold_start.sh <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [--resources [OPTS]] [-- <single_cold_start.py 的额外参数>]
 #
 # 参数:
-#     CPUS   CPU 列表: "0-7" (连续范围) 或 "32,34,36,38" (指定核心)。
+#     CPUS   CPU 列表: "N" (单核) / "0-7" (连续范围) / "32,34,36,38" (指定核心)。
 #            进程将按列表顺序依次绑定到核心。
 #     K      启动的进程数量。
 #     NUMA   NUMA 节点号，所有进程统一用 numactl --membind=<NUMA> 绑定内存。
@@ -29,6 +29,7 @@
 #
 # 示例:
 #     ./multi_single_cold_start.sh 0-7 4 0 -- --duration 60
+#     ./multi_single_cold_start.sh 127 1 1 -- --duration 30
 #     ./multi_single_cold_start.sh 4-11 8 1 -- --duration 30 --cleanup
 #     ./multi_single_cold_start.sh 32,34,36,38 4 0 -- --duration 60
 #     ./multi_single_cold_start.sh 0-7 4 0 --profile -- --duration 60
@@ -55,7 +56,7 @@ set -euo pipefail
 if [ $# -lt 3 ]; then
     echo "用法: $0 <CPUS> <K> <NUMA> [--profile] [--pprof [OPTS]] [--perf [OPTS]] [--perf_sandbox] [--resources [OPTS]] [-- <single_cold_start.py 的额外参数>]"
     echo ""
-    echo "  CPUS   CPU 列表: 0-7 (范围) 或 32,34,36,38 (指定核心)"
+    echo "  CPUS   CPU 列表: N (单核) / 0-7 (范围) / 32,34,36,38 (指定核心)"
     echo "  K      启动的进程数量"
     echo "  NUMA   NUMA 节点号，所有进程内存统一绑定"
     echo "  --profile    通过 containerd trace 日志统计各阶段时延"
@@ -65,6 +66,7 @@ if [ $# -lt 3 ]; then
     echo ""
     echo "示例:"
     echo "  $0 0-7 4 0 -- --duration 60 --cleanup"
+    echo "  $0 127 1 1 -- --duration 30"
     echo "  $0 32,34,36,38 4 0 -- --duration 60"
     echo "  $0 0-7 4 0 --pprof -- --duration 60"
     echo "  $0 0-7 4 0 --pprof --perf -- --duration 60"
@@ -151,9 +153,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 解析 CPU 列表: "M-N" (连续范围) 或 "C1,C2,C3,..." (指定核心)
+# 解析 CPU 列表: "N" (单核) / "M-N" (连续范围) / "C1,C2,C3,..." (指定核心)
 CPU_LIST=()                     # 所有可用 CPU 核心的数组
-if [[ "$CPU_RANGE" == *,* ]]; then
+if [[ "$CPU_RANGE" =~ ^[0-9]+$ ]]; then
+    # 单核（throughput_sweep list_to_spec 在 wr_n=1 时输出此形式）
+    CPU_LIST=("$CPU_RANGE")
+elif [[ "$CPU_RANGE" == *,* ]]; then
     # 逗号分隔的 CPU 核心列表
     IFS=',' read -ra CPU_LIST <<< "$CPU_RANGE"
     for cpu in "${CPU_LIST[@]}"; do
@@ -165,8 +170,9 @@ if [[ "$CPU_RANGE" == *,* ]]; then
 else
     # M-N 连续范围
     IFS='-' read -r CPU_START CPU_END <<< "$CPU_RANGE"
-    if [ -z "${CPU_START:-}" ] || [ -z "${CPU_END:-}" ]; then
-        echo "错误: CPU 范围格式不正确，应为 M-N (如 0-7) 或逗号分隔列表 (如 32,34,36,38)"
+    if [ -z "${CPU_START:-}" ] || [ -z "${CPU_END:-}" ] \
+        || ! [[ "$CPU_START" =~ ^[0-9]+$ ]] || ! [[ "$CPU_END" =~ ^[0-9]+$ ]]; then
+        echo "错误: CPU 范围格式不正确，应为 N / M-N (如 127 或 0-7) 或逗号分隔列表 (如 32,34,36,38)"
         exit 1
     fi
     if [ "$CPU_START" -gt "$CPU_END" ]; then
